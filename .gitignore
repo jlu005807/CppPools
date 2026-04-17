@@ -1,0 +1,57 @@
+# =========================
+# CMake / 构建目录
+# =========================
+build/
+output/
+cmake-build-*/
+
+# CMake 生成文件
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+build.ninja
+.ninja_deps
+.ninja_log
+Makefile
+compile_commands.json
+
+# =========================
+# 二进制与库文件
+# =========================
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+
+# =========================
+# 日志与临时文件
+# =========================
+*.log
+*.tmp
+*.bak
+
+# =========================
+# IDE / 编辑器
+# =========================
+.vscode/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# =========================
+# 系统文件
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,422 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CppPoolLab | Three Pools Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-deep: #070f1a;
+      --bg-mid: #123250;
+      --bg-ink: #0c1f32;
+      --text-main: #edf4ff;
+      --text-soft: #a9bdd3;
+      --accent-mint: #62f0d9;
+      --accent-gold: #f2b84d;
+      --accent-coral: #ff825a;
+      --glass: rgba(6, 14, 25, 0.72);
+      --line: rgba(255, 255, 255, 0.12);
+      --mono: "IBM Plex Mono", monospace;
+      --sans: "Space Grotesk", "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text-main);
+      font-family: var(--sans);
+      background:
+        radial-gradient(circle at 18% 18%, rgba(98, 240, 217, 0.22), transparent 42%),
+        radial-gradient(circle at 82% 12%, rgba(242, 184, 77, 0.16), transparent 38%),
+        linear-gradient(135deg, var(--bg-mid), var(--bg-deep) 45%, #06111d);
+      overflow: hidden;
+    }
+
+    #bgCanvas {
+      position: fixed;
+      inset: 0;
+      z-index: 0;
+      opacity: 0.92;
+    }
+
+    .ambient {
+      position: fixed;
+      filter: blur(65px);
+      opacity: 0.35;
+      pointer-events: none;
+      z-index: 0;
+      animation: drift 14s ease-in-out infinite;
+    }
+
+    .ambient-a {
+      width: 34vw;
+      height: 34vw;
+      border-radius: 48% 52% 63% 37%;
+      background: rgba(98, 240, 217, 0.4);
+      top: -10vw;
+      left: -8vw;
+    }
+
+    .ambient-b {
+      width: 28vw;
+      height: 28vw;
+      border-radius: 39% 61% 52% 48%;
+      background: rgba(255, 130, 90, 0.32);
+      right: -6vw;
+      bottom: -8vw;
+      animation-delay: -6s;
+    }
+
+    .layout {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      grid-template-columns: 1.05fr 0.95fr;
+      gap: 18px;
+      width: min(1200px, 94vw);
+      margin: 5vh auto;
+      align-items: stretch;
+    }
+
+    .card {
+      background: var(--glass);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 18px 18px 16px;
+      backdrop-filter: blur(8px);
+      box-shadow: 0 18px 50px rgba(0, 0, 0, 0.28);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(1.2rem, 2.2vw, 1.8rem);
+      letter-spacing: 0.01em;
+    }
+
+    .subtitle {
+      margin: 8px 0 16px;
+      color: var(--text-soft);
+      line-height: 1.55;
+      max-width: 62ch;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid rgba(98, 240, 217, 0.38);
+      color: #d8fff4;
+      background: rgba(98, 240, 217, 0.1);
+      border-radius: 999px;
+      padding: 5px 12px;
+      font-size: 0.79rem;
+      margin-bottom: 12px;
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--accent-mint);
+      box-shadow: 0 0 12px rgba(98, 240, 217, 0.75);
+    }
+
+    .control-row {
+      display: grid;
+      grid-template-columns: 1.2fr auto auto;
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    input[type="number"] {
+      min-width: 0;
+      width: 100%;
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      border-radius: 11px;
+      background: rgba(255, 255, 255, 0.06);
+      color: var(--text-main);
+      font-family: var(--mono);
+      padding: 10px 12px;
+    }
+
+    button {
+      border: 0;
+      border-radius: 11px;
+      padding: 10px 14px;
+      font-family: var(--sans);
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform 140ms ease, filter 140ms ease;
+    }
+
+    button:hover {
+      transform: translateY(-1px);
+      filter: brightness(1.04);
+    }
+
+    .btn-primary {
+      background: linear-gradient(110deg, var(--accent-mint), #9be8e4 45%, var(--accent-gold));
+      color: #07121d;
+    }
+
+    .btn-secondary {
+      background: linear-gradient(110deg, #ffd8b4, #ffb274);
+      color: #2a1408;
+    }
+
+    .controls-grid {
+      margin-top: 16px;
+      display: grid;
+      gap: 10px;
+    }
+
+    .seed-controls {
+      margin-top: 12px;
+      display: grid;
+      gap: 8px;
+      padding: 10px;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.03);
+    }
+
+    .seed-row {
+      display: grid;
+      grid-template-columns: auto 1fr auto auto auto;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .seed-label {
+      color: var(--text-soft);
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    .seed-value {
+      font-family: var(--mono);
+      color: #d8fff4;
+      font-size: 0.88rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .seed-btn {
+      padding: 6px 10px;
+      border-radius: 9px;
+      background: rgba(255, 255, 255, 0.1);
+      color: #f2fbff;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      font-size: 0.78rem;
+      font-weight: 600;
+    }
+
+    .slider-wrap {
+      display: grid;
+      grid-template-columns: 130px 1fr 58px;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .slider-wrap label {
+      color: var(--text-soft);
+      font-size: 0.82rem;
+    }
+
+    .slider-wrap input[type="range"] {
+      width: 100%;
+      accent-color: var(--accent-mint);
+    }
+
+    .slider-wrap span {
+      text-align: right;
+      font-family: var(--mono);
+      font-size: 0.8rem;
+      color: #dbfff8;
+    }
+
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+
+    .metric {
+      border: 1px solid rgba(255, 255, 255, 0.11);
+      border-radius: 12px;
+      padding: 10px 11px;
+      background: rgba(255, 255, 255, 0.03);
+    }
+
+    .metric strong {
+      display: block;
+      color: var(--text-soft);
+      font-size: 0.73rem;
+      letter-spacing: 0.03em;
+      margin-bottom: 6px;
+      text-transform: uppercase;
+    }
+
+    .metric span {
+      font-family: var(--mono);
+      color: #dcfff7;
+      font-size: 0.96rem;
+    }
+
+    h2 {
+      font-size: 0.9rem;
+      margin: 14px 0 8px;
+      color: var(--text-soft);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    #historyList {
+      margin: 0;
+      padding-left: 20px;
+      max-height: 168px;
+      overflow: auto;
+      color: #d4f5eb;
+      font-family: var(--mono);
+      font-size: 0.8rem;
+    }
+
+    pre {
+      margin: 8px 0 0;
+      border-radius: 12px;
+      padding: 12px;
+      background: rgba(0, 0, 0, 0.35);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      color: #d4ffea;
+      font-size: 0.78rem;
+      max-height: 230px;
+      overflow: auto;
+      font-family: var(--mono);
+      line-height: 1.45;
+    }
+
+    .footer-hint {
+      margin-top: 10px;
+      color: var(--text-soft);
+      font-size: 0.76rem;
+      letter-spacing: 0.02em;
+    }
+
+    @keyframes drift {
+      0%, 100% { transform: translate(0, 0) scale(1); }
+      50% { transform: translate(2vw, -2vh) scale(1.04); }
+    }
+
+    @media (max-width: 980px) {
+      body {
+        overflow: auto;
+      }
+
+      .layout {
+        grid-template-columns: 1fr;
+        margin: 16px auto;
+        padding-bottom: 14px;
+      }
+
+      .control-row {
+        grid-template-columns: 1fr;
+      }
+
+      .seed-row {
+        grid-template-columns: auto 1fr auto auto;
+      }
+
+      #seedRandomBtn {
+        grid-column: 1 / -1;
+      }
+    }
+  </style>
+</head>
+<body>
+  <canvas id="bgCanvas"></canvas>
+  <div class="ambient ambient-a"></div>
+  <div class="ambient ambient-b"></div>
+
+  <main class="layout">
+    <section class="card">
+      <div class="tag"><span class="dot"></span> LIVE PIPELINE DEMO</div>
+      <h1>C++ ThreadPool + MemoryPool + DBPool</h1>
+      <p style="margin:8px 0 0;">
+        <a href="/multi" style="color:#b9d6ff;">打开三池联动专用页面</a>
+      </p>
+      <p class="subtitle">
+        Send a user query to <code>/api/process?user=ID</code>. The request is scheduled by ThreadPool,
+        uses pooled request context objects, borrows a DB connection, and returns JSON with runtime metadata.
+      </p>
+
+      <div class="control-row">
+        <input id="userId" type="number" min="0" value="42" />
+        <button id="queryBtn" class="btn-primary">Send Request</button>
+        <button id="burstBtn" class="btn-secondary">Burst x5</button>
+      </div>
+
+      <div class="controls-grid">
+        <div class="seed-controls">
+          <div class="seed-row">
+            <span class="seed-label">Seed</span>
+            <span id="seedValue" class="seed-value">20260417</span>
+            <button id="seedPrevBtn" class="seed-btn">Prev</button>
+            <button id="seedNextBtn" class="seed-btn">Next</button>
+            <button id="seedRandomBtn" class="seed-btn">Random</button>
+          </div>
+        </div>
+
+        <div class="slider-wrap">
+          <label for="densityRange">Particle Density</label>
+          <input id="densityRange" type="range" min="300" max="1800" step="50" value="900">
+          <span id="densityValue">900</span>
+        </div>
+        <div class="slider-wrap">
+          <label for="trailRange">Trail Persistence</label>
+          <input id="trailRange" type="range" min="0.02" max="0.22" step="0.01" value="0.08">
+          <span id="trailValue">0.08</span>
+        </div>
+        <div class="slider-wrap">
+          <label for="swirlRange">Field Swirl</label>
+          <input id="swirlRange" type="range" min="0.04" max="0.3" step="0.01" value="0.12">
+          <span id="swirlValue">0.12</span>
+        </div>
+      </div>
+
+      <p class="footer-hint">
+        Tip: Use Burst to visualize queue pressure and observe how pooled resources react.
+      </p>
+    </section>
+
+    <section class="card">
+      <div class="metrics-grid">
+        <div class="metric"><strong>Last Request ID</strong><span id="metricRequestId">-</span></div>
+        <div class="metric"><strong>Latency (ms)</strong><span id="metricLatency">-</span></div>
+        <div class="metric"><strong>DB Free / Total</strong><span id="metricDb">-</span></div>
+        <div class="metric"><strong>Memory In Use</strong><span id="metricMem">-</span></div>
+        <div class="metric"><strong>Total Requests</strong><span id="metricTotal">-</span></div>
+        <div class="metric"><strong>Pending Tasks</strong><span id="metricPending">-</span></div>
+      </div>
+
+      <h2>Recent Requests</h2>
+      <ol id="historyList"></ol>
+
+      <h2>Raw JSON</h2>
+      <pre id="output">Ready.</pre>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
+
