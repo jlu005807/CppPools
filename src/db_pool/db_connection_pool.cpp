@@ -25,7 +25,7 @@ DBConnectionPool::DBConnectionPool(const DBPoolConfig& config)
     for (std::size_t i = 0; i < config_.pool_size; ++i) {
         std::unique_ptr<MockDBConnection> conn;
         if (config_.use_mysql) {
-            // MySQL mode: every pooled slot creates a real client connection.
+            // MySQL 模式：池中每个槽位都建立一条真实数据库连接。
             conn = std::make_unique<MockDBConnection>(
                 static_cast<int>(i + 1),
                 config_.host,
@@ -35,7 +35,7 @@ DBConnectionPool::DBConnectionPool(const DBPoolConfig& config)
                 config_.database,
                 config_.table);
         } else {
-            // Mock mode: deterministic fake backend for local learning/demo.
+            // Mock 模式：使用确定性模拟后端，便于本地学习与演示。
             conn = std::make_unique<MockDBConnection>(static_cast<int>(i + 1));
         }
 
@@ -48,14 +48,14 @@ DBConnectionPool::~DBConnectionPool() = default;
 
 MockDBConnection* DBConnectionPool::acquire(std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lock(mutex_);
-    // wait_for prevents unbounded blocking and makes overload visible.
+    // wait_for 可避免无限阻塞，让“资源耗尽”以超时形式显式暴露给上层。
     const bool ok = cv_.wait_for(lock, timeout, [this]() { return !free_conns_.empty(); });
     if (!ok) {
         return nullptr;
     }
     MockDBConnection* conn = free_conns_.front();
     free_conns_.pop();
-    // Track active leases so duplicated release() calls can be rejected.
+    // 记录借出连接，后续 release() 可据此校验合法性。
     in_use_conns_.insert(conn);
     return conn;
 }
@@ -68,13 +68,13 @@ void DBConnectionPool::release(MockDBConnection* conn) {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto it = in_use_conns_.find(conn);
         if (it == in_use_conns_.end()) {
-            // Reject duplicated/foreign releases to keep pool state sane.
+            // 拒绝重复归还或外部非法连接，保持池状态一致。
             return;
         }
         in_use_conns_.erase(it);
         free_conns_.push(conn);
     }
-    // Wake one waiting acquirer.
+    // 唤醒一个等待 acquire() 的线程。
     cv_.notify_one();
 }
 
@@ -88,6 +88,6 @@ DBConnGuard::DBConnGuard(DBConnectionPool& pool, std::chrono::milliseconds timeo
 }
 
 DBConnGuard::~DBConnGuard() {
-    // Safe even when conn_ is nullptr.
+    // 即使 conn_ 为空也安全（release 内部会直接返回）。
     pool_.release(conn_);
 }

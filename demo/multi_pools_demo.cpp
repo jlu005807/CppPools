@@ -14,6 +14,7 @@
 #include <vector>
 
 struct DemoContext {
+    // 用于模拟一次请求在后端链路中的上下文数据。
     int request_id{0};
     int user_id{0};
     std::string trace;
@@ -63,15 +64,19 @@ DBPoolConfig build_db_config_from_env() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    // Optional args:
-    //   argv[1] = task_count (default 1000)
-    //   argv[2] = worker_count (default 6)
+    // 可选命令行参数：
+    //   argv[1] = task_count 任务数（默认 1000）
+    //   argv[2] = worker_count 线程池工作线程数（默认 6）
     const int task_count = (argc > 1) ? std::atoi(argv[1]) : 1000;
     const int worker_count = (argc > 2) ? std::atoi(argv[2]) : 6;
 
     const int safe_task_count = std::max(task_count, 1);
     const int safe_worker_count = std::max(worker_count, 1);
 
+    // 初始化三大池子：
+    // 1) ThreadPool：负责并发执行任务
+    // 2) ObjectPool：复用请求上下文对象
+    // 3) DBConnectionPool：复用数据库连接（mock/mysql）
     ThreadPool thread_pool(static_cast<std::size_t>(safe_worker_count));
     ObjectPool<DemoContext> object_pool(128);
     const DBPoolConfig db_cfg = build_db_config_from_env();
@@ -90,23 +95,28 @@ int main(int argc, char** argv) {
     const auto begin_all = std::chrono::steady_clock::now();
     for (int i = 0; i < safe_task_count; ++i) {
         futures.emplace_back(thread_pool.submit([i, &object_pool, &db_pool, &success_count, &fail_count, &latencies_ms, &latency_mutex]() {
+            // 从对象池借出上下文对象，离开作用域后会自动归还。
             auto ctx = object_pool.acquire();
             ctx->request_id = i + 1;
             ctx->user_id = (i % 200) + 1;
             ctx->trace = "multi-pool-demo";
 
             const auto begin_one = std::chrono::steady_clock::now();
+            // 通过 RAII guard 获取并管理 DB 连接。
+            // 100ms 内拿不到连接则记为失败，避免线程无界等待。
             DBConnGuard guard(db_pool, std::chrono::milliseconds(100));
             if (!guard.valid()) {
                 ++fail_count;
                 return;
             }
 
+            // 模拟一次查询（mock 模式会 sleep，mysql 模式走真实 SQL）。
             (void)guard.get()->query_user_score(ctx->user_id);
             const auto end_one = std::chrono::steady_clock::now();
 
             const double ms = std::chrono::duration_cast<std::chrono::microseconds>(end_one - begin_one).count() / 1000.0;
             {
+                // 延迟数组是共享资源，写入时需要互斥保护。
                 std::lock_guard<std::mutex> lock(latency_mutex);
                 latencies_ms.push_back(ms);
             }
@@ -119,6 +129,7 @@ int main(int argc, char** argv) {
     }
     const auto end_all = std::chrono::steady_clock::now();
 
+    // 汇总吞吐与平均延迟，验证三池联动的整体效果。
     const double total_ms =
         std::chrono::duration_cast<std::chrono::microseconds>(end_all - begin_all).count() / 1000.0;
     const double qps = (total_ms > 0.0) ? (success_count.load() * 1000.0 / total_ms) : 0.0;
@@ -155,4 +166,3 @@ int main(int argc, char** argv) {
 
     return 0;
 }
-

@@ -53,9 +53,9 @@ DBPoolConfig build_db_config_from_env() {
 }
 
 HttpServerConfig build_server_config_from_env() {
-    // Optional tuning env vars:
-    //   CPPPOOLS_DB_ACQUIRE_TIMEOUT_MS
-    //   CPPPOOLS_LATENCY_WINDOW_SIZE
+    // 可选调优环境变量：
+    //   CPPPOOLS_DB_ACQUIRE_TIMEOUT_MS  连接池获取超时（毫秒）
+    //   CPPPOOLS_LATENCY_WINDOW_SIZE    延迟统计滑动窗口大小
     HttpServerConfig cfg;
     cfg.db_acquire_timeout = std::chrono::milliseconds(
         static_cast<int>(env_to_uint("CPPPOOLS_DB_ACQUIRE_TIMEOUT_MS", 100)));
@@ -66,11 +66,11 @@ HttpServerConfig build_server_config_from_env() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    // Optional CLI args:
-    //   argv[1] = port (default 8080)
-    //   argv[2] = worker count (default 6)
+    // 可选命令行参数：
+    //   argv[1] = 端口（默认 8080）
+    //   argv[2] = 线程池 worker 数（默认 6）
     //
-    // Optional DB env vars:
+    // 可选数据库环境变量：
     //   CPPPOOLS_DB_MODE=mock|mysql
     //   CPPPOOLS_DB_HOST / CPPPOOLS_DB_PORT
     //   CPPPOOLS_DB_USER / CPPPOOLS_DB_PASSWORD
@@ -80,6 +80,8 @@ int main(int argc, char** argv) {
     const int worker_count = (argc > 2) ? std::atoi(argv[2]) : 6;
 
     try {
+        // 初始化“三大池子 + HTTP 服务”。
+        // 这里的池子对象由 main 统一管理生命周期，服务内部只持引用。
         ThreadPool thread_pool(static_cast<std::size_t>(std::max(worker_count, 1)));
         ObjectPool<RequestContext> request_pool(128);
         const DBPoolConfig db_cfg = build_db_config_from_env();
@@ -96,6 +98,7 @@ int main(int argc, char** argv) {
         std::cout << "db acquire timeout(ms): " << server_cfg.db_acquire_timeout.count() << '\n';
         std::cout << "latency window size: " << server_cfg.latency_window_size << '\n';
 
+        // 启动 HTTP 服务（阻塞运行）。
         HttpServer server(
             static_cast<uint16_t>(std::max(port, 1)),
             thread_pool,

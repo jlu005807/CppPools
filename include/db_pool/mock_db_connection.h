@@ -2,15 +2,15 @@
 
 #include <string>
 
-// MockDBConnection now supports two runtime modes:
-// 1) Mock mode (default): deterministic simulated query
-// 2) MySQL mode: real query via MySQL C client (enabled by CPPPOOLS_USE_MYSQL)
+// MockDBConnection 支持两种运行模式：
+// 1) Mock 模式（默认）：使用可复现的模拟查询结果；
+// 2) MySQL 模式：通过 MySQL C API 进行真实查询（需启用 CPPPOOLS_USE_MYSQL）。
 class MockDBConnection {
 public:
-    // Mock mode constructor.
+    // Mock 模式构造函数。
     explicit MockDBConnection(int id);
 
-    // MySQL mode constructor.
+    // MySQL 模式构造函数。
     MockDBConnection(int id,
                      std::string host,
                      unsigned int port,
@@ -27,10 +27,10 @@ public:
     int id() const { return id_; }
     bool is_mysql_mode() const { return mysql_mode_; }
 
-    // Returns true when connection is usable.
+    // 连接可用性检测。
     bool healthy();
 
-    // Unified query API used by upper layers.
+    // 对上层暴露统一查询接口，内部根据模式分发。
     std::string query_user_score(int user_id);
 
 private:
@@ -51,4 +51,3 @@ private:
     struct MYSQL* mysql_{nullptr};
 #endif
 };
-

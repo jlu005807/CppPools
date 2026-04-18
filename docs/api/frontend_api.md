@@ -1,74 +1,65 @@
-﻿# 前端 API 与页面说明
+﻿# 前端页面与接口调用文档
 
----
+实现文件：`web/index.html`、`web/app.js`
 
-## 1. 页面入口
+## 1. 页面定位
 
-- 首页：`/`（`web/index.html` + `web/app.js`）
-- 三池联动页：`/multi`（`web/multi_pool.html` + `web/multi_pool.js`）
+前端只保留一个中文单页：`/`（即 `web/index.html`）。
 
----
+目标是“最小操作 + 指标可见”，突出后端三大池子与网络 API，而不是复杂前端交互。
 
-## 2. 首页（`app.js`）
+## 2. 页面能力
 
-首页功能重点：
+页面提供两个操作按钮：
 
-- 发送单次请求：调用 `/api/process?user=<id>`
-- Burst 并发请求：并发调用多次 `/api/process`
-- 周期刷新指标：调用 `/api/stats`
-- 背景粒子可视化：用于演示感和交互体验
+- `发送单次请求`：调用 `/api/process?user=<id>`
+- `并发请求 x5`：并发调用 5 次 `/api/process`
 
-关键展示指标：
+页面自动轮询：
 
-- 最近请求 `request_id`
-- 当前请求延迟
-- `db_free / db_total`
-- `memory_pool_in_use`
-- `thread_pool_pending`
+- 每 1 秒调用一次 `/api/stats`
+- 实时更新线程池、内存池、连接池和延迟指标
 
----
+## 3. 前端使用的后端接口
 
-## 3. 三池联动页（`multi_pool.js`）
+### 3.1 `GET /api/process?user=<id>`
 
-三池联动页聚焦于“池化指标 + 趋势图”。
+用途：触发一次后端业务处理链路，返回本次请求结果。
 
-### 3.1 指标来源
+前端行为：
 
-`/api/stats` 提供：
+- 显示 JSON 响应到结果面板
+- 显示请求耗时（浏览器侧测量）
+
+### 3.2 `GET /api/stats`
+
+用途：获取实时统计指标。
+
+前端读取字段：
 
 - `thread_pool_workers`
 - `thread_pool_pending`
-- `memory_pool_in_use`
-- `memory_pool_available`
-- `memory_pool_total`
 - `db_pool_free`
 - `db_pool_total`
+- `memory_pool_in_use`
+- `memory_pool_available`
 - `total_requests`
+- `avg_latency_ms`
 - `p95_latency_ms`
+- `p99_latency_ms`
 
-### 3.2 可视化能力
+## 4. 交互与容错
 
-- 资源占用条：线程池/内存池/连接池
-- 实时折线图：
-  - 曲线 1：`ThreadPool Pending`
-  - 曲线 2：`P95 Latency (ms)`
-- 操作区：
-  - 单次请求
-  - 并发压测（x20）
+- 输入校验：`user` 必须是非负整数
+- 网络异常：保留页面可操作，不会导致页面崩溃
+- 指标拉取失败：忽略本次刷新，等待下一次轮询
 
-### 3.3 轮询策略
+## 5. 访问方式
 
-- 周期：约 1.5 秒
-- 端点：`GET /api/stats`
-- 异常处理：保留上次可视化状态，避免闪烁
+启动 `demo_server` 后访问：
 
----
+- `http://127.0.0.1:8080/`
 
-## 4. 前后端对齐点
+如果修改端口，例如 `demo_server 8090 6`，则访问：
 
-- `/api/stats` 的分位数字段为：
-  - `p50_latency_ms`
-  - `p95_latency_ms`
-  - `p99_latency_ms`
-- `/multi` 页面当前使用 `p95_latency_ms` 作为延迟趋势展示。
-- `db_mode`（`mock`/`mysql`）切换后，前端无需改动即可继续展示同一仪表盘。
+- `http://127.0.0.1:8090/`

@@ -108,11 +108,9 @@ std::string static_content_type(const std::string& asset_path) {
 }
 
 bool is_allowed_static_route(const std::string& route_path) {
-    static const std::array<const char*, 4> kAllowed = {
+    static const std::array<const char*, 2> kAllowed = {
         "/index.html",
-        "/app.js",
-        "/multi_pool.html",
-        "/multi_pool.js"
+        "/app.js"
     };
     for (const char* v : kAllowed) {
         if (route_path == v) {
@@ -295,10 +293,7 @@ std::string HttpServer::route_request(const std::string& request, int request_id
         return build_http_response(body.str(), "application/json; charset=utf-8");
     }
 
-    std::string static_route = (route_path == "/") ? "/index.html" : route_path;
-    if (route_path == "/multi") {
-        static_route = "/multi_pool.html";
-    }
+    const std::string static_route = (route_path == "/") ? "/index.html" : route_path;
 
     if (is_allowed_static_route(static_route)) {
         static_requests_.fetch_add(1, std::memory_order_relaxed);

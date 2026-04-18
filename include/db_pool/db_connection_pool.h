@@ -15,11 +15,11 @@
 struct DBPoolConfig {
     std::size_t pool_size{8};
 
-    // false -> mock mode
-    // true  -> mysql mode
+    // false -> mock 模式
+    // true  -> mysql 模式
     bool use_mysql{false};
 
-    // MySQL settings (used only when use_mysql=true).
+    // MySQL 参数（仅在 use_mysql=true 时生效）。
     std::string host{"127.0.0.1"};
     unsigned int port{3306};
     std::string user{"root"};
@@ -28,14 +28,14 @@ struct DBPoolConfig {
     std::string table{"user_scores"};
 };
 
-// DBConnectionPool: bounded reusable connection container.
+// DBConnectionPool：有界连接池。
 //
-// acquire(timeout):
-//   waits up to timeout for a free connection.
-//   returns nullptr on timeout.
+// acquire(timeout)：
+//   最多等待 timeout 时长来获取空闲连接；
+//   超时返回 nullptr，避免业务线程无限阻塞。
 //
-// release(conn):
-//   returns connection to queue and notifies a waiting thread.
+// release(conn)：
+//   将连接归还到空闲队列，并唤醒一个等待中的线程。
 class DBConnectionPool {
 public:
     explicit DBConnectionPool(std::size_t pool_size);
@@ -45,10 +45,10 @@ public:
     DBConnectionPool(const DBConnectionPool&) = delete;
     DBConnectionPool& operator=(const DBConnectionPool&) = delete;
 
-    // Returns nullptr when timeout is reached.
+    // 超时时返回 nullptr。
     MockDBConnection* acquire(std::chrono::milliseconds timeout);
 
-    // Return a connection back to free queue.
+    // 将连接归还到空闲队列。
     void release(MockDBConnection* conn);
 
     std::size_t free_count() const;
@@ -58,24 +58,24 @@ public:
     const DBPoolConfig& config() const { return config_; }
 
 private:
-    // Protects free queue and count inspection.
+    // 保护连接队列和统计数据。
     mutable std::mutex mutex_;
-    // Coordinates waiting acquire() calls.
+    // 协调 acquire() 的等待与唤醒。
     std::condition_variable cv_;
-    // Available reusable connections.
+    // 当前可借出的空闲连接。
     std::queue<MockDBConnection*> free_conns_;
-    // Borrowed connections currently checked out by callers.
-    // This set lets release() reject duplicated/invalid returns safely.
+    // 当前已借出连接集合。
+    // 用于防御重复归还/非法归还，避免同一连接被重复入队。
     std::unordered_set<MockDBConnection*> in_use_conns_;
-    // Owning list of all connections.
+    // 对全部连接对象的所有权容器。
     std::vector<std::unique_ptr<MockDBConnection>> all_conns_;
-    // Fixed max connections created at initialization.
+    // 初始化时创建的固定连接总数（上限）。
     std::size_t total_count_{0};
     DBPoolConfig config_;
 };
 
-// DBConnGuard wraps acquire/release with RAII, so every successful acquire
-// is safely returned even when exceptions happen in business logic.
+// DBConnGuard：基于 RAII 的连接托管器。
+// 只要成功 acquire，即使业务中抛异常，析构时也会自动 release。
 class DBConnGuard {
 public:
     DBConnGuard(DBConnectionPool& pool, std::chrono::milliseconds timeout);

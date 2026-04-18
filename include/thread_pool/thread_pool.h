@@ -12,12 +12,12 @@
 #include <utility>
 #include <vector>
 
-// ThreadPool: a fixed-size worker pool for async task execution.
+// ThreadPool：固定大小的工作线程池，用于异步执行任务。
 //
-// Design goals:
-// 1) Reuse worker threads to avoid frequent thread creation/destruction.
-// 2) Provide a generic submit(...) API with future-based result retrieval.
-// 3) Shutdown gracefully: finish queued tasks, then join all workers.
+// 设计目标：
+// 1) 线程复用：避免高频创建/销毁线程带来的系统开销。
+// 2) 通用提交接口：支持任意可调用对象，并通过 future 获取结果。
+// 3) 优雅关闭：停止接收新任务，但保证队列中已有任务执行完成后再退出。
 class ThreadPool {
 public:
     explicit ThreadPool(std::size_t thread_count);
@@ -27,21 +27,21 @@ public:
     ThreadPool& operator=(const ThreadPool&) = delete;
 
     template <class F, class... Args>
-    // submit(...) pushes a task into queue and returns future for result.
-    // Throws std::runtime_error when pool is already shutting down.
+    // submit(...)：向队列提交任务，并返回 future 用于等待结果。
+    // 当线程池已经进入关闭流程时，抛出 std::runtime_error。
     auto submit(F&& f, Args&&... args) -> std::future<std::invoke_result_t<F, Args...>>;
 
-    // Stop accepting new tasks and wait for all workers to exit.
+    // 停止接收新任务，并等待所有工作线程退出。
     void shutdown();
 
-    // Number of worker threads currently owned by the pool.
+    // 当前线程池持有的工作线程数量。
     std::size_t worker_count() const;
 
-    // Approximate count of tasks currently waiting in queue.
+    // 当前任务队列中的待执行任务数量（近似快照）。
     std::size_t pending_tasks() const;
 
 private:
-    // Core routine run by every worker thread.
+    // 每个工作线程的核心循环逻辑。
     void worker_loop();
 
     std::vector<std::thread> workers_;
@@ -56,8 +56,8 @@ template <class F, class... Args>
 auto ThreadPool::submit(F&& f, Args&&... args) -> std::future<std::invoke_result_t<F, Args...>> {
     using ReturnType = std::invoke_result_t<F, Args...>;
 
-    // packaged_task bridges a callable and a future:
-    // worker executes packaged_task, caller waits on future.
+    // packaged_task 用于把“可调用对象”和 future 绑定起来：
+    // 工作线程执行 packaged_task，调用方通过 future 获取结果/异常。
     auto task = std::make_shared<std::packaged_task<ReturnType()>>(
         std::bind(std::forward<F>(f), std::forward<Args>(args)...));
 
@@ -67,10 +67,10 @@ auto ThreadPool::submit(F&& f, Args&&... args) -> std::future<std::invoke_result
         if (stop_) {
             throw std::runtime_error("submit on stopped ThreadPool");
         }
-        // Store as type-erased void() task, keeping interface simple.
+        // 统一存储为 void() 任务，简化队列类型与调度逻辑。
         tasks_.emplace([task]() { (*task)(); });
     }
-    // Wake one sleeping worker to consume the new task.
+    // 唤醒一个休眠线程来消费新任务。
     cv_.notify_one();
     return fut;
 }

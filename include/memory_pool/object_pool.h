@@ -11,16 +11,16 @@
 #include <type_traits>
 #include <utility>
 
-// ObjectPool<T>: simple thread-safe reusable object storage.
+// ObjectPool<T>：线程安全的对象复用池。
 //
-// Usage:
+// 用法示例：
 //   ObjectPool<Foo> pool(128);
-//   auto foo = pool.acquire(...);  // foo is unique_ptr with custom deleter
-//   // when foo goes out of scope, it is returned to pool automatically.
+//   auto foo = pool.acquire(...);  // 带自定义 deleter 的 unique_ptr
+//   // foo 离开作用域后会自动归还到池中（RAII）。
 template <typename T>
 class ObjectPool {
 public:
-    // RAII handle. Releasing this pointer returns object back to pool.
+    // RAII 句柄：释放 unique_ptr 时会自动把对象放回池中。
     using Ptr = std::unique_ptr<T, std::function<void(T*)>>;
 
     explicit ObjectPool(std::size_t init_size) {
@@ -35,9 +35,9 @@ public:
 
     ~ObjectPool() {
         std::lock_guard<std::mutex> lock(mutex_);
-        // Important lifetime contract:
-        // all acquired handles must be destroyed before ObjectPool itself.
-        // In debug builds this assert catches accidental dangling handles.
+        // 关键生命周期约束：
+        // ObjectPool 析构前，所有已借出的句柄都必须先析构并归还。
+        // 该断言可在调试阶段及时发现“池先销毁、对象后归还”的错误用法。
         assert(in_use_ == 0 && "ObjectPool destroyed while objects are still in use");
         while (!free_list_.empty()) {
             delete free_list_.front();
@@ -52,22 +52,22 @@ public:
     Ptr acquire(Args&&... args) {
         T* obj = nullptr;
         {
-            // Keep lock scope minimal: only manipulate pool bookkeeping here.
+            // 锁粒度尽量小：临界区内只做池状态更新，不做对象重置。
             std::lock_guard<std::mutex> lock(mutex_);
             if (!free_list_.empty()) {
-                // Reuse an existing object first.
+                // 优先复用空闲对象，减少动态分配。
                 obj = free_list_.front();
                 free_list_.pop();
             } else {
-                // Grow on demand if pool exhausted.
+                // 池耗尽时按需扩容，保证调用方始终可获取对象。
                 obj = new T();
                 ++total_size_;
             }
             ++in_use_;
         }
 
-        // Reinitialize content for caller to avoid stale state.
-        // This happens outside lock to reduce contention.
+        // 出池后重置对象内容，避免脏数据污染后续逻辑。
+        // 放在锁外执行，降低锁竞争。
         reset_object(obj, std::forward<Args>(args)...);
         return Ptr(obj, [this](T* p) { this->release(p); });
     }
@@ -90,14 +90,14 @@ public:
 private:
     template <typename... Args>
     static void reset_object(T* obj, Args&&... args) {
-        // Assign a reconstructed value. This keeps implementation simple and
-        // works well for request/context-like structs.
+        // 通过“重建赋值”恢复对象到可用状态。
+        // 对 RequestContext 这类轻量结构体非常实用，代码也更直观。
         *obj = T(std::forward<Args>(args)...);
     }
 
     void release(T* obj) {
         std::lock_guard<std::mutex> lock(mutex_);
-        // Return object into free list for next acquire().
+        // 归还到空闲队列，供下一次 acquire() 复用。
         free_list_.push(obj);
         assert(in_use_ > 0 && "ObjectPool in_use_ underflow");
         --in_use_;

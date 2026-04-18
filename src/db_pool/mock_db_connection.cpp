@@ -85,10 +85,10 @@ std::string MockDBConnection::query_user_score(int user_id) {
 }
 
 std::string MockDBConnection::query_user_score_mock(int user_id) const {
-    // Simulate I/O latency from remote DB/network.
+    // 模拟远程数据库/网络 I/O 延迟，让压测更接近真实场景。
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
-    // Deterministic pseudo-score keeps demo repeatable.
+    // 生成可复现的伪分数，方便教学演示时对比结果。
     const int score = (user_id * 17 + id_ * 3) % 101;
 
     std::ostringstream oss;
@@ -154,4 +154,3 @@ std::string MockDBConnection::query_user_score_mysql(int user_id) {
     return oss.str();
 #endif
 }
-
