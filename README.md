@@ -1,87 +1,176 @@
 ﻿# CppPools
 
-`CppPools` 是一个面向学习与面试展示的 C++17 项目，围绕三类高频基础组件展开：
+一个面向学习与面试展示的 **C++17 高并发基础组件项目**。
+项目核心是“三大池化组件 + 网络服务串联”：
 
 - `ThreadPool`：线程复用与异步任务调度
 - `ObjectPool<T>`：小对象复用，减少频繁 `new/delete`
-- `DBConnectionPool`：数据库连接复用（支持 `mock` / `mysql` 两种模式）
+- `DBConnectionPool`：数据库连接复用（支持 `mock/mysql`）
+- `HttpServer`：将三类池子接入同一请求链路，并提供可视化页面
 
-并提供一个轻量 HTTP 服务，将三者串到同一请求链路中：
+请求链路：
 
 `HTTP Request -> ThreadPool -> ObjectPool<RequestContext> -> DBConnectionPool -> JSON Response`
 
 ---
 
-## 1. 项目结构
+## 1. 项目结构（含注释）
 
 ```text
 CppPools/
-├── CMakeLists.txt
-├── README.md
+├── CMakeLists.txt                # CMake 构建入口（目标、依赖、MySQL 选项）
+├── README.md                     # 项目说明文档
 ├── include/
 │   ├── thread_pool/
+│   │   └── thread_pool.h         # 线程池接口（submit/future/shutdown）
 │   ├── memory_pool/
+│   │   └── object_pool.h         # 通用对象池模板（RAII 自动归还）
 │   ├── db_pool/
+│   │   ├── db_connection_pool.h  # 连接池接口与 RAII Guard
+│   │   └── mock_db_connection.h  # mock/mysql 统一连接抽象
 │   └── server/
+│       └── http_server.h         # HTTP 服务接口与统计结构
 ├── src/
 │   ├── thread_pool/
+│   │   └── thread_pool.cpp       # 线程池实现
 │   ├── db_pool/
+│   │   ├── db_connection_pool.cpp# 连接池实现（超时获取、归还校验）
+│   │   └── mock_db_connection.cpp# mock 查询 + MySQL 查询实现
 │   └── server/
+│       └── http_server.cpp       # 路由、指标统计、静态资源服务
 ├── demo/
-│   ├── main.cpp
-│   ├── multi_pools_demo.cpp
-│   └── server_main.cpp
+│   ├── main.cpp                  # 线程池基础 demo
+│   ├── multi_pools_demo.cpp      # 命令行三池联动压测 demo
+│   └── server_main.cpp           # HTTP 服务启动入口
 ├── tests/
-│   ├── test_thread_pool.cpp
-│   └── test_pools.cpp
+│   ├── test_thread_pool.cpp      # 线程池测试
+│   └── test_pools.cpp            # 对象池/连接池测试（超时、RAII、重复归还）
 ├── web/
-│   ├── index.html
-│   ├── app.js
-│   ├── multi_pool.html
-│   └── multi_pool.js
+│   ├── index.html                # 主可视化页面
+│   ├── app.js                    # 主页面交互逻辑
+│   ├── multi_pool.html           # 三池联动仪表盘页面
+│   └── multi_pool.js             # pending/latency 实时图逻辑
+├── scripts/
+│   └── run_server_mysql.ps1      # Windows 一键启动 MySQL 模式脚本
 ├── docs/
-│   ├── learning_log.md
-│   ├── mysql_setup.sql
-│   └── api/
-│       ├── backend_api.md
-│       └── frontend_api.md
-├── build/      # CMake 中间文件
-└── output/     # 构建产物目录（可执行文件/库）
+│   ├── api/
+│   │   ├── backend_api.md        # 后端 API 文档
+│   │   └── frontend_api.md       # 前端 API 文档
+│   ├── mysql_setup.sql           # MySQL 初始化脚本
+│   └── learning_log.md           # 学习迭代记录
+├── build/                        # CMake 中间构建目录（可删可重建）
+└── output/                       # 最终产物目录（bin/lib）
 ```
 
 ---
 
-## 2. 构建与输出目录
+## 2. 各模块实现说明
 
-本项目将构建产物统一放到 `output/`：
+### 2.1 ThreadPool（线程池）
 
-- 可执行文件：`output/bin/`
-- 库文件：`output/lib/`
+功能：
 
-### 2.1 CMake 构建
+- 固定工作线程
+- `submit(...)` 提交任意可调用对象
+- 返回 `std::future` 获取异步结果
+- `shutdown()` 优雅关闭，先清空任务再退出线程
+
+关键实现点：
+
+- `std::queue<std::function<void()>>` + `mutex + condition_variable`
+- 任务通过 `std::packaged_task` 封装，异常可透传给 `future`
+
+---
+
+### 2.2 ObjectPool<T>（对象池）
+
+功能：
+
+- 复用高频对象，降低堆分配压力
+- `acquire()` 返回带自定义 deleter 的 `unique_ptr`
+- 句柄析构时自动归还对象（RAII）
+
+关键实现点：
+
+- 空闲队列 `free_list_`
+- 占用计数 `in_use_`
+- 析构时断言检查（调试期可捕获“对象池先析构”的错误用法）
+
+---
+
+### 2.3 DBConnectionPool（数据库连接池）
+
+功能：
+
+- 支持 `mock/mysql` 两种模式
+- `acquire(timeout)` 超时获取连接
+- `DBConnGuard` 自动归还连接
+- 防御性处理重复归还（避免连接重复入队）
+
+关键实现点：
+
+- `free_conns_`（空闲连接队列）
+- `in_use_conns_`（借出连接集合）
+- `condition_variable::wait_for` 做超时等待
+
+---
+
+### 2.4 HttpServer（服务编排层）
+
+功能：
+
+- 处理 `GET` 请求并路由
+- 提供静态页面：`/`、`/multi`
+- 提供 API：`/api/health`、`/api/stats`、`/api/process`
+- 统计延迟窗口并输出 `avg/p50/p95/p99`
+
+关键实现点：
+
+- `/api/process?user=<id>` 严格参数校验（非法返回 `400`）
+- `HttpServerConfig` 支持运行时可调：
+  - `db_acquire_timeout`
+  - `latency_window_size`
+
+---
+
+## 3. 构建与运行指南
+
+### 3.1 通用构建（mock 模式）
 
 ```bash
 cmake -S . -B build
 cmake --build build
 ```
 
-### 2.2 运行测试
+产物位置：
+
+- 可执行文件：`output/bin`
+- 库文件：`output/lib`
+
+---
+
+### 3.2 运行测试
 
 ```bash
+# 方式一（推荐）
 ctest --test-dir build --output-on-failure
+
+# 方式二（直接运行）
+./output/bin/test_thread_pool
+./output/bin/test_pools
 ```
 
 ---
 
-## 3. 快速运行
+### 3.3 运行 Demo
 
-### 3.1 线程池 Demo
+线程池 demo：
 
 ```bash
 ./output/bin/demo_thread_pool
 ```
 
-### 3.2 三池联动压测 Demo
+三池联动命令行 demo：
 
 ```bash
 ./output/bin/demo_multi_pools
@@ -89,13 +178,7 @@ ctest --test-dir build --output-on-failure
 ./output/bin/demo_multi_pools <task_count> <worker_count>
 ```
 
-示例：
-
-```bash
-./output/bin/demo_multi_pools 2000 8
-```
-
-### 3.3 HTTP 服务 Demo
+HTTP 服务：
 
 ```bash
 ./output/bin/demo_server
@@ -103,145 +186,69 @@ ctest --test-dir build --output-on-failure
 ./output/bin/demo_server <port> <worker_count>
 ```
 
-示例：
-
-```bash
-./output/bin/demo_server 8080 6
-```
-
 访问：
 
-- 首页：`http://127.0.0.1:8080/`
-- 三池联动可视化页面：`http://127.0.0.1:8080/multi`
+- `http://127.0.0.1:8080/`
+- `http://127.0.0.1:8080/multi`
 
 ---
 
-## 4. 已实现的关键能力
+## 4. MySQL 模式（Windows + MinGW）
 
-### 4.1 `/api/stats` 延迟分位数
+> 关键：请使用 `libmysql.lib`，不要使用 `mysqlclient.lib`（MinGW 下常导致链接失败）。
 
-`/api/stats` 增加了延迟窗口统计字段：
+### 4.1 构建
 
-- `latency_samples`
-- `p50_latency_ms`
-- `p95_latency_ms`
-- `p99_latency_ms`
+```powershell
+Set-Location D:\Internt_of_Thing\CppPools
+Remove-Item -Recurse -Force .\build -ErrorAction SilentlyContinue
 
-这些值来自最近一段 `/api/process` 请求的处理时延样本。
+cmake -S . -B build -G Ninja `
+  -DCPPPOOLS_USE_MYSQL=ON `
+  -DMYSQL_INCLUDE_DIR="C:/Program Files/MySQL/MySQL Server 8.0/include" `
+  -DMYSQL_LIBRARY="C:/Program Files/MySQL/MySQL Server 8.0/lib/libmysql.lib"
 
-### 4.2 `/multi` 实时趋势图
-
-`/multi` 页面新增实时折线图，展示：
-
-- `ThreadPool Pending`
-- `P95 Latency (ms)`
-
-前端按固定周期轮询 `/api/stats` 并更新折线与资源占用条。
-
-### 4.3 DBPool 支持真实 MySQL
-
-`DBConnectionPool` 支持两种模式：
-
-- `mock`：默认，便于快速演示
-- `mysql`：真实 MySQL 连接池
-
-`/api/stats` 中的 `db_mode` 会显示当前模式，仪表盘展示逻辑保持一致。
-
----
-
-## 5. 启用 MySQL 连接池
-
-> 先准备 MySQL 客户端开发库，再开启 CMake 选项。
-
-### 5.1 开启编译选项
-
-```bash
-cmake -S . -B build -DCPPPOOLS_USE_MYSQL=ON
-cmake --build build
+cmake --build build -v
 ```
 
-### 5.2 设置运行时环境变量（Windows）
+### 4.2 初始化数据库
 
-```bash
-set CPPPOOLS_DB_MODE=mysql
-set CPPPOOLS_DB_HOST=127.0.0.1
-set CPPPOOLS_DB_PORT=3306
-set CPPPOOLS_DB_USER=root
-set CPPPOOLS_DB_PASSWORD=your_password
-set CPPPOOLS_DB_NAME=cpppools
-set CPPPOOLS_DB_TABLE=user_scores
-set CPPPOOLS_DB_POOL_SIZE=8
+```powershell
+Get-Content .\docs\mysql_setup.sql | & "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -uroot -p123456
 ```
 
-### 5.3 初始化示例表
-
-参考：`docs/mysql_setup.sql`
-
----
-
-## 6. 文档索引
-
-- 后端 API：`docs/api/backend_api.md`
-- 前端 API 与页面交互：`docs/api/frontend_api.md`
-- MySQL 初始化脚本：`docs/mysql_setup.sql`
-
----
-
-## 7. 后续可扩展方向
-
-1. `DBConnectionPool` 增加断线重连与心跳检测
-2. 引入统一日志（如 `spdlog`）并增加结构化指标
-3. 增加更系统的 benchmark（吞吐、延迟分位数、资源占用）
-4. 为 HTTP 层补充 keep-alive、请求解析与异常恢复能力
-
----
-
-## 8. Windows 一键启动 MySQL 模式
-
-项目提供了脚本：`scripts/run_server_mysql.ps1`，会自动：
-
-- 注入 MySQL `lib/bin` 到 `PATH`
-- 设置 `CPPPOOLS_DB_*` 环境变量
-- 启动服务端并保持同样仪表盘展示
-
-示例：
+### 4.3 启动服务（推荐脚本）
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\run_server_mysql.ps1 -DbPassword 123456 -Port 8080 -Workers 6
 ```
 
-如果你的 MySQL 不在默认路径，可额外指定：
+快速自检：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\run_server_mysql.ps1 -MySQLRoot "D:\\MySQL\\MySQL Server 8.0" -DbPassword 123456
+Invoke-RestMethod http://127.0.0.1:8080/api/stats | Select-Object db_mode,db_pool_total,p95_latency_ms
 ```
 
-### 8.1 CMake 目标说明（MySQL 模式）
+若 `db_mode=mysql`，说明真实连接池已生效。
 
-当以 `-DCPPPOOLS_USE_MYSQL=ON` 配置后：
+---
 
-- 标准目标仍是 `demo_server`
-- 额外提供标准目标入口 `demo_server_mysql`（依赖 `demo_server`）
-- 构建后会自动在 `output/bin` 下生成 `demo_server_mysql(.exe)` 兼容文件名
+## 5. API 概览
 
-可直接执行：
+- `GET /api/health`：健康检查
+- `GET /api/stats`：运行指标（线程池、内存池、连接池、延迟分位数）
+- `GET /api/process?user=<id>`：业务请求模拟（非法参数返回 `400`）
 
-```bash
-cmake --build build --target demo_server_mysql
-```
+详细说明见：
 
-## 9. New Server Tuning Knobs (Learning Enhancements)
+- `docs/api/backend_api.md`
+- `docs/api/frontend_api.md`
 
-The server now supports extra runtime env vars:
+---
 
-- `CPPPOOLS_DB_ACQUIRE_TIMEOUT_MS` (default `100`)
-- `CPPPOOLS_LATENCY_WINDOW_SIZE` (default `1024`)
+## 6. 下一步可扩展方向
 
-`GET /api/stats` now also returns:
-
-- `avg_latency_ms`
-- `db_acquire_timeout_ms`
-- `latency_window_size`
-
-`GET /api/process?user=<id>` now validates `user` strictly.
-If `user` is missing or not a non-negative integer, server returns `400 Bad Request`.
+1. 连接池健康检查与断线重连
+2. 更完整 benchmark（吞吐、延迟分位、资源占用）
+3. 引入结构化日志（如 `spdlog`）
+4. HTTP keep-alive 与更完整请求解析
