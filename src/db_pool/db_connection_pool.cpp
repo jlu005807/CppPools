@@ -1,5 +1,6 @@
 #include "db_pool/db_connection_pool.h"
 
+#include <cassert>
 #include <stdexcept>
 
 namespace {
@@ -42,9 +43,16 @@ DBConnectionPool::DBConnectionPool(const DBPoolConfig& config)
         free_conns_.push(conn.get());
         all_conns_.push_back(std::move(conn));
     }
+    // 构造完成后所有连接都处于空闲状态，初始化 atomic 镜像。
+    free_count_atomic_.store(config_.pool_size, std::memory_order_relaxed);
 }
 
-DBConnectionPool::~DBConnectionPool() = default;
+DBConnectionPool::~DBConnectionPool() {
+    // 与 ObjectPool 的析构约束保持一致：所有借出的连接必须先归还，
+    // 否则 DBConnGuard 持有的指针在 pool 析构后会变野。
+    // 仅在 Debug 模式下生效，Release 版本零开销。
+    assert(in_use_conns_.empty() && "DBConnectionPool destroyed while connections are still in use");
+}
 
 MockDBConnection* DBConnectionPool::acquire(std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lock(mutex_);
@@ -57,6 +65,8 @@ MockDBConnection* DBConnectionPool::acquire(std::chrono::milliseconds timeout) {
     free_conns_.pop();
     // 记录借出连接，后续 release() 可据此校验合法性。
     in_use_conns_.insert(conn);
+    // 同步更新 atomic 镜像，使 free_count() 的无锁读取始终与队列长度一致。
+    free_count_atomic_.fetch_sub(1, std::memory_order_relaxed);
     return conn;
 }
 
@@ -73,14 +83,15 @@ void DBConnectionPool::release(MockDBConnection* conn) {
         }
         in_use_conns_.erase(it);
         free_conns_.push(conn);
+        free_count_atomic_.fetch_add(1, std::memory_order_relaxed);
     }
     // 唤醒一个等待 acquire() 的线程。
     cv_.notify_one();
 }
 
 std::size_t DBConnectionPool::free_count() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return free_conns_.size();
+    // 无锁读取：/api/stats 高频查询场景下避免和 acquire/release 抢 mutex_。
+    return free_count_atomic_.load(std::memory_order_relaxed);
 }
 
 DBConnGuard::DBConnGuard(DBConnectionPool& pool, std::chrono::milliseconds timeout) : pool_(pool) {

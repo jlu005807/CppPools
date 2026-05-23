@@ -4,6 +4,7 @@
 build/
 output/
 cmake-build-*/
+build_mysql_on/
 
 # CMake 生成文件
 CMakeCache.txt

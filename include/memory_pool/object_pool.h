@@ -90,8 +90,17 @@ public:
 private:
     template <typename... Args>
     static void reset_object(T* obj, Args&&... args) {
-        // 通过“重建赋值”恢复对象到可用状态。
+        // 通过"重建赋值"恢复对象到可用状态。
         // 对 RequestContext 这类轻量结构体非常实用，代码也更直观。
+        //
+        // 教学权衡：
+        // - 优点：实现简单、可适配任意可拷贝/可移动赋值的 T。
+        // - 缺点：若 T 中含 std::string / std::vector 等带堆资源的字段，
+        //   赋值过程会先构造一个临时 T、再做移动/拷贝赋值，
+        //   原对象内部已分配的 buffer 不一定能被完整复用，存在额外开销。
+        // - 性能更优的写法：让 T 提供一个 reset() 成员（清零字段、
+        //   保留 string/vector 的 capacity），这里改成 obj->reset()。
+        //   当前项目场景下开销可忽略，因此保留这种更易读的实现。
         *obj = T(std::forward<Args>(args)...);
     }
 

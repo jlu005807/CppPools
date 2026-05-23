@@ -12,6 +12,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -41,7 +42,7 @@ void close_socket(SocketType s) {
 #endif
 }
 
-// Keep JSON error payload clean when message contains accidental spaces/newlines.
+// 规范化错误消息字符串，避免 JSON 中出现首尾空白或换行。
 std::string trim(const std::string& s) {
     std::size_t start = 0;
     while (start < s.size() && std::isspace(static_cast<unsigned char>(s[start])) != 0) {
@@ -67,6 +68,7 @@ ParsedTarget parse_target(const std::string& target) {
     return {target.substr(0, qmark), target.substr(qmark + 1)};
 }
 
+// 从 query string 中提取指定 key 的值，不做 URL 解码。
 std::string get_query_value(const std::string& query, const std::string& key) {
     std::size_t begin = 0;
     while (begin <= query.size()) {
@@ -120,6 +122,7 @@ bool is_allowed_static_route(const std::string& route_path) {
     return false;
 }
 
+// 解析“非负 int”参数，失败时返回 false。
 bool parse_non_negative_int(const std::string& s, int* value) {
     if (value == nullptr || s.empty()) {
         return false;
@@ -138,6 +141,42 @@ bool parse_non_negative_int(const std::string& s, int* value) {
     return true;
 }
 
+// 解析“非负 unsigned int”参数，失败时返回 false。
+bool parse_non_negative_uint(const std::string& s, unsigned int* value) {
+    if (value == nullptr || s.empty()) {
+        return false;
+    }
+
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(s.c_str(), &end, 10);
+    if (errno != 0 || end == s.c_str() || *end != '\0') {
+        return false;
+    }
+    if (parsed > static_cast<unsigned long>(UINT_MAX)) {
+        return false;
+    }
+    *value = static_cast<unsigned int>(parsed);
+    return true;
+}
+
+// 原子更新峰值：仅当 candidate 更大时写入。
+void update_peak(std::atomic<std::uint64_t>& peak, std::uint64_t candidate) {
+    std::uint64_t current = peak.load(std::memory_order_relaxed);
+    while (candidate > current &&
+           !peak.compare_exchange_weak(current, candidate, std::memory_order_relaxed)) {
+    }
+}
+
+// 原子更新最小值：仅当 candidate 更小时写入。
+void update_min(std::atomic<std::uint64_t>& min_value, std::uint64_t candidate) {
+    std::uint64_t current = min_value.load(std::memory_order_relaxed);
+    while (candidate < current &&
+           !min_value.compare_exchange_weak(current, candidate, std::memory_order_relaxed)) {
+    }
+}
+
+// 最近邻秩法分位数（Nearest Rank）。
 double percentile_nearest_rank(std::vector<double>& sorted, double p) {
     if (sorted.empty()) {
         return 0.0;
@@ -172,7 +211,7 @@ HttpServer::HttpServer(uint16_t port,
 
 void HttpServer::start() {
 #ifdef _WIN32
-    // WinSock must be initialized before socket()/bind()/listen().
+    // Windows 下必须先初始化 WinSock，才能调用 socket/bind/listen。
     WSADATA wsa_data;
     if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
         throw std::runtime_error("WSAStartup failed");
@@ -207,8 +246,8 @@ void HttpServer::start() {
               << db_pool_.free_count() << "/" << db_pool_.total_count() << '\n';
 
     int request_id = 0;
-    // Classic blocking accept loop:
-    // each accepted socket is offloaded to thread pool so accept loop remains responsive.
+    // 经典阻塞式 accept 循环：
+    // 每次 accept 成功后，把客户端处理逻辑投递到线程池，确保主循环持续响应新连接。
     while (true) {
         sockaddr_in client_addr{};
 #ifdef _WIN32
@@ -236,8 +275,8 @@ void HttpServer::start() {
 void HttpServer::handle_client(std::intptr_t client_fd, int request_id) {
     SocketType sock = static_cast<SocketType>(client_fd);
     char buffer[4096];
-    // For this educational server we read one request packet and close connection.
-    // (No keep-alive / chunked parser yet.)
+    // 教学版本仅处理“一次读取 + 一次响应 + 主动关闭连接”模型，
+    // 暂不支持 keep-alive 与 chunked 解析。
     const int n = recv(sock, buffer, sizeof(buffer) - 1, 0);
     if (n <= 0) {
         close_socket(sock);
@@ -266,7 +305,7 @@ std::string HttpServer::build_http_response(const std::string& body,
 }
 
 std::string HttpServer::route_request(const std::string& request, int request_id) {
-    // Parse request line: METHOD PATH HTTP/VERSION
+    // 解析请求首行：METHOD PATH HTTP/VERSION
     std::istringstream req_stream(request);
     std::string method;
     std::string target;
@@ -297,7 +336,7 @@ std::string HttpServer::route_request(const std::string& request, int request_id
 
     if (is_allowed_static_route(static_route)) {
         static_requests_.fetch_add(1, std::memory_order_relaxed);
-        const std::string filename = static_route.substr(1);  // remove leading '/'
+        const std::string filename = static_route.substr(1);  // 去掉前导 '/'
         const std::string content = read_file_or_empty(web_root_ + "/" + filename);
         if (content.empty()) {
             error_requests_.fetch_add(1, std::memory_order_relaxed);
@@ -308,10 +347,16 @@ std::string HttpServer::route_request(const std::string& request, int request_id
 
     if (route_path == "/api/stats") {
         api_requests_.fetch_add(1, std::memory_order_relaxed);
-        // uptime is measured from process start and reported for dashboard context.
+        // uptime 从进程启动开始计时，便于 dashboard 展示运行时长。
         const auto uptime =
             std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started_at_).count();
         const LatencyStats lstats = collect_latency_stats();
+
+        const std::size_t pending_now = thread_pool_.pending_tasks();
+        update_peak(peak_pending_tasks_, pending_now);
+        const std::uint64_t raw_min_db_free = min_db_free_.load(std::memory_order_relaxed);
+        const std::uint64_t safe_min_db_free =
+            raw_min_db_free == std::numeric_limits<std::uint64_t>::max() ? db_pool_.free_count() : raw_min_db_free;
 
         std::ostringstream body;
         body << "{"
@@ -320,14 +365,21 @@ std::string HttpServer::route_request(const std::string& request, int request_id
              << "\"api_requests\":" << api_requests_.load(std::memory_order_relaxed) << ","
              << "\"static_requests\":" << static_requests_.load(std::memory_order_relaxed) << ","
              << "\"error_requests\":" << error_requests_.load(std::memory_order_relaxed) << ","
+             << "\"process_requests\":" << process_requests_.load(std::memory_order_relaxed) << ","
+             << "\"active_process_requests\":" << active_process_requests_.load(std::memory_order_relaxed) << ","
+             << "\"db_timeout_requests\":" << db_timeout_requests_.load(std::memory_order_relaxed) << ","
              << "\"db_mode\":\"" << db_pool_.mode_name() << "\","
              << "\"thread_pool_workers\":" << thread_pool_.worker_count() << ","
-             << "\"thread_pool_pending\":" << thread_pool_.pending_tasks() << ","
+             << "\"thread_pool_pending\":" << pending_now << ","
+             << "\"peak_thread_pool_pending\":" << peak_pending_tasks_.load(std::memory_order_relaxed) << ","
              << "\"db_pool_free\":" << db_pool_.free_count() << ","
              << "\"db_pool_total\":" << db_pool_.total_count() << ","
+             << "\"min_db_pool_free\":" << safe_min_db_free << ","
              << "\"memory_pool_in_use\":" << request_pool_.in_use() << ","
              << "\"memory_pool_available\":" << request_pool_.available() << ","
              << "\"memory_pool_total\":" << request_pool_.total_size() << ","
+             << "\"peak_memory_pool_in_use\":" << peak_memory_in_use_.load(std::memory_order_relaxed) << ","
+             << "\"peak_active_process_requests\":" << peak_active_process_.load(std::memory_order_relaxed) << ","
              << "\"db_acquire_timeout_ms\":" << config_.db_acquire_timeout.count() << ","
              << "\"latency_window_size\":" << config_.latency_window_size << ","
              << "\"latency_samples\":" << lstats.samples << ","
@@ -342,11 +394,24 @@ std::string HttpServer::route_request(const std::string& request, int request_id
 
     if (route_path == "/api/process") {
         api_requests_.fetch_add(1, std::memory_order_relaxed);
+        process_requests_.fetch_add(1, std::memory_order_relaxed);
+        const auto active = active_process_requests_.fetch_add(1, std::memory_order_relaxed) + 1;
+        update_peak(peak_active_process_, active);
         const auto process_begin = std::chrono::steady_clock::now();
+        // 统一收口：记录本次处理耗时并减少 active_process_requests 计数。
+        const auto finalize_latency = [this, process_begin]() {
+            const auto process_end = std::chrono::steady_clock::now();
+            const double process_ms =
+                std::chrono::duration_cast<std::chrono::microseconds>(process_end - process_begin).count() / 1000.0;
+            record_process_latency_ms(process_ms);
+            active_process_requests_.fetch_sub(1, std::memory_order_relaxed);
+        };
+
         const std::string raw_user = get_query_value(parsed.query, "user");
         int user_id = 0;
         if (!parse_non_negative_int(raw_user, &user_id)) {
             error_requests_.fetch_add(1, std::memory_order_relaxed);
+            finalize_latency();
             return build_http_response(
                 json_error("invalid user parameter, expected non-negative integer"),
                 "application/json",
@@ -354,37 +419,77 @@ std::string HttpServer::route_request(const std::string& request, int request_id
                 "Bad Request");
         }
 
-        // Request context is acquired from memory pool and automatically returned.
+        const std::string raw_hold_ms = get_query_value(parsed.query, "hold_ms");
+        unsigned int hold_ms = 0;
+        if (!raw_hold_ms.empty()) {
+            if (!parse_non_negative_uint(raw_hold_ms, &hold_ms)) {
+                error_requests_.fetch_add(1, std::memory_order_relaxed);
+                finalize_latency();
+                return build_http_response(
+                    json_error("invalid hold_ms parameter, expected non-negative integer"),
+                    "application/json",
+                    400,
+                    "Bad Request");
+            }
+        }
+        hold_ms = std::min<unsigned int>(hold_ms, 5000U);
+
+        const std::string raw_work_ms = get_query_value(parsed.query, "work_ms");
+        unsigned int work_ms = 0;
+        if (!raw_work_ms.empty()) {
+            if (!parse_non_negative_uint(raw_work_ms, &work_ms)) {
+                error_requests_.fetch_add(1, std::memory_order_relaxed);
+                finalize_latency();
+                return build_http_response(
+                    json_error("invalid work_ms parameter, expected non-negative integer"),
+                    "application/json",
+                    400,
+                    "Bad Request");
+            }
+        }
+        work_ms = std::min<unsigned int>(work_ms, 5000U);
+
+        // 从对象池借出 RequestContext；req_ctx 析构时会自动归还对象池（RAII）。
         auto req_ctx = request_pool_.acquire();
         req_ctx->request_id = request_id;
         req_ctx->user_id = user_id;
         req_ctx->path = route_path;
+        const std::uint64_t memory_in_use_now = request_pool_.in_use();
+        update_peak(peak_memory_in_use_, memory_in_use_now);
+        if (work_ms > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(work_ms));
+        }
 
-        // Acquire DB connection with timeout, then auto-release by guard.
+        // 从连接池借出 DB 连接（含超时）；通过 DBConnGuard 在作用域结束时自动归还。
         DBConnGuard guard(db_pool_, config_.db_acquire_timeout);
         if (!guard.valid()) {
             error_requests_.fetch_add(1, std::memory_order_relaxed);
-            const auto process_end = std::chrono::steady_clock::now();
-            const double process_ms =
-                std::chrono::duration_cast<std::chrono::microseconds>(process_end - process_begin).count() / 1000.0;
-            record_process_latency_ms(process_ms);
+            db_timeout_requests_.fetch_add(1, std::memory_order_relaxed);
+            finalize_latency();
             return build_http_response(json_error("db connection timeout"), "application/json", 503, "Service Unavailable");
+        }
+        update_min(min_db_free_, db_pool_.free_count());
+        if (hold_ms > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(hold_ms));
         }
 
         const std::string db_result = guard.get()->query_user_score(req_ctx->user_id);
-        // Return current pool snapshot together with mock query payload.
+        // 回包里附带当前池子快照，便于前端在一次请求内直接观测状态变化。
+        const std::size_t pending_now = thread_pool_.pending_tasks();
+        update_peak(peak_pending_tasks_, pending_now);
         std::ostringstream body;
         body << "{"
              << "\"request_id\":" << req_ctx->request_id << ","
              << "\"thread_id\":\"" << std::this_thread::get_id() << "\","
+             << "\"work_ms\":" << work_ms << ","
+             << "\"hold_ms\":" << hold_ms << ","
              << "\"db_free\":" << db_pool_.free_count() << ","
              << "\"memory_pool_in_use\":" << request_pool_.in_use() << ","
+             << "\"thread_pool_pending\":" << thread_pool_.pending_tasks() << ","
+             << "\"active_process_requests\":" << active_process_requests_.load(std::memory_order_relaxed) << ","
              << "\"payload\":" << db_result
              << "}";
-        const auto process_end = std::chrono::steady_clock::now();
-        const double process_ms =
-            std::chrono::duration_cast<std::chrono::microseconds>(process_end - process_begin).count() / 1000.0;
-        record_process_latency_ms(process_ms);
+        finalize_latency();
         return build_http_response(body.str(), "application/json; charset=utf-8");
     }
 

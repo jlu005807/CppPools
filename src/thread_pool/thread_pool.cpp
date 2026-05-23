@@ -48,6 +48,8 @@ void ThreadPool::worker_loop() {
             }
             task = std::move(tasks_.front());
             tasks_.pop();
+            // 出队也在临界区内同步更新计数，保证 pending_count_ 始终等于 tasks_.size()。
+            pending_count_.fetch_sub(1, std::memory_order_relaxed);
         }
         // 在锁外执行任务，减少临界区时长，提升并发吞吐。
         task();
@@ -59,6 +61,6 @@ std::size_t ThreadPool::worker_count() const {
 }
 
 std::size_t ThreadPool::pending_tasks() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return tasks_.size();
+    // 无锁读取：stats 接口可能被前端高频轮询，避免和 submit/worker 抢 mutex_。
+    return pending_count_.load(std::memory_order_relaxed);
 }

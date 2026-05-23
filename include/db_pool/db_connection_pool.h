@@ -2,6 +2,7 @@
 
 #include "db_pool/mock_db_connection.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -72,6 +73,11 @@ private:
     // 初始化时创建的固定连接总数（上限）。
     std::size_t total_count_{0};
     DBPoolConfig config_;
+
+    // 与 free_conns_ 同步维护的空闲计数。
+    // 让 free_count() 这种 stats getter 可以无锁查询，不和 acquire/release 抢 mutex_。
+    // 更新点都在临界区内，atomic 这里只是为"读"侧提供无锁视图。
+    std::atomic<std::size_t> free_count_atomic_{0};
 };
 
 // DBConnGuard：基于 RAII 的连接托管器。

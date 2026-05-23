@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <functional>
@@ -38,6 +39,9 @@ public:
     std::size_t worker_count() const;
 
     // 当前任务队列中的待执行任务数量（近似快照）。
+    // 实现要点：用 std::atomic 取代加锁读取 tasks_.size()。
+    // 这样 /api/stats 这种"读多写少"的查询可以完全无锁，
+    // 避免和正在 submit/工作线程取任务的临界区争夺 mutex_。
     std::size_t pending_tasks() const;
 
 private:
@@ -50,6 +54,11 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     bool stop_{false};
+
+    // 与 tasks_ 同步维护的待处理任务计数。
+    // 入队时 +1、出队时 -1，更新都发生在 mutex_ 的临界区内，
+    // 因此 atomic 这里只是为了让"读"侧无锁，不是用来代替互斥。
+    std::atomic<std::size_t> pending_count_{0};
 };
 
 template <class F, class... Args>
@@ -69,6 +78,9 @@ auto ThreadPool::submit(F&& f, Args&&... args) -> std::future<std::invoke_result
         }
         // 统一存储为 void() 任务，简化队列类型与调度逻辑。
         tasks_.emplace([task]() { (*task)(); });
+        // 队列长度的递增必须发生在临界区内：
+        // 否则 worker_loop 端有可能在我们 ++ 之前先取出该任务并 --，导致计数短暂为负。
+        pending_count_.fetch_add(1, std::memory_order_relaxed);
     }
     // 唤醒一个休眠线程来消费新任务。
     cv_.notify_one();

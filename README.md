@@ -77,10 +77,20 @@ CppPools/
 
 ### 4) HTTP 服务 HttpServer
 
-- 当前只支持 `GET`
-- 静态资源：`/`、`/index.html`、`/app.js`
-- API：`/api/health`、`/api/stats`、`/api/process?user=<id>`
-- 指标包含：`avg/p50/p95/p99` 延迟分位
+- 当前只支持 `GET`，其余方法返回 `405`
+- 静态资源（白名单）：`/`、`/index.html`、`/app.js`
+- API：
+  - `/api/health`：返回 `status`、`uptime_ms`、`timestamp_hint`
+  - `/api/stats`：返回三大池子状态、累计计数器、滑动窗口延迟分位
+  - `/api/process?user=<id>&work_ms=<ms>&hold_ms=<ms>`：模拟一次完整链路
+    - `user` 必填，`work_ms`/`hold_ms` 可选（0–5000，超出会被截断）
+    - 连接获取超时返回 `503 db connection timeout`
+- 指标包含：
+  - 池子快照（`thread_pool_pending` / `db_pool_free` / `memory_pool_in_use` …）
+  - 历史峰值（`peak_thread_pool_pending` / `peak_memory_pool_in_use` / `min_db_pool_free` …）
+  - 延迟分位（`avg / p50 / p95 / p99_latency_ms`）
+
+完整字段说明见 [docs/api/backend_api.md](docs/api/backend_api.md)。
 
 ## 构建与运行
 
@@ -117,6 +127,8 @@ ctest --test-dir build --output-on-failure
 
 # 三池联动命令行 demo
 ./output/bin/demo_multi_pools
+# 可选参数：任务数、worker 数
+./output/bin/demo_multi_pools 1000 6
 
 # HTTP 服务
 ./output/bin/demo_server
@@ -124,9 +136,25 @@ ctest --test-dir build --output-on-failure
 ./output/bin/demo_server 8080 6
 ```
 
+> MySQL 模式构建时还会额外生成 `demo_server_mysql(.exe)` 作为别名文件，便于一键脚本识别。
+
 浏览器访问：
 
 - `http://127.0.0.1:8080/`
+
+### 4) 运行期可调环境变量
+
+`demo_server` / `demo_multi_pools` 读取下列环境变量（详见 [docs/api/backend_api.md](docs/api/backend_api.md#5-运行期可调环境变量)）：
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `CPPPOOLS_DB_MODE` | `mock` | `mock` 或 `mysql` |
+| `CPPPOOLS_DB_HOST` / `CPPPOOLS_DB_PORT` | `127.0.0.1` / `3306` | MySQL 地址 |
+| `CPPPOOLS_DB_USER` / `CPPPOOLS_DB_PASSWORD` | `root` / `` | MySQL 凭据 |
+| `CPPPOOLS_DB_NAME` / `CPPPOOLS_DB_TABLE` | `cpppools` / `user_scores` | 库表名 |
+| `CPPPOOLS_DB_POOL_SIZE` | `8` | 连接池大小 |
+| `CPPPOOLS_DB_ACQUIRE_TIMEOUT_MS` | `100` | 连接获取超时（毫秒） |
+| `CPPPOOLS_LATENCY_WINDOW_SIZE` | `1024` | 延迟滑动窗口样本数上限 |
 
 ## MySQL 模式（Windows + MinGW）
 

@@ -231,3 +231,43 @@
 - Mock mode and MySQL mode both remain runnable after these upgrades.
 
 ---
+### Session 11 - 2026-04-18
+
+**Topics Covered**:
+- Project onboarding map (entrypoints, module boundaries, runtime flow)
+- Core concurrency pipeline (`ThreadPool` -> `ObjectPool<RequestContext>` -> `DBConnectionPool` -> `HttpServer`)
+- Test-first verification path with `ctest`
+
+**Problems Solved**:
+- Confirmed local learning environment is healthy (`2/2` tests passed)
+- Identified recommended reading order for fast understanding
+
+**Skills Practiced**:
+- Code mentor project coaching
+- Algorithmic-art usage boundary clarification (frontend visualization module only)
+
+**Notes**:
+- Start from `demo/server_main.cpp` and follow the route logic in `src/server/http_server.cpp`.
+- Keep using `docs/learning_log.md` as the single progress journal.
+
+---
+### Session 12 - 2026-04-19
+
+**Topics Covered**:
+- `HttpServer` 请求处理链路中文注释补全
+- 路由分发、参数解析、延迟统计与池子观测指标解读
+- 注释一致性巡检（server 模块优先）
+
+**Problems Solved**:
+- 为 `src/server/http_server.cpp` 增加结构化中文注释，降低阅读门槛
+- 为 `include/server/http_server.h` 增加中文接口注释，提升跨文件可读性
+
+**Skills Practiced**:
+- Code mentor project coaching
+- Documentation-first maintainability refinement
+
+**Notes**:
+- `thread_pool`、`memory_pool`、`db_pool` 核心文件已有较完整中文注释，可暂不重复补充。
+- 后续如需统一注释风格，可再做一次“术语统一 + 编码格式”专项整理。
+
+---
