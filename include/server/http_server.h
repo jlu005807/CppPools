@@ -35,11 +35,21 @@ struct HttpServerConfig {
 
 // HttpServer：教学用途的最小 HTTP 服务端实现。
 //
-// 职责划分：
-// 1) 接收 TCP 连接；
-// 2) 将连接处理任务投递到 ThreadPool；
-// 3) 使用 ObjectPool 复用每请求上下文；
-// 4) 使用 DBConnectionPool 执行查询。
+// "自研 Socket 级轻量 HTTP/1.1 服务" 的含义：
+// - 直接基于 BSD socket / Winsock 写 accept 主循环，不依赖任何第三方 HTTP 库；
+// - 仅实现 GET 方法 + "一次读取 / 一次响应 / 主动关闭"模型，不做 keep-alive、
+//   chunked、TLS，目的是把"HTTP 协议层"清晰暴露给学习者；
+// - 路由能力以 if/else 形式直观体现，便于初学者跟踪请求 -> 响应的全过程。
+//
+// 与三大池子的协作分工：
+// 1) 接收 TCP 连接（accept 主循环跑在调用者线程，通常是 main）；
+// 2) 把"处理这个 client_fd"的任务投递到 ThreadPool（避免阻塞 accept）；
+// 3) 工作线程从 ObjectPool 借出 RequestContext，处理完成后 RAII 自动归还；
+// 4) 业务路径里用 DBConnGuard 从 DBConnectionPool 借出连接，作用域结束自动归还。
+//
+// 可观测性：
+//   /api/stats 会暴露三大池子的"瞬时 + 历史峰值"以及 /api/process 的延迟分位
+//   （avg / p50 / p95 / p99），用于运行期观察池化效果。
 class HttpServer {
 public:
     // web_root 指向静态资源目录（需包含 index.html 与 app.js）。

@@ -212,30 +212,34 @@ HttpServer::HttpServer(uint16_t port,
 void HttpServer::start() {
 #ifdef _WIN32
     // Windows 下必须先初始化 WinSock，才能调用 socket/bind/listen。
+    // 这是 Winsock 与 BSD socket 的最大差异之一：句柄类型也不同（SOCKET vs int）。
     WSADATA wsa_data;
     if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
         throw std::runtime_error("WSAStartup failed");
     }
 #endif
 
+    // 创建 TCP socket：AF_INET（IPv4）+ SOCK_STREAM（流式）。
     SocketType server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd == kInvalidSocket) {
         throw std::runtime_error("socket creation failed");
     }
 
+    // SO_REUSEADDR：允许端口在 TIME_WAIT 状态下被重复绑定，便于反复 Ctrl+C 重启。
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(port_);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);   // 0.0.0.0：监听所有本机网卡。
+    addr.sin_port = htons(port_);               // 主机字节序 -> 网络字节序。
 
     if (bind(server_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
         close_socket(server_fd);
         throw std::runtime_error("bind failed");
     }
 
+    // listen backlog=64：内核为半连接队列+全连接队列预留的容量上限。
     if (listen(server_fd, 64) < 0) {
         close_socket(server_fd);
         throw std::runtime_error("listen failed");
@@ -248,6 +252,7 @@ void HttpServer::start() {
     int request_id = 0;
     // 经典阻塞式 accept 循环：
     // 每次 accept 成功后，把客户端处理逻辑投递到线程池，确保主循环持续响应新连接。
+    // 这就是"三级池化"的入口：accept 主循环只做调度，真正的 I/O+计算都在 worker 线程上。
     while (true) {
         sockaddr_in client_addr{};
 #ifdef _WIN32
@@ -356,7 +361,9 @@ std::string HttpServer::route_request(const std::string& request, int request_id
         update_peak(peak_pending_tasks_, pending_now);
         const std::uint64_t raw_min_db_free = min_db_free_.load(std::memory_order_relaxed);
         const std::uint64_t safe_min_db_free =
-            raw_min_db_free == std::numeric_limits<std::uint64_t>::max() ? db_pool_.free_count() : raw_min_db_free;
+            raw_min_db_free == std::numeric_limits<std::uint64_t>::max()
+                ? static_cast<std::uint64_t>(db_pool_.free_count())
+                : raw_min_db_free;
 
         std::ostringstream body;
         body << "{"
@@ -468,7 +475,7 @@ std::string HttpServer::route_request(const std::string& request, int request_id
             finalize_latency();
             return build_http_response(json_error("db connection timeout"), "application/json", 503, "Service Unavailable");
         }
-        update_min(min_db_free_, db_pool_.free_count());
+        update_min(min_db_free_, static_cast<std::uint64_t>(db_pool_.free_count()));
         if (hold_ms > 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(hold_ms));
         }

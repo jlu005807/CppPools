@@ -31,12 +31,23 @@ struct DBPoolConfig {
 
 // DBConnectionPool：有界连接池。
 //
+// 在三级池化协作链路中的位置：
+//   HTTP 请求 -> ThreadPool 调度 -> ObjectPool 复用上下文 -> [DBConnectionPool 查询]
+// 是链路里唯一接触外部资源（mock 后端 / 真实 MySQL）的池，因此实现关注两点：
+//   1) 超时机制：避免业务线程在资源耗尽时无限等待；
+//   2) 归还校验：unordered_set 拦截重复归还/野指针归还，保护池状态。
+//
 // acquire(timeout)：
 //   最多等待 timeout 时长来获取空闲连接；
 //   超时返回 nullptr，避免业务线程无限阻塞。
+//   底层使用 std::condition_variable::wait_for + predicate，可同时防虚假唤醒。
 //
 // release(conn)：
-//   将连接归还到空闲队列，并唤醒一个等待中的线程。
+//   将连接归还到空闲队列，并唤醒一个等待中的线程（cv_.notify_one()）。
+//
+// 学习提示：
+//   一般生产环境的连接池还会做"连接健康探活/失效重连/最大空闲时间"等扩展，
+//   本项目为教学目标保持最小核心，重点突出"有界 + 超时 + RAII 归还"三件事。
 class DBConnectionPool {
 public:
     explicit DBConnectionPool(std::size_t pool_size);

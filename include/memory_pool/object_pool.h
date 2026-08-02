@@ -13,10 +13,20 @@
 
 // ObjectPool<T>：线程安全的对象复用池。
 //
+// 在三级池化协作链路中的位置：
+//   HTTP 请求 -> ThreadPool 调度 -> [ObjectPool 复用 RequestContext] -> DBConnectionPool 查询
+// 在 HttpServer::route_request 中用来复用 RequestContext，避免每次请求都做一次 new/delete。
+//
 // 用法示例：
 //   ObjectPool<Foo> pool(128);
 //   auto foo = pool.acquire(...);  // 带自定义 deleter 的 unique_ptr
 //   // foo 离开作用域后会自动归还到池中（RAII）。
+//
+// RAII 自动归还原理：
+//   acquire() 返回的是 std::unique_ptr<T, std::function<void(T*)>>。
+//   custom deleter 在 unique_ptr 析构时被调用，里面 lambda 捕获了 [this]，
+//   把指针 push 回 free_list_，从而完成"借→还"的闭环。
+//   这是 C++ RAII 的经典用法：把"必须配对"的资源生命周期绑到栈对象上。
 template <typename T>
 class ObjectPool {
 public:

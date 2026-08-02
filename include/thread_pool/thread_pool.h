@@ -15,10 +15,24 @@
 
 // ThreadPool：固定大小的工作线程池，用于异步执行任务。
 //
+// 在三级池化协作链路中的位置：
+//   HTTP 请求 -> [ThreadPool 调度] -> ObjectPool 复用上下文 -> DBConnectionPool 查询
+// 也就是 HTTP 请求进入服务后第一时间被丢到这里，让 accept 主循环立即回到等待新连接。
+//
 // 设计目标：
 // 1) 线程复用：避免高频创建/销毁线程带来的系统开销。
 // 2) 通用提交接口：支持任意可调用对象，并通过 future 获取结果。
 // 3) 优雅关闭：停止接收新任务，但保证队列中已有任务执行完成后再退出。
+//
+// 并发模型（生产者 / 消费者）：
+// - 生产者：调用 submit() 的线程（如 HttpServer::start 的 accept 循环），
+//   持锁把任务塞进 tasks_，通过 cv_.notify_one() 唤醒一个 worker。
+// - 消费者：worker_loop() 内部的工作线程，cv_.wait 在 tasks_ 空闲时挂起，
+//   被唤醒后取出任务、在锁外执行，避免长任务阻塞队列。
+//
+// 学习提示：
+//   condition_variable 必须搭配 unique_lock 使用。wait() 的 predicate 形式
+//   能自动处理"虚假唤醒"，是 C++ 并发的标准写法。
 class ThreadPool {
 public:
     explicit ThreadPool(std::size_t thread_count);
