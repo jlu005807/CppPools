@@ -2,9 +2,9 @@
 # CMake / 构建目录
 # =========================
 build/
-output/
+build-*/
 cmake-build-*/
-build_mysql_on/
+output/
 
 # CMake 生成文件
 CMakeCache.txt
@@ -56,3 +56,18 @@ compile_commands.json
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# =========================
+# third_party
+# =========================
+# vendored 依赖本身应入库，但其构建产物不应入库。
+third_party/*/build/
+
+#ai
+.agent/
+.codex/
+.claude/
+.qoder/
+
+#plan
+docs/superpowers/

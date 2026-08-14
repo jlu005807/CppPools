@@ -15,16 +15,11 @@ param(
 $projectRoot = Split-Path -Parent $PSScriptRoot
 
 if ([string]::IsNullOrWhiteSpace($ExePath)) {
-    # Prefer explicit mysql build if present.
-    $exeDefault = Join-Path $projectRoot "output\bin\demo_server_mysql.exe"
-    $exeFallback = Join-Path $projectRoot "output\bin\demo_server.exe"
-
+    $exeDefault = Join-Path $projectRoot "build\bin\cpppools_server.exe"
     if (Test-Path $exeDefault) {
         $ExePath = $exeDefault
-    } elseif (Test-Path $exeFallback) {
-        $ExePath = $exeFallback
     } else {
-        throw "No server executable found. Build the project first."
+        throw "No server executable found at $exeDefault. Build the project first (cmake --build build)."
     }
 }
 
@@ -51,7 +46,8 @@ $env:CPPPOOLS_DB_POOL_SIZE = "$PoolSize"
 Write-Host "Starting server with MySQL mode..."
 Write-Host "exe: $ExePath"
 Write-Host ("mysql: {0}:{1}/{2}.{3} pool={4}" -f $DbHost, $DbPort, $DbName, $DbTable, $PoolSize)
-Write-Host "url: http://127.0.0.1:$Port/"
-Write-Host "multi: http://127.0.0.1:$Port/multi"
+Write-Host "url:    http://127.0.0.1:$Port/"
+Write-Host "health: http://127.0.0.1:$Port/health"
+Write-Host "stats:  http://127.0.0.1:$Port/api/v1/stats"
 
 & $ExePath $Port $Workers

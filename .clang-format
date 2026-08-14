@@ -1,0 +1,22 @@
+---
+# CppPools 代码风格：基于 Google 风格，按项目既有习惯调整。
+Language: Cpp
+BasedOnStyle: Google
+
+ColumnLimit: 100
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+
+AccessModifierOffset: -4
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+BreakBeforeBraces: Attach
+DerivePointerAlignment: false
+PointerAlignment: Left
+SpacesBeforeTrailingComments: 2
+
+# 头文件分组：本项目头文件优先，其次标准库。
+IncludeBlocks: Preserve
+SortIncludes: CaseSensitive
