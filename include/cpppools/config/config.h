@@ -36,6 +36,32 @@ struct DataSourceConfig {
 struct AppConfig {
     ServerConfig server;
     std::vector<DataSourceConfig> datasources;
+
+    // 集群与缓存段（可选；两段缺省 = 单节点模式，行为与改造前完全一致）。
+    // 字段定义见 cluster-cache spec §6.1。
+    struct ClusterNode {
+        std::string node_id;  // 全集群唯一
+        std::string host;
+        int port{8080};
+    };
+    struct Cluster {
+        std::string node_id;              // 本节点身份，必须出现在 nodes 中
+        long long epoch{0};               // 拓扑版本，变更时递增
+        std::vector<ClusterNode> nodes;   // 全集群节点列表
+    };
+    struct Cache {
+        bool enabled{false};
+        std::size_t max_entries{100000};
+        std::size_t max_bytes{static_cast<std::size_t>(256) * 1024 * 1024};
+        std::size_t max_entry_bytes{65536};
+        long long ttl_ms{60000};
+        long long blacklist_ttl_ms{60000};  // 不变量 I1：必须 ≥ ttl_ms
+        std::vector<std::string> tables;    // 空 = 全部表可缓存
+    };
+
+    bool has_cluster{false};
+    Cluster cluster;
+    Cache cache;
 };
 
 // 加载结果：错误按值返回（项目约定：状态按值返回，不用异常做控制流）。

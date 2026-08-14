@@ -6,11 +6,13 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace cpppools::db {
 
 class DbConnectionPool;
+class RowCache;
 
 // 路由结果（spec §4.1 五种情形）。
 enum class RouteStatus {
@@ -54,7 +56,11 @@ struct RegistryBuildResult {
 // 构建完成后全只读，route() 可被多线程并发调用。
 class DataSourceRegistry {
 public:
-    static RegistryBuildResult build(const std::vector<config::DataSourceConfig>& sources);
+    // cache_cfg.enabled=true 时为每个数据源创建一份**共享** RowCache，
+    // 注入该源全部槽位的 CachingDatabase 装饰器（spec §4.1.1）。
+    static RegistryBuildResult build(
+        const std::vector<config::DataSourceConfig>& sources,
+        const config::AppConfig::Cache& cache_cfg = {});
 
     ~DataSourceRegistry();
     DataSourceRegistry(const DataSourceRegistry&) = delete;
@@ -72,6 +78,17 @@ public:
     std::vector<const DbConnectionPool*> pools() const;
     // 指定源的表清单（/api/v1/schema 用）。未知源返回空。
     std::vector<std::string> tables_of(const std::string& datasource_name) const;
+    // 单个数据源的配置摘要（跨节点一致性校验用，spec §6.3）。
+    // digest = murmur3_32(LP(type) ‖ LP(目标标识各段)) 的 hex，**不含凭据**：
+    // 哈希输入用 LP 长度前缀（与 §3.1 同原则，禁止分隔符拼接）。
+    struct DataSourceDigest {
+        std::string name;
+        std::string type;
+        std::string digest;
+    };
+    std::vector<DataSourceDigest> datasource_digests() const;
+    // 各数据源的共享缓存（cache 关闭时为空）：cache_* 指标聚合用。
+    std::vector<std::pair<std::string, const RowCache*>> caches() const;
 
 private:
     DataSourceRegistry() = default;
@@ -80,6 +97,7 @@ private:
         config::DataSourceConfig config;
         std::vector<std::string> tables;               // 自省顺序
         std::unique_ptr<DbConnectionPool> pool;
+        std::shared_ptr<RowCache> cache;               // enabled 时非空，槽位共享
     };
 
     const Entry* find_entry(const std::string& name) const;

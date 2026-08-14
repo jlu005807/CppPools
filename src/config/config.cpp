@@ -222,6 +222,115 @@ ConfigLoadResult load_config(const std::string& path) {
             return fail("at most one datasource may have \"default\": true");
         }
 
+        // ---- cluster 段（可选；缺省 = 单节点模式）----
+        if (const auto it = root.find("cluster"); it != root.end()) {
+            if (!it->is_object()) {
+                return fail("\"cluster\" must be an object");
+            }
+            const std::string ctx = "cluster.";
+            auto& cluster = cfg.cluster;
+            cluster.node_id = get_str(*it, "node_id", "", ctx);
+            if (cluster.node_id.empty()) {
+                return fail("cluster.node_id is required");
+            }
+            cluster.epoch = get_num<long long>(*it, "epoch", 0, ctx);
+            if (cluster.epoch < 0) {
+                return fail("cluster.epoch must be >= 0");
+            }
+            const auto nodes_it = it->find("nodes");
+            if (nodes_it == it->end() || !nodes_it->is_array() || nodes_it->empty()) {
+                return fail("cluster.nodes is required and must be a non-empty array");
+            }
+            std::unordered_set<std::string> seen_node_ids;
+            bool self_found = false;
+            for (std::size_t i = 0; i < nodes_it->size(); ++i) {
+                const njson& item = (*nodes_it)[i];
+                const std::string idx = std::to_string(i);
+                const std::string nctx = "cluster.nodes[" + idx + "].";
+                if (!item.is_object()) {
+                    return fail("cluster.nodes[" + idx + "] must be an object");
+                }
+                AppConfig::ClusterNode node;
+                node.node_id = get_str(item, "node_id", "", nctx);
+                if (node.node_id.empty()) {
+                    return fail("cluster.nodes[" + idx + "] missing \"node_id\"");
+                }
+                if (!seen_node_ids.insert(node.node_id).second) {
+                    return fail("duplicate cluster node_id: \"" + node.node_id + "\"");
+                }
+                node.host = get_str(item, "host", "", nctx);
+                if (node.host.empty()) {
+                    return fail("cluster.nodes[" + idx + "] missing \"host\"");
+                }
+                const int port = get_num<int>(item, "port", 8080, nctx);
+                if (port <= 0 || port > 65535) {
+                    return fail("cluster.nodes[" + idx + "].port must be in [1, 65535]");
+                }
+                node.port = port;
+                if (node.node_id == cluster.node_id) {
+                    self_found = true;
+                }
+                cluster.nodes.push_back(std::move(node));
+            }
+            if (!self_found) {
+                return fail("cluster.node_id \"" + cluster.node_id +
+                            "\" must appear in cluster.nodes");
+            }
+            cfg.has_cluster = true;
+        }
+
+        // ---- cache 段（可选；缺省 = 缓存关闭）----
+        if (const auto it = root.find("cache"); it != root.end()) {
+            if (!it->is_object()) {
+                return fail("\"cache\" must be an object");
+            }
+            const std::string ctx = "cache.";
+            auto& cache = cfg.cache;
+            cache.enabled = get_num<bool>(*it, "enabled", false, ctx);
+            const long long max_entries = get_num<long long>(*it, "max_entries", 100000, ctx);
+            if (max_entries <= 0) {
+                return fail("cache.max_entries must be > 0");
+            }
+            cache.max_entries = static_cast<std::size_t>(max_entries);
+            const long long max_bytes = get_num<long long>(*it, "max_bytes",
+                                                            256LL * 1024 * 1024, ctx);
+            if (max_bytes <= 0) {
+                return fail("cache.max_bytes must be > 0");
+            }
+            cache.max_bytes = static_cast<std::size_t>(max_bytes);
+            const long long max_entry_bytes = get_num<long long>(*it, "max_entry_bytes", 65536, ctx);
+            if (max_entry_bytes <= 0) {
+                return fail("cache.max_entry_bytes must be > 0");
+            }
+            cache.max_entry_bytes = static_cast<std::size_t>(max_entry_bytes);
+            cache.ttl_ms = get_num<long long>(*it, "ttl_ms", 60000, ctx);
+            if (cache.ttl_ms <= 0) {
+                return fail("cache.ttl_ms must be > 0");
+            }
+            cache.blacklist_ttl_ms = get_num<long long>(*it, "blacklist_ttl_ms", 60000, ctx);
+            if (cache.blacklist_ttl_ms <= 0) {
+                return fail("cache.blacklist_ttl_ms must be > 0");
+            }
+            // 不变量 I1（spec §5.2）：黑名单时长必须 ≥ 缓存 TTL，
+            // 否则"黑名单期间错过的写被旧缓存遮蔽"的裂缝失守。
+            if (cache.blacklist_ttl_ms < cache.ttl_ms) {
+                return fail("cache.blacklist_ttl_ms must be >= cache.ttl_ms "
+                            "(invariant I1: the blacklist window must outlast any cache entry)");
+            }
+            if (const auto tables_it = it->find("tables"); tables_it != it->end()) {
+                if (!tables_it->is_array()) {
+                    return fail("cache.tables must be an array of strings");
+                }
+                for (std::size_t i = 0; i < tables_it->size(); ++i) {
+                    const njson& item = (*tables_it)[i];
+                    if (!item.is_string() || item.get<std::string>().empty()) {
+                        return fail("cache.tables[" + std::to_string(i) + "] must be a non-empty string");
+                    }
+                    cache.tables.push_back(item.get<std::string>());
+                }
+            }
+        }
+
         ConfigLoadResult result;
         result.ok = true;
         result.config = std::move(cfg);

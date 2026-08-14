@@ -3,6 +3,9 @@
 #include "server/http_util.h"
 #include "server/route_table.h"
 #include "server/crud_api.h"
+#include "db/row_cache.h"
+
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cerrno>
@@ -27,6 +30,7 @@ using SsizeType = int;
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 using SocketType = int;
@@ -44,10 +48,13 @@ namespace cpppools::server {
 
 using db::DbConnectionPool;
 using db::DataSourceRegistry;
+using db::RowCacheStats;
 using pool::ObjectPool;
 using pool::ThreadPool;
 
 namespace {
+
+using njson = nlohmann::json;
 
 void close_socket(SocketType s) {
 #ifdef _WIN32
@@ -154,6 +161,9 @@ bool is_api_route(RouteId id) {
         case RouteId::kStats:
         case RouteId::kGetConfig:
         case RouteId::kSchema:
+        case RouteId::kCluster:
+        case RouteId::kCacheDisable:
+        case RouteId::kCacheEnable:
             return false;
         case RouteId::kSelect:
         case RouteId::kInsert:
@@ -202,6 +212,9 @@ bool send_all(SocketType fd, const char* data, std::size_t total) noexcept {
 // 用 kSendFlags（Linux 上是 MSG_NOSIGNAL）+ EINTR 重试，与正常路径一致，
 // 避免 SIGPIPE 直接终止进程。
 void send_overload_response(SocketType fd) noexcept {
+    // 静态响应不带 X-Request-Id：accept 循环虽已为该连接分配了 request_id，
+    // 但过载路径的首要目标是代价最低（静态字面量，零格式化）。取舍：
+    // 该连接编号被消耗而无回显，排障时以 rejected_requests 计数为准。
     // 使用 JSON 错误体，而不是纯文本：
     // docs/api/backend_api.md §1.2 声明“所有错误（4xx/5xx）统一为
     // {"message", "status_code"}”。用纯文本会让按文档实现的客户端 JSON 解析失败，
@@ -275,10 +288,22 @@ void HttpServer::start() {
         throw std::runtime_error("bind failed");
     }
 
+    // 回填实际监听端口（port 0 时内核分配临时端口）。
+    sockaddr_in bound_addr{};
+    socklen_t bound_len = sizeof(bound_addr);
+    if (getsockname(server_fd, reinterpret_cast<sockaddr*>(&bound_addr), &bound_len) == 0) {
+        bound_port_.store(ntohs(bound_addr.sin_port), std::memory_order_relaxed);
+    }
+
     // listen backlog=64：内核为半连接队列+全连接队列预留的容量上限。
     if (listen(server_fd, 64) < 0) {
         throw std::runtime_error("listen failed");
     }
+
+    // 优雅停机的唤醒机制：POSIX 用 poll(200ms) 包住 accept —— 实测 macOS 的
+    // SO_RCVTIMEO 不影响 accept（会无限阻塞，探针实证）。
+    // Windows 分支的 accept 无超时唤醒，停机需等下一个连接到达，
+    // 属已知限制（本项目主目标平台为 macOS/Linux）。
 
     // 用 endl 而非 '\n'：start() 之后进入永不返回的 accept 循环，
     // 若不 flush，stdout 被重定向（systemd / docker / nohup）时启动横幅会永久留在缓冲区里。
@@ -292,11 +317,21 @@ void HttpServer::start() {
                   << (name == registry_.default_name() ? " [default]" : "") << std::endl;
     }
 
-    int request_id = 0;
-    // 经典阻塞式 accept 循环：
+    std::uint64_t request_id = 0;
+    // 经典阻塞式 accept 循环（带 200ms 超时唤醒，见上）：
     // 每次 accept 成功后，把客户端处理逻辑投递到线程池，确保主循环持续响应新连接。
     // 这就是三级池化的入口：accept 主循环只做调度，真正的 I/O + 计算都在 worker 线程上。
-    while (true) {
+    while (!stopping_.load(std::memory_order_relaxed)) {
+#ifndef _WIN32
+        // poll 等待新连接（200ms 超时）：超时即回到循环头检查停机标志。
+        struct pollfd pfd;
+        pfd.fd = server_fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        if (poll(&pfd, 1, 200) <= 0) {
+            continue;  // 超时或错误：回到循环头检查停机标志
+        }
+#endif
         sockaddr_in client_addr{};
 #ifdef _WIN32
         int len = sizeof(client_addr);
@@ -308,6 +343,9 @@ void HttpServer::start() {
         if (client_fd == kInvalidSocket) {
             if (errno == EINTR) {
                 continue;  // 被信号打断，重试
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;  // accept 超时：正常唤醒点，回到循环头检查停机标志
             }
             // 其余错误（如 EMFILE fd 耗尽）：短暂让出 CPU，避免 100% 忙循环。
             std::cerr << "[warn] accept failed: errno=" << errno << '\n';
@@ -353,9 +391,29 @@ void HttpServer::start() {
             close_socket(client_fd);
         }
     }
+
+    // ===== 优雅停机：等待在途请求排空（上限 5s）=====
+    // accept 已停（不再收新连接），worker 线程上的在途请求继续跑完；
+    // 之后 start() 返回，main 按逆序销毁三大池（线程池析构排空队列）。
+    // 注意口径：in-flight 只含"已开始处理"的请求（active_requests_ 在
+    // handle_client 内递增）；已提交但尚在队列的任务在排空窗口内才启动，
+    // 故 remaining 可能大于 in_flight_at_stop —— 用有符号算术防下溢。
+    const long long in_flight_at_stop =
+        static_cast<long long>(active_requests_.load(std::memory_order_relaxed));
+    const std::size_t queued_at_stop = thread_pool_.pending_tasks();
+    const auto drain_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (active_requests_.load(std::memory_order_relaxed) > 0 &&
+           std::chrono::steady_clock::now() < drain_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    const long long remaining =
+        static_cast<long long>(active_requests_.load(std::memory_order_relaxed));
+    std::cout << "graceful stop: in-flight at stop=" << in_flight_at_stop
+              << ", queued at stop=" << queued_at_stop
+              << ", not finished=" << remaining << std::endl;
 }
 
-void HttpServer::handle_client(std::intptr_t client_fd, int request_id) {
+void HttpServer::handle_client(std::intptr_t client_fd, std::uint64_t request_id) {
     // socket 交给 RAII 托管：无论正常返回还是抛异常，析构都会关闭它。
     SocketGuard guard(static_cast<SocketType>(client_fd));
 
@@ -376,8 +434,10 @@ void HttpServer::handle_client(std::intptr_t client_fd, int request_id) {
         if (!pool_exhausted_warned.test_and_set(std::memory_order_relaxed)) {
             std::cerr << "[warn] request pool exhausted (this warning prints once)\n";
         }
-        const ApiResponse resp =
+        ApiResponse resp =
             make_error_response(503, "Service Unavailable", "request pool exhausted");
+        // 池耗尽是最需要排障的失败形态之一，id 不能缺。
+        resp.extra_headers.emplace_back("X-Request-Id", std::to_string(request_id));
         // 局部缓冲即可：响应仅约 100 字节。此时拿不到池化的 ctx->response
         // （ctx 正是借不出来的那个东西）。
         std::string response_buf;
@@ -398,6 +458,12 @@ void HttpServer::handle_client(std::intptr_t client_fd, int request_id) {
 
     // 仅处理"一次读取 + 一次响应 + 主动关闭连接"模型，不支持 keep-alive 与 chunked。
     // 请求体按 Content-Length 模型读取（见下方读体段）。
+    // 首读超时（30s）：只建连不发字节的静默客户端不得永久钉死 worker ——
+    // 否则优雅停机的"5s 排空上限"失真（被钉死的 worker 在 ThreadPool
+    // 析构时仍被 join，进程无限挂起）。超时后 recv 返回错误，按"无数据"
+    // 走下方的静默返回路径。
+    const struct timeval head_tv{30, 0};
+    setsockopt(guard.get(), SOL_SOCKET, SO_RCVTIMEO, &head_tv, sizeof(head_tv));
     SsizeType n = 0;
     do {
         n = recv(guard.get(), ctx->buffer.data(), kRequestBufferBytes, 0);
@@ -418,9 +484,10 @@ void HttpServer::handle_client(std::intptr_t client_fd, int request_id) {
     // 对畸形请求行的处理完全一致（含 error 计数）。
     if (!parse_request_line(request)) {
         error_requests_.fetch_add(1, std::memory_order_relaxed);
-        const ApiResponse bad = request_complete
+        ApiResponse bad = request_complete
             ? make_error_response(400, "Bad Request", "malformed request line")
             : make_error_response(414, "URI Too Long", "request line is too long");
+        bad.extra_headers.emplace_back("X-Request-Id", std::to_string(request_id));
         std::string response_buf;
         append_http_response(bad, response_buf);
         (void)send_all(guard.get(), response_buf.data(), response_buf.size());
@@ -438,8 +505,9 @@ void HttpServer::handle_client(std::intptr_t client_fd, int request_id) {
             // 超限：回 413 且不尝试读入（避免被大 body 占用缓冲/带宽）。
             // 口径：与对象池 503 一致 —— 进了处理链的失败计 error。
             error_requests_.fetch_add(1, std::memory_order_relaxed);
-            const ApiResponse too_large =
+            ApiResponse too_large =
                 make_error_response(413, "Payload Too Large", "request body too large");
+            too_large.extra_headers.emplace_back("X-Request-Id", std::to_string(request_id));
             std::string response_buf;
             append_http_response(too_large, response_buf);
             (void)send_all(guard.get(), response_buf.data(), response_buf.size());
@@ -488,6 +556,8 @@ void HttpServer::handle_client(std::intptr_t client_fd, int request_id) {
     }
 
     // 写入池化的 response 缓冲（reset() 已 clear 但保留 capacity）。
+    // X-Request-Id 回显：客户端可用它与服务端日志对账（贯穿排障的前提）。
+    resp.extra_headers.emplace_back("X-Request-Id", std::to_string(request_id));
     append_http_response(resp, ctx->response);
 
     // 发送失败不影响计数（请求已被完整处理），guard 会关闭 socket。
@@ -553,10 +623,13 @@ ApiResponse HttpServer::route_request(std::string_view request, bool request_com
         case RouteId::kStats:       resp = handle_stats();                   break;
         case RouteId::kGetConfig:   resp = handle_get_config();              break;
         case RouteId::kSchema:      resp = handle_schema(api_ctx);           break;
+        case RouteId::kCluster:     resp = handle_cluster();                 break;
         case RouteId::kSelect:      resp = handle_select(api_ctx);           break;
         case RouteId::kInsert:      resp = handle_insert(api_ctx);           break;
         case RouteId::kUpdate:      resp = handle_update(api_ctx);           break;
         case RouteId::kDelete:      resp = handle_delete(api_ctx);           break;
+        case RouteId::kCacheDisable: resp = handle_cache_control(false);     break;
+        case RouteId::kCacheEnable:  resp = handle_cache_control(true);      break;
     }
 
     if (api_route) {
@@ -723,6 +796,45 @@ ApiResponse HttpServer::handle_metrics() const {
             << "cpppools_db_pool_rebuild_failed_total" << db_label << " " << dps.rebuild_failed_total << "\n";
     }
 
+    // ===== 行级缓存（每数据源一行，pool 标签 = 数据源名）=====
+    const auto cache_list = registry_.caches();
+    if (!cache_list.empty()) {
+        out << "# HELP cpppools_cache_hits_total Cache hits (reads served without DB).\n"
+            << "# TYPE cpppools_cache_hits_total counter\n"
+            << "# HELP cpppools_cache_misses_total Cache misses (backed by DB read).\n"
+            << "# TYPE cpppools_cache_misses_total counter\n"
+            << "# HELP cpppools_cache_entries Cached rows currently held.\n"
+            << "# TYPE cpppools_cache_entries gauge\n"
+            << "# HELP cpppools_cache_bytes Approximate bytes held (estimated).\n"
+            << "# TYPE cpppools_cache_bytes gauge\n"
+            << "# HELP cpppools_cache_evictions_total LRU evictions.\n"
+            << "# TYPE cpppools_cache_evictions_total counter\n"
+            << "# HELP cpppools_cache_invalidations_total Write-through invalidations.\n"
+            << "# TYPE cpppools_cache_invalidations_total counter\n"
+            << "# HELP cpppools_cache_singleflight_merged_total Concurrent misses merged by singleflight.\n"
+            << "# TYPE cpppools_cache_singleflight_merged_total counter\n"
+            << "# HELP cpppools_cache_bypass_total Entries skipped, by reason (spec §8.1; 期1 仅 too_large).\n"
+            << "# TYPE cpppools_cache_bypass_total counter\n"
+            << "# HELP cpppools_cache_backfill_dropped_total Backfills dropped by generation CAS (spec §4.3.1).\n"
+            << "# TYPE cpppools_cache_backfill_dropped_total counter\n";
+        for (const auto& [name, cache] : cache_list) {
+            const RowCacheStats cs = cache->stats();
+            const std::string label = "{pool=\"" + name + "\"}";
+            out << "cpppools_cache_hits_total" << label << " " << cs.hits << "\n"
+                << "cpppools_cache_misses_total" << label << " " << cs.misses << "\n"
+                << "cpppools_cache_entries" << label << " " << cs.entries << "\n"
+                << "cpppools_cache_bytes" << label << " " << cs.bytes << "\n"
+                << "cpppools_cache_evictions_total" << label << " " << cs.evictions << "\n"
+                << "cpppools_cache_invalidations_total" << label << " " << cs.invalidations << "\n"
+                << "cpppools_cache_singleflight_merged_total" << label << " "
+                << cs.singleflight_merged << "\n"
+                << "cpppools_cache_bypass_total{pool=\"" << name << "\",reason=\"too_large\"} "
+                << cs.bypass_too_large << "\n"
+                << "cpppools_cache_backfill_dropped_total" << label << " "
+                << cs.backfill_dropped << "\n";
+        }
+    }
+
     out << "# HELP cpppools_api_latency_ms Latency quantiles of business API requests.\n"
         << "# TYPE cpppools_api_latency_ms summary\n"
         << std::fixed << std::setprecision(3)
@@ -813,6 +925,29 @@ ApiResponse HttpServer::handle_stats() const {
          << "\"memory_pool_acquire_failed_total\":" << ops.acquire_failed_total << ","
          << "\"db_acquire_timeout_ms\":" << config_.db_acquire_timeout.count() << ","
          << "\"latency_window_size\":" << config_.latency_window_size << ","
+         << [&] {
+                // 缓存聚合：任一数据源启用缓存即计 enabled。
+                std::uint64_t hits = 0, misses = 0;
+                std::size_t entries = 0;
+                bool enabled = false;
+                for (const auto& [name, cache] : registry_.caches()) {
+                    const RowCacheStats cs = cache->stats();
+                    hits += cs.hits;
+                    misses += cs.misses;
+                    entries += cs.entries;
+                    enabled = enabled || cache->enabled();
+                    (void)name;
+                }
+                std::ostringstream os;
+                os << "\"cache_enabled\":" << (enabled ? "true" : "false") << ","
+                   << "\"cache_entries\":" << entries << ","
+                   << "\"cache_hits_total\":" << hits << ","
+                   << "\"cache_misses_total\":" << misses << ","
+                   // 集群身份（spec §8.1）：与缓存聚合并列，便于运维一屏定位。
+                   << "\"cluster_epoch\":" << config_.cluster_view.epoch << ","
+                   << "\"node_id\":\"" << config_.cluster_view.node_id << "\",";
+                return os.str();
+            }()
          << "\"latency_samples\":" << lstats.samples << ","
          << std::fixed << std::setprecision(3)
          << "\"avg_latency_ms\":" << lstats.avg_ms << ","
@@ -856,6 +991,26 @@ ApiResponse HttpServer::handle_get_config() const {
          << "\"memory_pool_total\":" << ops.size << ","
          << "\"memory_pool_capacity\":" << ops.capacity << ","
          << "\"latency_window_size\":" << config_.latency_window_size << ","
+         << [&] {
+                // 缓存聚合：任一数据源启用缓存即计 enabled。
+                std::uint64_t hits = 0, misses = 0;
+                std::size_t entries = 0;
+                bool enabled = false;
+                for (const auto& [name, cache] : registry_.caches()) {
+                    const RowCacheStats cs = cache->stats();
+                    hits += cs.hits;
+                    misses += cs.misses;
+                    entries += cs.entries;
+                    enabled = enabled || cache->enabled();
+                    (void)name;
+                }
+                std::ostringstream os;
+                os << "\"cache_enabled\":" << (enabled ? "true" : "false") << ","
+                   << "\"cache_entries\":" << entries << ","
+                   << "\"cache_hits_total\":" << hits << ","
+                   << "\"cache_misses_total\":" << misses << ",";
+                return os.str();
+            }()
          << "\"max_request_bytes\":" << kRequestBufferBytes << ","
          << "\"endpoint_count\":" << (route_table_end() - route_table_begin())
          << "}";
@@ -863,6 +1018,71 @@ ApiResponse HttpServer::handle_get_config() const {
     ApiResponse resp;
     resp.body = body.str();
     return resp;
+}
+
+ApiResponse HttpServer::handle_cluster() const {
+    // SDK 建环的唯一信息源（cluster-cache spec §6.2）：拓扑 + 哈希参数 +
+    // TTL 全部自包含。TTL 由服务端下发是保证不变量 I1（blacklist_ttl ≥
+    // cache_ttl）跨进程一致的唯一手段 —— 两个 TTL 分属两个进程配置，
+    // 无下发通道时任何人改其中一边都会静默破坏不变量。
+    const ClusterView& cv = config_.cluster_view;
+
+    njson root;
+    root["self"] = cv.node_id;
+    root["epoch"] = cv.epoch;
+    // 哈希参数：与 spec §3.1 一致，两端建环逐项同参。
+    root["hash"] = {
+        {"algorithm", "murmur3_32"},
+        {"seed", 0},
+        {"unsigned", true},
+        {"vnodes_per_node", cv.vnodes_per_node},
+        {"attempt_base", 0},
+    };
+    root["ttl"] = {
+        {"cache_ttl_ms", cv.cache_ttl_ms},
+        {"blacklist_ttl_ms", cv.blacklist_ttl_ms},
+    };
+    njson nodes = njson::array();
+    if (!cv.nodes.empty()) {
+        for (const auto& node : cv.nodes) {
+            nodes.push_back({{"node_id", node.node_id},
+                             {"host", node.host},
+                             {"port", node.port}});
+        }
+    } else {
+        // 单节点模式：合成单节点列表，SDK 逻辑统一、无需特判。
+        nodes.push_back({{"node_id", "single"},
+                         {"host", "127.0.0.1"},
+                         {"port", port_}});
+    }
+    root["nodes"] = std::move(nodes);
+    njson digests = njson::array();
+    for (const auto& d : registry_.datasource_digests()) {
+        digests.push_back({{"name", d.name}, {"type", d.type}, {"digest", d.digest}});
+    }
+    root["datasource_digest"] = std::move(digests);
+
+    ApiResponse resp;
+    resp.body = root.dump();
+    return resp;
+}
+
+ApiResponse HttpServer::handle_cache_control(bool enable) {
+    // kill-switch（spec §8.3）：生产上疑似缓存脏读时的第一动作。
+    // 对全部数据源的共享缓存生效；关闭只停读命中与回填，写的失效仍执行（I0）。
+    std::size_t affected = 0;
+    for (const auto& [name, cache] : registry_.caches()) {
+        cache->set_enabled(enable);
+        ++affected;
+        (void)name;
+    }
+    njson resp;
+    resp["enabled"] = enable;
+    resp["affected_datasources"] = affected;
+    resp["message"] = enable ? "row cache enabled" : "row cache disabled";
+    ApiResponse api_resp;
+    api_resp.body = resp.dump();
+    return api_resp;
 }
 
 void HttpServer::record_api_latency_ms(double latency_ms) {

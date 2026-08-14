@@ -80,6 +80,7 @@ add_library(cpppools STATIC
     src/server/route_table.cpp
     src/server/crud_api.cpp
     src/server/http_server.cpp
+    src/server/hash_ring.cpp
 )
 target_include_directories(cpppools
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -212,6 +213,11 @@ cpppools_add_test(test_statement_cache)
 cpppools_add_test(test_database_conformance)
 cpppools_add_test(test_routing)
 cpppools_add_test(test_crud_api)
+cpppools_add_test(test_hash_ring)
+cpppools_add_test(test_cluster_api)
+cpppools_add_test(test_row_cache)
+cpppools_add_test(test_caching_database)
+cpppools_add_test(test_cache_metrics)
 
 # =========================
 # 构建摘要

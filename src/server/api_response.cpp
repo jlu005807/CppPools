@@ -46,6 +46,12 @@ void append_http_response(const ApiResponse& resp, std::string& out) {
         out += resp.allow;
         out += "\r\n";
     }
+    for (const auto& [name, value] : resp.extra_headers) {
+        out += name;
+        out += ": ";
+        out += value;
+        out += "\r\n";
+    }
     out += "Connection: close\r\n\r\n";
     if (body_allowed) {
         out += resp.body;

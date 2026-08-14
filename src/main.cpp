@@ -6,12 +6,19 @@
 #include "cpppools/pool/thread_pool.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
+#include <csignal>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <string>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 using namespace cpppools::pool;
 using namespace cpppools::db;
@@ -20,6 +27,39 @@ namespace config = cpppools::config;
 
 
 namespace {
+
+// 优雅停机的信号桥：信号处理函数只能碰原子量（async-signal-safe 约束），
+// 所以这里只存原子量，handler 里转调 request_stop()（它也只碰原子标志）。
+std::atomic<cpppools::server::HttpServer*> g_stop_server{nullptr};
+std::atomic<int> g_stop_signal_count{0};
+
+void handle_stop_signal(int sig) {
+    // 第二次信号 = 用户等不及排空：强制退出（_exit 是 async-signal-safe）。
+    if (g_stop_signal_count.fetch_add(1, std::memory_order_relaxed) > 0) {
+        _exit(sig == SIGINT ? 130 : 143);
+    }
+    cpppools::server::HttpServer* server = g_stop_server.load(std::memory_order_relaxed);
+    if (server != nullptr) {
+        server->request_stop();
+    }
+}
+
+// RAII：信号注册的生效范围与 server 的生命周期严格对齐 ——
+// 无论 start() 正常返回还是抛异常，析构都会解指针并恢复默认处置，
+// 不会有 handler 悬在已销毁对象上。
+struct StopBridge {
+    StopBridge() {
+        std::signal(SIGTERM, handle_stop_signal);
+        std::signal(SIGINT, handle_stop_signal);
+    }
+    ~StopBridge() {
+        g_stop_server.store(nullptr, std::memory_order_relaxed);
+        g_stop_signal_count.store(0, std::memory_order_relaxed);
+        std::signal(SIGTERM, SIG_DFL);
+        std::signal(SIGINT, SIG_DFL);
+    }
+};
+
 unsigned int env_to_uint(const char* key, unsigned int fallback) {
     const char* v = std::getenv(key);
     if (v == nullptr || *v == '\0') {
@@ -111,7 +151,8 @@ int main(int argc, char** argv) {
         // table→datasource 索引。任一源失败整体 fail-fast；
         // 歧义表（多源同名）在构建期打 stderr 警告（spec §4.1）。
         // :memory: 字面路径强制单槽也在 registry 内处理（spec §10.1）。
-        RegistryBuildResult registry_result = DataSourceRegistry::build(app_cfg.datasources);
+        RegistryBuildResult registry_result =
+            DataSourceRegistry::build(app_cfg.datasources, app_cfg.cache);
         if (registry_result.registry == nullptr) {
             std::cerr << "config error: " << registry_result.error << std::endl;
             return 1;
@@ -146,6 +187,17 @@ int main(int argc, char** argv) {
         // latency_window_size 配置文件优先（避免“解析了但无效”的裂口）。
         HttpServerConfig server_cfg = build_server_config_from_env();
         server_cfg.latency_window_size = app_cfg.server.latency_window_size;
+        // 集群视图（/api/v1/cluster 的响应素材；cluster 段缺省 = 单节点模式）。
+        if (app_cfg.has_cluster) {
+            server_cfg.cluster_view.node_id = app_cfg.cluster.node_id;
+            server_cfg.cluster_view.epoch = app_cfg.cluster.epoch;
+            for (const auto& n : app_cfg.cluster.nodes) {
+                server_cfg.cluster_view.nodes.push_back(
+                    {n.node_id, n.host, n.port});
+            }
+        }
+        server_cfg.cluster_view.cache_ttl_ms = app_cfg.cache.ttl_ms;
+        server_cfg.cluster_view.blacklist_ttl_ms = app_cfg.cache.blacklist_ttl_ms;
 
         // 启动 HTTP 服务（阻塞运行）。
         // 其余启动信息由 HttpServer::start() 统一打印，避免重复输出。
@@ -157,6 +209,11 @@ int main(int argc, char** argv) {
             request_pool,
             *registry,
             server_cfg);
+        // 优雅停机：SIGTERM/SIGINT → 停 accept → 等在途请求排空 → 正常返回
+        // （此后按声明逆序销毁：server → 三大池，生命周期安全）。
+        // 排空等待中再收一次信号 = 强制退出（见 handle_stop_signal）。
+        g_stop_server.store(&server, std::memory_order_relaxed);
+        StopBridge stop_bridge;
         server.start();
     } catch (const std::exception& ex) {
         std::cerr << "server failed: " << ex.what() << std::endl;

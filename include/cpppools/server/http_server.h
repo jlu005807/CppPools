@@ -35,8 +35,8 @@ inline constexpr std::size_t kMaxBodyBytes = 65536;
 // 这里用 clear() 而不是重新构造，就是为了保住已分配的 capacity，
 // 否则池化只剩下“对象个数”的形式，真正昂贵的堆缓冲每次还是重新申请。
 struct RequestContext {
-    // 由 accept 主循环分配的递增请求编号。
-    int request_id{0};
+    // 由 accept 主循环分配的递增请求编号（uint64 防长运行回绕为负）。
+    std::uint64_t request_id{0};
     // 请求接收缓冲（多留 1 字节供结尾零）。
     std::vector<char> buffer;
     // 待发送的完整 HTTP 响应文本。
@@ -57,11 +57,30 @@ struct RequestContext {
 
 // HttpServer 运行期可调参数。
 // 这些配置项保持“显式且可观察”，方便学习时看到参数调优对服务行为的影响。
+// 集群视图：/api/v1/cluster 的响应素材（cluster-cache spec §6.2）。
+// 由 main 从配置文件构造；nodes 为空 = 单节点模式（端点自动合成单节点列表，
+// SDK 无需特判）。哈希参数与 TTL 随端点下发，保证两端同参（不变量 I1）。
+struct ClusterView {
+    struct Node {
+        std::string node_id;
+        std::string host;
+        int port{8080};
+    };
+    std::string node_id{"single"};
+    long long epoch{0};
+    std::vector<Node> nodes;
+    long long cache_ttl_ms{60000};
+    long long blacklist_ttl_ms{60000};
+    int vnodes_per_node{100};
+};
+
 struct HttpServerConfig {
     // 从 DbConnectionPool 借连接时的最大等待时长。
     std::chrono::milliseconds db_acquire_timeout{100};
     // /api/v1/stats 计算分位延迟时使用的滑动窗口样本数量。
     std::size_t latency_window_size{1024};
+    // 集群视图（缺省 = 单节点模式）。
+    ClusterView cluster_view;
 };
 
 // HttpServer：单节点三级池化 API 服务的 HTTP 接入层。
@@ -100,7 +119,16 @@ public:
                HttpServerConfig config = {});
 
     // 阻塞启动：进入 accept 循环并持续向线程池分发客户端处理任务。
+    // 收到 request_stop() 后优雅退出：停止 accept → 等待在途请求排空
+    // （上限 5s）→ 返回。
     void start();
+
+    // 请求优雅停机（信号安全：只置原子标志）。可从信号处理函数调用。
+    void request_stop() { stopping_.store(true, std::memory_order_relaxed); }
+
+    // 实际监听端口：port 0（临时端口）时由 bind 后回填，供测试连接。
+    // start() 之前为 0。
+    uint16_t bound_port() const { return bound_port_.load(std::memory_order_relaxed); }
 
     // 解析请求行、匹配路由并分发到对应 handler。
     // request_complete 为 false 表示请求行可能被接收缓冲截断；
@@ -119,7 +147,7 @@ public:
     // 公开的理由与 route_request 同源：它只依赖 fd + 三个池引用，
     // 测试（test_http_server）用 socketpair 直接驱动它验证
     // 对象池耗尽→503、DB 超时→503、计数器口径这些接线，无需真实监听。
-    void handle_client(std::intptr_t client_fd, int request_id);
+    void handle_client(std::intptr_t client_fd, std::uint64_t request_id);
 
 private:
     struct LatencyStats {
@@ -135,6 +163,9 @@ private:
     ApiResponse handle_metrics() const;
     ApiResponse handle_stats() const;
     ApiResponse handle_get_config() const;
+    ApiResponse handle_cluster() const;
+    // 缓存 kill-switch（spec §8.3）：对全部数据源的共享缓存生效。
+    ApiResponse handle_cache_control(bool enable);
 
     // 记录 API 请求延迟样本，用于后续分位数统计。
     void record_api_latency_ms(double latency_ms);
@@ -149,6 +180,13 @@ private:
     db::DataSourceRegistry& registry_;
     // 运行期调优参数（超时、统计窗口大小等）。
     HttpServerConfig config_;
+
+    // 优雅停机标志：request_stop() 置位后 accept 循环退出（SIGTERM/SIGINT
+    // 经 main 注册的信号处理函数调用 request_stop，只碰这个原子量，信号安全）。
+    std::atomic<bool> stopping_{false};
+
+    // bind 后的实际监听端口（port 0 时内核分配临时端口，回填供测试连接）。
+    std::atomic<std::uint16_t> bound_port_{0};
 
     // 运行期监控计数器（用于可观测性输出）。
     // 这里使用 memory_order_relaxed 足够，因为我们只需要近似实时遥测值。

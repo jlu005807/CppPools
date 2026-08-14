@@ -8,6 +8,7 @@
 
 #include "cpppools/db/database.h"
 #include "cpppools/db/row_request.h"
+#include "db/caching_database.h"
 #include "db/sqlite_database.h"
 #include "cpppools/db/value.h"
 
@@ -86,6 +87,12 @@ struct TempDb {
     }
 };
 
+// 装饰器开关（cluster-cache spec §9 的 conformance 参数化）：main 跑两遍，
+// 第二遍把每个 open_seeded_db 的库包上 CachingDatabase，验证 CRUD 语义
+// 子集在缓存层下逐条不变。排除清单（直接构造后端或断言后端内部）的用例
+// 在 g_with_cache=true 时自行跳过。
+bool g_with_cache = false;
+
 // 打开一个建好 users/pairs 表的临时库。
 TempDb open_seeded_db(const std::string& tag) {
     TempDb t;
@@ -101,7 +108,15 @@ TempDb open_seeded_db(const std::string& tag) {
         std::fprintf(stderr, "make_sqlite_database failed: %s\n", result.error.c_str());
     }
     assert(result.db != nullptr);
-    t.db = std::move(result.db);
+    if (g_with_cache) {
+        cpppools::db::RowCacheConfig rc;
+        rc.ttl = std::chrono::seconds(60);
+        t.db = std::make_unique<cpppools::db::CachingDatabase>(
+            std::move(result.db),
+            std::make_shared<cpppools::db::RowCache>(rc));
+    } else {
+        t.db = std::move(result.db);
+    }
     return t;
 }
 
@@ -171,6 +186,7 @@ static void test_introspection() {
 }
 
 static void test_blob_column_rejects_datasource() {
+    if (g_with_cache) return;  // 排除清单：直接构造后端、断言创建失败
     // 口径 D7：BLOB 亲和列 → 创建失败，error 指明 table.column。
     const std::string path = make_temp_path("blob");
     sqlite3* raw = nullptr;
@@ -190,6 +206,7 @@ static void test_blob_column_rejects_datasource() {
 }
 
 static void test_open_missing_file_fails() {
+    if (g_with_cache) return;  // 排除清单：直接构造后端、断言创建失败
     // 口径 D11：不带 CREATE —— 库文件不存在则失败（中间件不建库）。
     config::DataSourceConfig cfg;
     cfg.type = "sqlite";
@@ -377,6 +394,7 @@ static void test_delete_and_zero_rows() {
 // ---------------------------------------------------------------------------
 
 static void test_shared_memory_two_connections() {
+    if (g_with_cache) return;  // 排除清单：直接构造两条裸连接断言共享内存库
     const std::string uri = "file:cpppools_conformance_mem?mode=memory&cache=shared";
 
     // 裸连接先建表并保持打开（共享内存库随最后一个连接关闭而消失）。
@@ -420,6 +438,7 @@ static void test_shared_memory_two_connections() {
 // ---------------------------------------------------------------------------
 
 static void test_repeated_ops_stay_correct() {
+    if (g_with_cache) return;  // 排除清单：statement-cache 系列（断言句柄复用语境）
     TempDb t = open_seeded_db("repeat");
     for (std::int64_t i = 1; i <= 20; ++i) {
         InsertRequest ins{"users", {{"name", Value{"u" + std::to_string(i)}},
@@ -503,6 +522,7 @@ static void test_rowid_alias_explicit_null_rejected_end_to_end() {
 }
 
 static void test_partial_unique_index_not_marked_unique() {
+    if (g_with_cache) return;  // 排除清单：直接构造后端、断言自省口径
     // partial UNIQUE 索引只在谓词子集上唯一 —— 不得标列级 unique，
     // 否则击穿「每操作至多一行」的安全不变量。
     const std::string path = make_temp_path("partial");
@@ -565,7 +585,8 @@ static void test_foreign_data_read_is_controlled() {
 
 }  // namespace
 
-int main() {
+// CRUD 语义子集：两遍跑同一批用例（裸后端 / 套装饰器，spec §9）。
+static void run_all_cases() {
     test_introspection();
     test_blob_column_rejects_datasource();
     test_open_missing_file_fails();
@@ -586,5 +607,12 @@ int main() {
     test_rowid_alias_explicit_null_rejected_end_to_end();
     test_partial_unique_index_not_marked_unique();
     test_foreign_data_read_is_controlled();
+}
+
+int main() {
+    g_with_cache = false;
+    run_all_cases();
+    g_with_cache = true;
+    run_all_cases();
     return 0;
 }

@@ -2,8 +2,12 @@
 
 #include "cpppools/db/database_factory.h"
 #include "cpppools/db/db_connection_pool.h"
+#include "db/caching_database.h"
+#include "db/row_cache.h"
+#include "server/hash_ring.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <utility>
 
@@ -27,7 +31,8 @@ std::string join_names(const std::vector<std::string>& names) {
 DataSourceRegistry::~DataSourceRegistry() = default;
 
 RegistryBuildResult DataSourceRegistry::build(
-    const std::vector<config::DataSourceConfig>& sources) {
+    const std::vector<config::DataSourceConfig>& sources,
+    const config::AppConfig::Cache& cache_cfg) {
     if (sources.empty()) {
         return {nullptr, "config has no datasources; at least one is required"};
     }
@@ -85,10 +90,26 @@ RegistryBuildResult DataSourceRegistry::build(
             pool_size = 1;
         }
 
+        // 该源的共享缓存（enabled 时）：全部槽位的装饰器共用一份（spec §4.1.1）。
+        std::shared_ptr<RowCache> cache;
+        if (cache_cfg.enabled) {
+            RowCacheConfig rc;
+            rc.max_entries = cache_cfg.max_entries;
+            rc.max_bytes = cache_cfg.max_bytes;
+            rc.max_entry_bytes = cache_cfg.max_entry_bytes;
+            rc.ttl = std::chrono::milliseconds(cache_cfg.ttl_ms);
+            cache = std::make_shared<RowCache>(rc);
+        }
         const config::DataSourceConfig pool_cfg = cfg;  // 值拷贝：factory 捕获
-        ConnectionFactory factory = [pool_cfg](std::size_t) -> std::unique_ptr<Database> {
+        ConnectionFactory factory = [pool_cfg, cache](std::size_t) -> std::unique_ptr<Database> {
             DatabaseCreateResult result = create_database(pool_cfg);
-            return std::move(result.db);  // 失败为 nullptr → 池 fail-fast
+            if (result.db == nullptr) {
+                return nullptr;  // 池 fail-fast
+            }
+            if (cache) {
+                return std::make_unique<CachingDatabase>(std::move(result.db), cache);
+            }
+            return std::move(result.db);
         };
         DbPoolConfig pcfg;
         pcfg.pool_size = pool_size;
@@ -101,6 +122,7 @@ RegistryBuildResult DataSourceRegistry::build(
         } catch (const std::exception& ex) {
             return {nullptr, "datasource \"" + cfg.name + "\": pool init failed: " + ex.what()};
         }
+        entry.cache = std::move(cache);
 
         for (const auto& table : entry.tables) {
             reg->table_index_[table].push_back(cfg.name);
@@ -211,6 +233,41 @@ std::vector<std::string> DataSourceRegistry::tables_of(
     const std::string& datasource_name) const {
     const Entry* entry = find_entry(datasource_name);
     return (entry != nullptr) ? entry->tables : std::vector<std::string>{};
+}
+
+std::vector<DataSourceRegistry::DataSourceDigest> DataSourceRegistry::datasource_digests() const {
+    // 摘要只含"连的是哪个目标"（type + 库标识），**不含凭据**：
+    // 某节点的 sqlite.path 写错时，SDK/运维比对全节点摘要即可发现
+    // （spec §6.3：无强制手段的关键结构约束，由此提供检测）。
+    using server::hash_ring::lp;
+    std::vector<DataSourceDigest> out;
+    out.reserve(entries_.size());
+    for (const auto& entry : entries_) {
+        const config::DataSourceConfig& c = entry.config;
+        std::string input = lp(c.type);
+        if (c.type == "sqlite") {
+            input += lp(c.sqlite_path);
+        } else {
+            input += lp(c.mysql_host);
+            input += lp(std::to_string(c.mysql_port));
+            input += lp(c.mysql_database);
+        }
+        const uint32_t h = server::hash_ring::murmur3_32(input);
+        char hex[9];
+        std::snprintf(hex, sizeof(hex), "%08x", h);
+        out.push_back(DataSourceDigest{c.name, c.type, std::string(hex)});
+    }
+    return out;
+}
+
+std::vector<std::pair<std::string, const RowCache*>> DataSourceRegistry::caches() const {
+    std::vector<std::pair<std::string, const RowCache*>> out;
+    for (const auto& entry : entries_) {
+        if (entry.cache) {
+            out.emplace_back(entry.config.name, entry.cache.get());
+        }
+    }
+    return out;
 }
 
 const DataSourceRegistry::Entry* DataSourceRegistry::find_entry(

@@ -101,17 +101,20 @@ REAL 键列的请求不参与环路由（见 §5.5）。
 
 ### 3.2 黄金向量（规范性，两端测试必须引用本表）
 
-期 0 冻结下列向量，服务端 `test_hash_ring` 与 SDK 测试**引用本表而非各自硬编码**。
-（值在期 0 实现后填入并锁定；表格结构与输入集合此刻即为规范。）
+下列向量已于期 0 冻结（生成方式：Python `mmh3.hash(key, 0, signed=False)` +
+§3.1 的 LP 编码；服务端 `test_hash_ring` 与 SDK 测试**引用本表而非各自
+硬编码**，任何一端的实现漂移都会撞红）。
 
 | # | 输入 | 期望哈希（uint32） | 备注 |
 |---|---|---|---|
-| V1 | vnode: `node_id="node-a"`, `index=0` | _期 0 填入_ | ASCII node_id |
-| V2 | vnode: `node_id="节点-b"`, `index=99` | _期 0 填入_ | 非 ASCII + 边界 index |
-| V3 | query: `("main","users","id","42",0)` | _期 0 填入_ | 整数键 |
-| V4 | query: `("main","users","tag","a/b",0)` | _期 0 填入_ | 值含 `/`（验证长度前缀） |
-| V5 | query: `("main","users","id","-7",3)` | _期 0 填入_ | 负整数 + attempt>0 |
-| V6 | 环归属：节点集 `{node-a,node-b,node-c}` + V3 键 | _期 0 填入 owner_ | 端到端归属 |
+| V1 | vnode: `node_id="node-a"`, `index=0` | **1664544994** | ASCII node_id |
+| V2 | vnode: `node_id="节点-b"`, `index=99` | **3870970589** | 非 ASCII + 边界 index |
+| V3 | query: `("main","users","id","42",0)` | **931942866** | 整数键 |
+| V4 | query: `("main","users","tag","a/b",0)` | **2309089622** | 值含 `/`（验证长度前缀） |
+| V5 | query: `("main","users","id","-7",3)` | **4213239566** | 负整数 + attempt>0 |
+| V6 | 环归属：节点集 `{node-a,node-b,node-c}`×100 vnodes + V3 键 | owner = **node-a**（键哈希 931942866） | 端到端归属 |
+| V7 | murmur3 公知：`mmh3("")=0`、`mmh3("test")=3127628307`、`mmh3("abc")=3017643002` | — | tail=0/1/3 字节基准 |
+| V8 | 碰撞对（离线搜索冻结）：vnode `(node-8,1591)` 与 `(node-21,173)` 同哈希 **2079710457**，tie-break 归属 = **node-21**（字典序小）；查询键 `("main","users","id","1099",0)` 哈希 2078835168 落碰撞点前一 vnode(2076313318) 与碰撞点之间，lower_bound 命中碰撞槽，归属 **node-21** | — | tie-break 确定性基准 |
 
 ### 3.3 路由键与缓存键：同一个 4 元组
 

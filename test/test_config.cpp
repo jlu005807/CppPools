@@ -259,6 +259,178 @@ static void test_negative_numbers_fail() {
     std::remove(p2.c_str());
 }
 
+// ---------------------------------------------------------------------------
+// cluster / cache 段（分布式集群与行级缓存，spec §6.1）
+// ---------------------------------------------------------------------------
+
+// cluster 段与 cache 段均合法的完整配置。
+constexpr const char* kValidClusterConfig = R"({
+  "cluster": {
+    "node_id": "node-a",
+    "epoch": 3,
+    "nodes": [
+      { "node_id": "node-a", "host": "10.0.0.1", "port": 8080 },
+      { "node_id": "node-b", "host": "10.0.0.2", "port": 8080 }
+    ]
+  },
+  "cache": {
+    "enabled": true,
+    "max_entries": 50000,
+    "max_bytes": 1048576,
+    "max_entry_bytes": 4096,
+    "ttl_ms": 30000,
+    "blacklist_ttl_ms": 60000,
+    "tables": ["users", "orders"]
+  },
+  "datasources": [
+    { "name": "main", "type": "sqlite", "sqlite": { "path": "data/main.db" } }
+  ]
+})";
+
+// 包一层最小 datasources，只换中间段。
+std::string wrap_datasources(const std::string& middle) {
+    return "{" + middle + ", \"datasources\": ["
+           "{ \"name\": \"main\", \"type\": \"sqlite\","
+           " \"sqlite\": { \"path\": \"data/main.db\" } }]}";
+}
+
+static void test_cluster_cache_sections() {
+    // 1. 完整合法配置：全字段解析正确。
+    {
+        const std::string path = write_tmp_config(kValidClusterConfig, "cfg_cluster.json");
+        const auto result = load_config(path);
+        assert(result.ok);
+        assert(result.config.has_cluster);
+        assert(result.config.cluster.node_id == "node-a");
+        assert(result.config.cluster.epoch == 3);
+        assert(result.config.cluster.nodes.size() == 2);
+        assert(result.config.cluster.nodes[0].host == "10.0.0.1");
+        assert(result.config.cluster.nodes[0].port == 8080);
+        assert(result.config.cluster.nodes[1].node_id == "node-b");
+        assert(result.config.cache.enabled);
+        assert(result.config.cache.max_entries == 50000);
+        assert(result.config.cache.max_bytes == 1048576);
+        assert(result.config.cache.max_entry_bytes == 4096);
+        assert(result.config.cache.ttl_ms == 30000);
+        assert(result.config.cache.blacklist_ttl_ms == 60000);
+        assert(result.config.cache.tables.size() == 2);
+        assert(result.config.cache.tables[0] == "users");
+        std::remove(path.c_str());
+    }
+
+    // 2. 两段缺省 = 单节点模式（向后兼容：既有配置不受影响）。
+    {
+        const std::string path = write_tmp_config(kValidTwoSources, "cfg_nocluster.json");
+        const auto result = load_config(path);
+        assert(result.ok);
+        assert(!result.config.has_cluster);
+        assert(!result.config.cache.enabled);  // 默认关闭
+        std::remove(path.c_str());
+    }
+
+    // 3. node_id 不在 nodes 列表中 → fail-fast（spec §6.1）。
+    {
+        const std::string cfg = wrap_datasources(
+            "\"cluster\": { \"node_id\": \"ghost\", "
+            "\"nodes\": [ { \"node_id\": \"node-a\", \"host\": \"10.0.0.1\", \"port\": 8080 } ] }");
+        const std::string path = write_tmp_config(cfg, "cfg_badnodeid.json");
+        const auto result = load_config(path);
+        assert(!result.ok);
+        assert(result.error.find("node_id") != std::string::npos);
+        std::remove(path.c_str());
+    }
+
+    // 4. nodes 空 → 失败；nodes 内重复 node_id → 失败。
+    {
+        const std::string cfg = wrap_datasources(
+            "\"cluster\": { \"node_id\": \"node-a\", \"nodes\": [] }");
+        const std::string path = write_tmp_config(cfg, "cfg_emptynodes.json");
+        assert(!load_config(path).ok);
+        std::remove(path.c_str());
+    }
+    {
+        const std::string cfg = wrap_datasources(
+            "\"cluster\": { \"node_id\": \"node-a\", \"nodes\": ["
+            "{ \"node_id\": \"node-a\", \"host\": \"10.0.0.1\", \"port\": 8080 },"
+            "{ \"node_id\": \"node-a\", \"host\": \"10.0.0.2\", \"port\": 8080 } ] }");
+        const std::string path = write_tmp_config(cfg, "cfg_dupnodes.json");
+        const auto result = load_config(path);
+        assert(!result.ok);
+        assert(result.error.find("node") != std::string::npos);
+        std::remove(path.c_str());
+    }
+
+    // 5. nodes 端口越界 / host 缺失 → 失败。
+    {
+        const std::string cfg = wrap_datasources(
+            "\"cluster\": { \"node_id\": \"node-a\", \"nodes\": ["
+            "{ \"node_id\": \"node-a\", \"host\": \"10.0.0.1\", \"port\": 99999 } ] }");
+        const std::string path = write_tmp_config(cfg, "cfg_badport.json");
+        const auto result = load_config(path);
+        assert(!result.ok);
+        assert(result.error.find("port") != std::string::npos);
+        std::remove(path.c_str());
+    }
+    {
+        const std::string cfg = wrap_datasources(
+            "\"cluster\": { \"node_id\": \"node-a\", \"nodes\": ["
+            "{ \"node_id\": \"node-a\", \"port\": 8080 } ] }");
+        const std::string path = write_tmp_config(cfg, "cfg_nohost.json");
+        const auto result = load_config(path);
+        assert(!result.ok);
+        assert(result.error.find("host") != std::string::npos);
+        std::remove(path.c_str());
+    }
+
+    // 6. 不变量 I1：blacklist_ttl_ms 必须 ≥ ttl_ms（spec §5.2）。
+    {
+        const std::string cfg = wrap_datasources(
+            "\"cache\": { \"enabled\": true, \"ttl_ms\": 60000, \"blacklist_ttl_ms\": 10000 }");
+        const std::string path = write_tmp_config(cfg, "cfg_badttl.json");
+        const auto result = load_config(path);
+        assert(!result.ok);
+        assert(result.error.find("blacklist_ttl_ms") != std::string::npos);
+        std::remove(path.c_str());
+    }
+
+    // 7. cache 非法取值：ttl ≤ 0、容量 ≤ 0。
+    {
+        const std::string cfg = wrap_datasources(
+            "\"cache\": { \"enabled\": true, \"ttl_ms\": 0 }");
+        const std::string path = write_tmp_config(cfg, "cfg_zerottl.json");
+        assert(!load_config(path).ok);
+        std::remove(path.c_str());
+    }
+    {
+        const std::string cfg = wrap_datasources(
+            "\"cache\": { \"enabled\": true, \"max_entries\": 0 }");
+        const std::string path = write_tmp_config(cfg, "cfg_zeroentries.json");
+        assert(!load_config(path).ok);
+        std::remove(path.c_str());
+    }
+
+    // 8. 字段类型错（epoch 给字符串）→ 带字段名的可读错误。
+    {
+        const std::string cfg = wrap_datasources(
+            "\"cluster\": { \"node_id\": \"node-a\", \"epoch\": \"three\", \"nodes\": ["
+            "{ \"node_id\": \"node-a\", \"host\": \"10.0.0.1\", \"port\": 8080 } ] }");
+        const std::string path = write_tmp_config(cfg, "cfg_badepoch.json");
+        const auto result = load_config(path);
+        assert(!result.ok);
+        assert(result.error.find("cluster.epoch") != std::string::npos);
+        std::remove(path.c_str());
+    }
+
+    // 9. cache.tables 非数组 / 非字符串元素 → 失败。
+    {
+        const std::string cfg = wrap_datasources(
+            "\"cache\": { \"enabled\": true, \"tables\": \"users\" }");
+        const std::string path = write_tmp_config(cfg, "cfg_badtables.json");
+        assert(!load_config(path).ok);
+        std::remove(path.c_str());
+    }
+}
+
 int main() {
     test_load_valid_config();
     test_load_missing_file_fails();
@@ -277,5 +449,6 @@ int main() {
     test_zero_pool_size_fails();
     test_field_type_errors_fail_with_message();
     test_negative_numbers_fail();
+    test_cluster_cache_sections();
     return 0;
 }

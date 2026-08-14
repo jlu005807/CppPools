@@ -30,11 +30,15 @@ enum class RouteId {
     kStats,
     kGetConfig,
     kSchema,
+    kCluster,
     // 通用行级 CRUD（POST + JSON body，spec §7.1）
     kSelect,
     kInsert,
     kUpdate,
     kDelete,
+    // 缓存运行时开关（kill-switch，spec §8.3）
+    kCacheDisable,
+    kCacheEnable,
 };
 
 // 单条路由的声明。

@@ -2,6 +2,8 @@
 
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace cpppools::server {
 
@@ -18,6 +20,9 @@ struct ApiResponse {
     // 405 响应必须携带 Allow 头（RFC 7231 §6.5.5 的 MUST）。
     // 为空表示本次响应不需要该头。
     std::string allow;
+    // 附加响应头（如 X-Request-Id）：由 HttpServer 在写回前填充，
+    // handler 无需感知。
+    std::vector<std::pair<std::string, std::string>> extra_headers;
 };
 
 // 统一的错误响应体：{"message": "...", "status_code": N}

@@ -12,6 +12,8 @@
 #include <cstdlib>
 #include <string>
 #include <thread>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -73,14 +75,15 @@ struct Fixture {
     db::DbConnectionPool& db_pool() { return *registry->default_pool(); }
 
     // 走一次完整的 handle_client：peer 端预写请求，返回收到的响应文本。
-    std::string round_trip(const std::string& request) {
+    // request_id 透传给 handle_client（X-Request-Id 回显测试可注入不同值）。
+    std::string round_trip(const std::string& request, std::uint64_t request_id = 1) {
         int fds[2];
         assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
         const std::size_t to_write = request.size();
         assert(send(fds[1], request.data(), to_write, 0) ==
                static_cast<ssize_t>(to_write));
 
-        server.handle_client(static_cast<std::intptr_t>(fds[0]), 1);
+        server.handle_client(static_cast<std::intptr_t>(fds[0]), request_id);
         // fds[0] 已被 handle_client 内的 SocketGuard 关闭。
 
         std::string response;
@@ -303,6 +306,99 @@ static void test_malformed_request_line_does_not_wait_for_body() {
     assert(resp.find("400") != std::string::npos);
 }
 
+static void test_request_id_header_echoed() {
+    // X-Request-Id 回显：每个响应都带，且随 accept 序号递增 ——
+    // 客户端用它与服务端日志对账（贯穿排障的前提）。
+    Fixture f(2, 4);
+    const std::string r1 = f.round_trip("GET /health HTTP/1.1\r\n", 1);
+    assert(r1.find("X-Request-Id: 1\r\n") != std::string::npos);
+    // 不同请求携带各自的 id（accept 循环里是递增序号，此处注入模拟）。
+    const std::string r2 = f.round_trip("GET /health HTTP/1.1\r\n", 42);
+    assert(r2.find("X-Request-Id: 42\r\n") != std::string::npos);
+    // 错误路径同样携带（排障最需要 id 的恰是失败请求）。
+    const std::string r3 = f.round_trip("BADREQUESTLINE", 7);
+    assert(r3.find("X-Request-Id: 7\r\n") != std::string::npos);
+}
+
+static void test_graceful_stop_returns_from_start() {
+    // request_stop() 后 start() 必须在有限时间内返回（accept 循环退出）：
+    // 200ms accept 超时唤醒 + 停机标志检查；无在途请求时立即排空返回。
+    Fixture f(2, 4);
+    std::atomic<bool> stopped{false};
+    std::thread server_thread([&f, &stopped] {
+        f.server.start();
+        stopped.store(true);
+    });
+    // 等监听就绪（start 内 bind/listen 同步完成，留少量余量）。
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    f.server.request_stop();
+    // 上限 3s，远超 200ms 唤醒周期；用标志轮询而非阻塞 join，
+    // 若 accept 循环未响应停机标志会断言失败而不是测试挂死。
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!stopped.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    assert(stopped.load() && "request_stop 后 start() 必须返回");
+    server_thread.join();  // 线程已结束，join 立即返回
+}
+
+static void test_graceful_stop_drains_inflight_request() {
+    // 有在途请求时停机：start() 必须等在途跑完（排空）才返回，
+    // 而不是立即返回把它丢弃 —— 排空分支的真实连接回归
+    // （走真实 accept 循环：port 0 临时端口 + bound_port() 连接）。
+    Fixture f(2, 4);
+    std::atomic<bool> stopped{false};
+    std::thread server_thread([&f, &stopped] {
+        f.server.start();
+        stopped.store(true);
+    });
+    // 等 bind 回填端口。
+    uint16_t port = 0;
+    for (int i = 0; i < 200 && port == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        port = f.server.bound_port();
+    }
+    assert(port != 0 && "bind 后必须回填端口");
+
+    // 真实连接：发带头部的请求但暂不发 body → worker 挂在读体（在途）。
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(fd >= 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    assert(connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+    const std::string header = "POST /health HTTP/1.1\r\nContent-Length: 5\r\n\r\n";
+    assert(send(fd, header.data(), header.size(), 0) ==
+           static_cast<ssize_t>(header.size()));
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+    // 停机请求：有在途请求 → start() 不得立即返回。
+    f.server.request_stop();
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    assert(!stopped.load() && "有在途请求时 start() 不得在排空前返回");
+
+    // 补发 body → 在途完成 → 排空 → start() 返回，且请求拿到正常响应。
+    assert(send(fd, "abcde", 5, 0) == 5);
+    const struct timeval tv{3, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    std::string response;
+    char buf[256];
+    ssize_t n;
+    while ((n = recv(fd, buf, sizeof(buf), 0)) > 0) {
+        response.append(buf, static_cast<std::size_t>(n));
+    }
+    ::close(fd);
+    assert(response.find("405") != std::string::npos && "在途请求必须被完整处理");
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!stopped.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    assert(stopped.load() && "在途完成后 start() 必须返回");
+    server_thread.join();
+}
+
 int main() {
     test_normal_request_through_handle_client();
     test_object_pool_exhausted_returns_503();
@@ -315,5 +411,8 @@ int main() {
     test_large_body_across_multiple_segments();
     test_body_over_limit_counts_error();
     test_malformed_request_line_does_not_wait_for_body();
+    test_request_id_header_echoed();
+    test_graceful_stop_returns_from_start();
+    test_graceful_stop_drains_inflight_request();
     return 0;
 }
