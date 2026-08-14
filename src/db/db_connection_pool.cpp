@@ -8,47 +8,6 @@
 
 namespace cpppools::db {
 
-namespace {
-
-// mock 模式的**进程级共享**存储。
-//
-// factory 化之前它是 DbConnectionPool 的成员，靠「声明顺序在 all_conns_ 之前」
-// 保证比连接活得久。factory 化后这个保证退化为调用方自觉：
-// 静态单例在程序退出时才销毁，只要没有池是静态对象且活到它之后，就安全。
-// 本项目的池都在 main 的栈上，成立。
-MockScoreStore& mock_store() {
-    static MockScoreStore store;
-    return store;
-}
-
-// 便利构造用的内置 factory：把 DbPoolConfig 里的 mock/MySQL 建连逻辑收敛在此。
-ConnectionFactory make_builtin_factory(DbPoolConfig config) {
-    return [config](std::size_t slot_index) -> std::unique_ptr<DbConnection> {
-        if (config.use_mysql) {
-            // MySQL 模式：真实连接。构造失败会抛异常，由池的构造期捕获（fail-fast）。
-            return std::make_unique<DbConnection>(static_cast<int>(slot_index) + 1,
-                                                  config.host,
-                                                  config.port,
-                                                  config.user,
-                                                  config.password,
-                                                  config.database,
-                                                  config.table);
-        }
-        // Mock 模式：确定性模拟后端，注入共享存储使 CRUD 写入对池内所有连接可见。
-        return std::make_unique<DbConnection>(static_cast<int>(slot_index) + 1, &mock_store());
-    };
-}
-
-// 仅按大小构造时的默认配置：mock 模式。
-DbPoolConfig make_mock_config(std::size_t pool_size) {
-    DbPoolConfig cfg;
-    cfg.pool_size = pool_size;
-    cfg.use_mysql = false;
-    return cfg;
-}
-
-}  // namespace
-
 DbConnectionPool::DbConnectionPool(std::string name,
                                    ConnectionFactory factory,
                                    std::size_t pool_size,
@@ -87,9 +46,6 @@ DbConnectionPool::DbConnectionPool(std::string name,
     min_free_ = pool_size;
 }
 
-DbConnectionPool::DbConnectionPool(std::size_t pool_size)
-    : DbConnectionPool("legacy-db", make_builtin_factory(make_mock_config(pool_size)), pool_size) {}
-
 DbConnectionPool::DbConnectionPool(std::string name,
                                    ConnectionFactory factory,
                                    const DbPoolConfig& config,
@@ -97,9 +53,6 @@ DbConnectionPool::DbConnectionPool(std::string name,
     : DbConnectionPool(std::move(name), std::move(factory), config.pool_size, idle_probe_threshold) {
     config_ = config;  // 保留配置快照供 mode_name()/config() 使用
 }
-
-DbConnectionPool::DbConnectionPool(const DbPoolConfig& config)
-    : DbConnectionPool("legacy-db", make_builtin_factory(config), config) {}
 
 DbConnectionPool::~DbConnectionPool() {
     // 与 ObjectPool 的析构约束一致：所有借出的连接必须先归还，
@@ -119,7 +72,7 @@ DbConnectionPool::~DbConnectionPool() {
     // slots_（vector<unique_ptr<PooledConn>>）自动清理，连接随槽位析构。
 }
 
-DbConnection* DbConnectionPool::acquire(std::chrono::milliseconds timeout) {
+Database* DbConnectionPool::acquire(std::chrono::milliseconds timeout) {
     // **绝对 deadline**：timeout 是含探活与重建的总上界。
     // 若每次重试都重新 wait_for(timeout)，最坏总耗时是 N × timeout + N × 探活耗时，
     // 而 HTTP 层依赖这个上界（db_acquire_timeout 默认 100ms 内回 503）。
@@ -240,7 +193,7 @@ bool DbConnectionPool::probe_and_rebuild(PooledConn* slot) {
     // 对 slot->conn 的读写必须持锁：stats() 会在锁内遍历它。
     // 锁外写 unique_ptr 与锁内读是未同步的并发读写（形式上 UB）。
     // 昂贵操作（delete / factory / healthy）仍留在锁外。
-    DbConnection* old = nullptr;
+    Database* old = nullptr;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         old = slot->conn.release();
@@ -248,7 +201,7 @@ bool DbConnectionPool::probe_and_rebuild(PooledConn* slot) {
     }
     delete old;  // 锁外：析构是任意用户代码（批 1/批 2 教训同源）
 
-    std::unique_ptr<DbConnection> fresh;
+    std::unique_ptr<Database> fresh;
     try {
         fresh = factory_(slot->slot_index);
     } catch (...) {
@@ -269,7 +222,7 @@ bool DbConnectionPool::probe_and_rebuild(PooledConn* slot) {
     return true;
 }
 
-void DbConnectionPool::release(DbConnection* conn) {
+void DbConnectionPool::release(Database* conn) {
     if (!conn) {
         // 合法路径：DbConnGuard 没拿到连接时析构会调 release(nullptr)。
         // **不得**计入 invalid_release_total，否则池耗尽场景会刷假告警。

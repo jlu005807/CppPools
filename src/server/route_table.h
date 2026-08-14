@@ -26,14 +26,15 @@ enum class RouteId {
     // 基础设施端点（无版本前缀）
     kHealth,
     kMetrics,
-    // 状态查询
+    // 状态查询 / 自省
     kStats,
     kGetConfig,
-    // CRUD
-    kCreateScore,
-    kGetScore,
-    kUpdateScore,
-    kDeleteScore,
+    kSchema,
+    // 通用行级 CRUD（POST + JSON body，spec §7.1）
+    kSelect,
+    kInsert,
+    kUpdate,
+    kDelete,
 };
 
 // 单条路由的声明。

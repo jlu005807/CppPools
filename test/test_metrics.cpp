@@ -1,9 +1,10 @@
-#include "cpppools/db/db_connection.h"
+#include "cpppools/config/config.h"
+#include "cpppools/db/datasource_registry.h"
 #include "cpppools/db/db_connection_pool.h"
-#include "cpppools/db/mock_score_store.h"
 #include "cpppools/pool/object_pool.h"
 #include "cpppools/pool/thread_pool.h"
 #include "cpppools/server/http_server.h"
+#include "sqlite_pool_fixture.h"
 
 #include <cassert>
 #include <set>
@@ -41,19 +42,33 @@ struct Fixture {
         return c;
     }()};
     pool::ObjectPool<server::RequestContext> request_pool{"request", 4, 8};
-    // 与 main.cpp 同构的构造路径：显式 store + factory + 池名 "db"，
-    // 而不是便利构造（那会得到 "legacy-db"）——测试应覆盖生产形态。
-    // 成员声明顺序即生命周期：store 必须先于 db_pool 声明（逆序析构）。
-    db::MockScoreStore store;
-    db::DbPoolConfig db_cfg{};
-    db::DbConnectionPool db_pool{
-        "db",
-        [this](std::size_t slot_index) -> std::unique_ptr<db::DbConnection> {
-            return std::make_unique<db::DbConnection>(
-                static_cast<int>(slot_index) + 1, &store);
-        },
-        db_cfg};
-    server::HttpServer server{0, thread_pool, request_pool, db_pool};
+    // 真实 SQLite 后端的单源注册表。数据源（=池）名取 "db" 是为了钉住
+    // 指标标签接线（生产上池名=数据源名，取值不同但接线逻辑相同）。
+    std::string db_path;
+    std::unique_ptr<db::DataSourceRegistry> registry;
+    server::HttpServer server{0, thread_pool, request_pool, init_registry()};
+
+    db::DataSourceRegistry& init_registry() {
+        db::register_sqlite_backend();
+        db_path = testing::make_temp_db_path("db");
+        testing::seed_user_scores_table(db_path);
+        config::DataSourceConfig cfg;
+        cfg.name = "db";
+        cfg.type = "sqlite";
+        cfg.sqlite_path = db_path;
+        cfg.pool_size = 8;
+        auto result = db::DataSourceRegistry::build({cfg});
+        assert(result.registry != nullptr);
+        registry = std::move(result.registry);
+        return *registry;
+    }
+
+    ~Fixture() {
+        registry.reset();
+        std::remove(db_path.c_str());
+        std::remove((db_path + "-wal").c_str());
+        std::remove((db_path + "-shm").c_str());
+    }
 
     server::ApiResponse get(const std::string& path) {
         // 请求行必须以 CRLF 结尾：解析器把行终结符当完整性闸门

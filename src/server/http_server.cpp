@@ -2,7 +2,7 @@
 
 #include "server/http_util.h"
 #include "server/route_table.h"
-#include "server/score_api.h"
+#include "server/crud_api.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -43,6 +43,7 @@ using SsizeType = ssize_t;
 namespace cpppools::server {
 
 using db::DbConnectionPool;
+using db::DataSourceRegistry;
 using pool::ObjectPool;
 using pool::ThreadPool;
 
@@ -152,11 +153,12 @@ bool is_api_route(RouteId id) {
         case RouteId::kMetrics:
         case RouteId::kStats:
         case RouteId::kGetConfig:
+        case RouteId::kSchema:
             return false;
-        case RouteId::kCreateScore:
-        case RouteId::kGetScore:
-        case RouteId::kUpdateScore:
-        case RouteId::kDeleteScore:
+        case RouteId::kSelect:
+        case RouteId::kInsert:
+        case RouteId::kUpdate:
+        case RouteId::kDelete:
             return true;
     }
     return false;
@@ -228,12 +230,12 @@ void send_overload_response(SocketType fd) noexcept {
 HttpServer::HttpServer(uint16_t port,
                        ThreadPool& thread_pool,
                        ObjectPool<RequestContext>& request_pool,
-                       DbConnectionPool& db_pool,
+                       DataSourceRegistry& registry,
                        HttpServerConfig config)
     : port_(port),
       thread_pool_(thread_pool),
       request_pool_(request_pool),
-      db_pool_(db_pool),
+      registry_(registry),
       config_(std::move(config)) {
     if (config_.db_acquire_timeout <= std::chrono::milliseconds(0)) {
         config_.db_acquire_timeout = std::chrono::milliseconds(1);
@@ -281,9 +283,14 @@ void HttpServer::start() {
     // 用 endl 而非 '\n'：start() 之后进入永不返回的 accept 循环，
     // 若不 flush，stdout 被重定向（systemd / docker / nohup）时启动横幅会永久留在缓冲区里。
     std::cout << "cpppools listening on http://127.0.0.1:" << port_ << std::endl;
-    std::cout << "  db backend    : " << db_pool_.mode_name() << std::endl;
     std::cout << "  worker threads: " << thread_pool_.worker_count() << std::endl;
-    std::cout << "  db pool size  : " << db_pool_.total_count() << std::endl;
+    for (const std::string& name : registry_.datasource_names()) {
+        const DbConnectionPool* pool = registry_.find_pool(name);
+        std::cout << "  datasource    : " << name
+                  << " (" << pool->mode_name() << ", pool_size="
+                  << pool->total_count() << ")"
+                  << (name == registry_.default_name() ? " [default]" : "") << std::endl;
+    }
 
     int request_id = 0;
     // 经典阻塞式 accept 循环：
@@ -390,7 +397,7 @@ void HttpServer::handle_client(std::intptr_t client_fd, int request_id) {
     (void)release_active;
 
     // 仅处理"一次读取 + 一次响应 + 主动关闭连接"模型，不支持 keep-alive 与 chunked。
-    // 由于所有参数都走 query string，请求体不需要读取。
+    // 请求体按 Content-Length 模型读取（见下方读体段）。
     SsizeType n = 0;
     do {
         n = recv(guard.get(), ctx->buffer.data(), kRequestBufferBytes, 0);
@@ -403,11 +410,72 @@ void HttpServer::handle_client(std::intptr_t client_fd, int request_id) {
     // 读满缓冲意味着请求可能还有未读部分，请求行未必完整。
     // 把这个事实传给路由层，由它区分 400（格式错）与 414（URL 过长）。
     const bool request_complete = received < kRequestBufferBytes;
-    const std::string_view request(ctx->buffer.data(), received);
+    std::string_view request(ctx->buffer.data(), received);
+
+    // 读体前先校验请求行：非法请求直接回错，不为它等 body。
+    // 否则攻击者声明 Content-Length: 60000 却不发 body，能把一个 worker 永久钉死
+    // （worker 数有限，几条这样的连接即可拒绝服务）。响应口径与 route_request
+    // 对畸形请求行的处理完全一致（含 error 计数）。
+    if (!parse_request_line(request)) {
+        error_requests_.fetch_add(1, std::memory_order_relaxed);
+        const ApiResponse bad = request_complete
+            ? make_error_response(400, "Bad Request", "malformed request line")
+            : make_error_response(414, "URI Too Long", "request line is too long");
+        std::string response_buf;
+        append_http_response(bad, response_buf);
+        (void)send_all(guard.get(), response_buf.data(), response_buf.size());
+        return;
+    }
+
+    // --- 请求体读取（Content-Length 模型；chunked 不支持）---
+    // 必须在路由之前读完：否则 body 字节残留在 socket 上，若将来支持
+    // keep-alive 会污染下一个请求。首次 recv 可能已含部分/全部 body：
+    // 先截取已到达部分，不足则继续 recv 直到读满。
+    const auto content_length = find_content_length(request);
+    if (content_length.has_value()) {
+        const std::size_t want = *content_length;
+        if (want > kMaxBodyBytes) {
+            // 超限：回 413 且不尝试读入（避免被大 body 占用缓冲/带宽）。
+            // 口径：与对象池 503 一致 —— 进了处理链的失败计 error。
+            error_requests_.fetch_add(1, std::memory_order_relaxed);
+            const ApiResponse too_large =
+                make_error_response(413, "Payload Too Large", "request body too large");
+            std::string response_buf;
+            append_http_response(too_large, response_buf);
+            (void)send_all(guard.get(), response_buf.data(), response_buf.size());
+            // 已知取舍：此时接收缓冲里通常堆着客户端已发出但未读的 body 字节，
+            // 直接 close 可能以 RST 而非 FIN 送达，客户端可能看到 connection reset
+            // 而非 413。对超限流量这是可接受折衷（不做 shutdown+drain，避免拖慢 worker）。
+            return;
+        }
+        // 读体超时：声明了 body 却不发（或发一半消失）的客户端不得钉死 worker。
+        // 超时后 recv 返回 -1/EAGAIN，读体循环退出，body 按不完整交给路由层。
+        const struct timeval body_tv{5, 0};
+        setsockopt(guard.get(), SOL_SOCKET, SO_RCVTIMEO, &body_tv, sizeof(body_tv));
+        const auto header_end = request.find("\r\n\r\n");
+        const std::size_t body_offset = header_end + 4;  // find 成功是 find_content_length 的前提
+        const std::size_t have = received > body_offset ? received - body_offset : 0;
+        ctx->body.assign(request.data() + body_offset, std::min(have, want));
+        while (ctx->body.size() < want) {
+            char chunk[4096];
+            SsizeType m = 0;
+            do {
+                m = recv(guard.get(), chunk, sizeof(chunk), 0);
+            } while (m < 0 && errno == EINTR);
+            if (m <= 0) {
+                break;  // 对端断开：body 不完整，路由层按既有语义处理
+            }
+            const std::size_t take = std::min(want - ctx->body.size(),
+                                              static_cast<std::size_t>(m));
+            ctx->body.append(chunk, take);
+        }
+        // 头区视图截到头区终结符为止：路由层不应看到 body 字节。
+        request = request.substr(0, body_offset);
+    }
 
     ApiResponse resp;
     try {
-        resp = route_request(request, request_complete);
+        resp = route_request(request, request_complete, ctx->body);
     } catch (const std::exception& ex) {
         // 兜底：任何未预期异常都转成 500，而不是让连接静默悬挂。
         error_requests_.fetch_add(1, std::memory_order_relaxed);
@@ -426,7 +494,8 @@ void HttpServer::handle_client(std::intptr_t client_fd, int request_id) {
     (void)send_all(guard.get(), ctx->response.data(), ctx->response.size());
 }
 
-ApiResponse HttpServer::route_request(std::string_view request, bool request_complete) {
+ApiResponse HttpServer::route_request(std::string_view request, bool request_complete,
+                                              std::string_view body) {
     // 零拷贝解析请求行；所有 string_view 都借自 request，仅在本函数调用期内有效。
     const auto line = parse_request_line(request);
     if (!line.has_value()) {
@@ -474,7 +543,7 @@ ApiResponse HttpServer::route_request(std::string_view request, bool request_com
     }
 
     const auto begin = std::chrono::steady_clock::now();
-    const ScoreApiContext api_ctx{db_pool_, target.query, config_.db_acquire_timeout};
+    const CrudApiContext api_ctx{registry_, body, config_.db_acquire_timeout};
 
     ApiResponse resp;
     // switch 覆盖全部 RouteId：新增路由若忘记补分支，-Werror=switch 会报编译错误。
@@ -483,10 +552,11 @@ ApiResponse HttpServer::route_request(std::string_view request, bool request_com
         case RouteId::kMetrics:     resp = handle_metrics();                 break;
         case RouteId::kStats:       resp = handle_stats();                   break;
         case RouteId::kGetConfig:   resp = handle_get_config();              break;
-        case RouteId::kCreateScore: resp = handle_create_score(api_ctx);     break;
-        case RouteId::kGetScore:    resp = handle_get_score(api_ctx);        break;
-        case RouteId::kUpdateScore: resp = handle_update_score(api_ctx);     break;
-        case RouteId::kDeleteScore: resp = handle_delete_score(api_ctx);     break;
+        case RouteId::kSchema:      resp = handle_schema(api_ctx);           break;
+        case RouteId::kSelect:      resp = handle_select(api_ctx);           break;
+        case RouteId::kInsert:      resp = handle_insert(api_ctx);           break;
+        case RouteId::kUpdate:      resp = handle_update(api_ctx);           break;
+        case RouteId::kDelete:      resp = handle_delete(api_ctx);           break;
     }
 
     if (api_route) {
@@ -525,7 +595,12 @@ ApiResponse HttpServer::handle_metrics() const {
     // （每个 getter 都转调 stats()，会变成 N 次完整快照）。
     const pool::TaskStats tps = thread_pool_.stats();
     const pool::AcquireStats ops = request_pool_.stats();
-    const db::DbPoolStats dps = db_pool_.stats();
+    // 每个数据源池一次快照（一次锁取一致快照，不连调多个 getter）。
+    std::vector<db::DbPoolStats> db_stats;
+    db_stats.reserve(registry_.pools().size());
+    for (const DbConnectionPool* pool : registry_.pools()) {
+        db_stats.push_back(pool->stats());
+    }
 
     // Prometheus exposition 文本格式：counter 带 _total 后缀，单位写入指标名。
     // 池指标统一带 pool 标签：DB 中间件改造后会有 N 个连接池，
@@ -629,20 +704,24 @@ ApiResponse HttpServer::handle_metrics() const {
            "max_size; DB pool timed out. Failure rate = failed / total.\n"
         << "# TYPE cpppools_pool_acquire_failed_total counter\n";
     emit_acquire_family(ops);
-    emit_acquire_family(dps.base);
+    for (const auto& dps : db_stats) {
+        emit_acquire_family(dps.base);
+    }
 
-    // ===== DB 池特有计数 =====
-    const std::string db_label = "{pool=\"" + dps.base.name + "\"}";
+    // ===== DB 池特有计数（每数据源池一行，pool 标签 = 数据源名）=====
     out << "# HELP cpppools_db_pool_invalid_release_total Duplicate or foreign pointer releases.\n"
         << "# TYPE cpppools_db_pool_invalid_release_total counter\n"
-        << "cpppools_db_pool_invalid_release_total" << db_label << " " << dps.invalid_release_total << "\n"
         << "# HELP cpppools_db_pool_rebuild_total Connections rebuilt after failed health probe.\n"
         << "# TYPE cpppools_db_pool_rebuild_total counter\n"
-        << "cpppools_db_pool_rebuild_total" << db_label << " " << dps.rebuild_total << "\n"
         << "# HELP cpppools_db_pool_rebuild_failed_total Rebuild attempts that failed "
            "(slot kept empty for self-healing).\n"
-        << "# TYPE cpppools_db_pool_rebuild_failed_total counter\n"
-        << "cpppools_db_pool_rebuild_failed_total" << db_label << " " << dps.rebuild_failed_total << "\n";
+        << "# TYPE cpppools_db_pool_rebuild_failed_total counter\n";
+    for (const auto& dps : db_stats) {
+        const std::string db_label = "{pool=\"" + dps.base.name + "\"}";
+        out << "cpppools_db_pool_invalid_release_total" << db_label << " " << dps.invalid_release_total << "\n"
+            << "cpppools_db_pool_rebuild_total" << db_label << " " << dps.rebuild_total << "\n"
+            << "cpppools_db_pool_rebuild_failed_total" << db_label << " " << dps.rebuild_failed_total << "\n";
+    }
 
     out << "# HELP cpppools_api_latency_ms Latency quantiles of business API requests.\n"
         << "# TYPE cpppools_api_latency_ms summary\n"
@@ -664,7 +743,31 @@ ApiResponse HttpServer::handle_stats() const {
     // 每池一次快照（同 handle_metrics）。
     const pool::TaskStats tps = thread_pool_.stats();
     const pool::AcquireStats ops = request_pool_.stats();
-    const db::DbPoolStats dps = db_pool_.stats();
+    // DB 字段为全部数据源池的聚合（分池明细见 /metrics 的 pool 标签）。
+    std::size_t db_free = 0;
+    std::size_t db_capacity = 0;
+    std::size_t db_alive = 0;
+    std::size_t db_min_free = 0;
+    std::uint64_t db_acquire_total = 0;
+    std::uint64_t db_acquire_failed = 0;
+    std::uint64_t db_invalid_release = 0;
+    std::uint64_t db_rebuild = 0;
+    std::uint64_t db_rebuild_failed = 0;
+    bool first_pool = true;
+    for (const DbConnectionPool* pool : registry_.pools()) {
+        const db::DbPoolStats s = pool->stats();
+        db_free += s.base.available;
+        db_capacity += s.base.capacity;
+        db_alive += s.base.size;
+        db_min_free = first_pool ? s.base.min_available
+                                 : std::min(db_min_free, s.base.min_available);
+        first_pool = false;
+        db_acquire_total += s.base.acquire_total;
+        db_acquire_failed += s.base.acquire_failed_total;
+        db_invalid_release += s.invalid_release_total;
+        db_rebuild += s.rebuild_total;
+        db_rebuild_failed += s.rebuild_failed_total;
+    }
 
     std::ostringstream body;
     body << "{"
@@ -676,7 +779,7 @@ ApiResponse HttpServer::handle_stats() const {
          << "\"active_requests\":" << active_requests_.load(std::memory_order_relaxed) << ","
          << "\"peak_active_requests\":" << peak_active_requests_.load(std::memory_order_relaxed) << ","
          << "\"db_timeout_requests\":" << db_timeout_requests_.load(std::memory_order_relaxed) << ","
-         << "\"db_mode\":\"" << db_pool_.mode_name() << "\","
+         << "\"datasources\":" << registry_.datasource_names().size() << ","
          // 线程池：旧字段名保留（thread_pool_workers/pending/peak_thread_pool_pending），
          // 新增队列容量与四个计数器。
          << "\"thread_pool_workers\":" << tps.worker_count << ","
@@ -689,17 +792,17 @@ ApiResponse HttpServer::handle_stats() const {
          << "\"thread_pool_task_exception_total\":" << tps.task_exception_total << ","
          << "\"thread_pool_task_exec_us_total\":" << tps.task_exec_us_total << ","
          << "\"thread_pool_peak_task_exec_us\":" << tps.peak_task_exec_us << ","
-         // 连接池：旧字段保留（db_pool_free 含空槽）；
+         // 连接池：全部数据源池聚合（db_pool_free 含空槽）；
          // db_pool_alive 是存活连接数（重建失败的空槽不计），暴露退化程度。
-         << "\"db_pool_free\":" << dps.base.available << ","
-         << "\"db_pool_total\":" << dps.base.capacity << ","
-         << "\"db_pool_alive\":" << dps.base.size << ","
-         << "\"min_db_pool_free\":" << dps.base.min_available << ","
-         << "\"db_pool_acquire_total\":" << dps.base.acquire_total << ","
-         << "\"db_pool_acquire_failed_total\":" << dps.base.acquire_failed_total << ","
-         << "\"db_pool_invalid_release_total\":" << dps.invalid_release_total << ","
-         << "\"db_pool_rebuild_total\":" << dps.rebuild_total << ","
-         << "\"db_pool_rebuild_failed_total\":" << dps.rebuild_failed_total << ","
+         << "\"db_pool_free\":" << db_free << ","
+         << "\"db_pool_total\":" << db_capacity << ","
+         << "\"db_pool_alive\":" << db_alive << ","
+         << "\"min_db_pool_free\":" << db_min_free << ","
+         << "\"db_pool_acquire_total\":" << db_acquire_total << ","
+         << "\"db_pool_acquire_failed_total\":" << db_acquire_failed << ","
+         << "\"db_pool_invalid_release_total\":" << db_invalid_release << ","
+         << "\"db_pool_rebuild_total\":" << db_rebuild << ","
+         << "\"db_pool_rebuild_failed_total\":" << db_rebuild_failed << ","
          // 对象池：旧字段保留；新增容量与 acquire 计数。
          << "\"memory_pool_in_use\":" << ops.in_use << ","
          << "\"memory_pool_available\":" << ops.available << ","
@@ -730,8 +833,23 @@ ApiResponse HttpServer::handle_get_config() const {
     std::ostringstream body;
     body << "{"
          << "\"version\":\"" << CPPPOOLS_VERSION << "\","
-         << "\"db_mode\":\"" << db_pool_.mode_name() << "\","
-         << "\"db_pool_total\":" << db_pool_.total_count() << ","
+         << "\"db_pool_total\":" << [&] {
+                std::size_t total = 0;
+                for (const DbConnectionPool* pool : registry_.pools()) {
+                    total += pool->total_count();
+                }
+                return total;
+            }() << ","
+         << "\"datasources\":[" << [&] {
+                std::string names;
+                for (const std::string& n : registry_.datasource_names()) {
+                    if (!names.empty()) {
+                        names += ",";
+                    }
+                    names += "\"" + n + "\"";
+                }
+                return names;
+            }() << "],"
          << "\"db_acquire_timeout_ms\":" << config_.db_acquire_timeout.count() << ","
          << "\"thread_pool_workers\":" << tps.worker_count << ","
          << "\"thread_pool_queue_capacity\":" << tps.queue_capacity << ","

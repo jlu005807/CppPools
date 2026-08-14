@@ -28,7 +28,7 @@ enum class HttpMethod {
 
 struct RequestLine {
     HttpMethod method{HttpMethod::kUnsupported};
-    // 请求目标，形如 "/api/v1/get-score?user=42"（尚未切分 query）。
+    // 请求目标，形如 "/api/v1/select"（尚未切分 query）。
     std::string_view target;
 };
 
@@ -55,14 +55,21 @@ TargetParts split_target(std::string_view target);
 // 旧实现把两者都返回空字符串，导致 "?user=" 被误判成缺少参数。
 std::optional<std::string_view> find_query_value(std::string_view query, std::string_view key);
 
+// 从原始请求文本的头区解析 Content-Length。
+// 头区以 "\r\n\r\n" 结束；找不到终结符返回 nullopt（请求不完整，
+// 与请求行的完整性闸门同理 —— 防止半截头部被当作完整请求处理）。
+// 无 Content-Length 头同样返回 nullopt（GET 请求的正常形态）。
+// 值必须是纯非负十进制数，否则 nullopt（400 由调用方负责）。
+std::optional<std::size_t> find_content_length(std::string_view raw);
+
 // 解析非负 int。要求整个字符串都是数字，不接受前导空格、正负号与尾部残留字符。
 // 越界（> INT_MAX）返回 nullopt。
 std::optional<int> parse_int_non_negative(std::string_view s);
 
 // 转义字符串使其可安全嵌入 JSON 字面量。
 //
-// 必要性：ScoreResult::error 可能承载 mysql_error() 的输出，
-// 那是来自外部系统的动态内容，若不转义可能产出非法 JSON。
+// 必要性：错误消息可能透传后端（SQLite/MySQL）的动态内容，
+// 若不转义可能产出非法 JSON。
 std::string json_escape(std::string_view s);
 
 // 最近邻秩法分位数（Nearest Rank）。入参必须已升序排序。

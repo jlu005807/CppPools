@@ -1,5 +1,6 @@
 #pragma once
 
+#include "cpppools/db/datasource_registry.h"
 #include "cpppools/db/db_connection_pool.h"
 #include "cpppools/pool/object_pool.h"
 #include "cpppools/pool/thread_pool.h"
@@ -20,6 +21,10 @@ namespace cpppools::server {
 // 单次请求的接收缓冲上限。请求行超过此值会得到 414。
 inline constexpr std::size_t kRequestBufferBytes = 4096;
 
+// 请求体上限（Content-Length 模型）。超过返回 413。
+// JSON 行级 CRUD 的 body 是 KB 级，64KB 留足余量。
+inline constexpr std::size_t kMaxBodyBytes = 65536;
+
 // RequestContext 由 ObjectPool<RequestContext> 复用，是三级池化中的第二级。
 //
 // 池的价值所在：每次请求都需要一个 4KB 接收缓冲与一个响应字符串。
@@ -36,14 +41,17 @@ struct RequestContext {
     std::vector<char> buffer;
     // 待发送的完整 HTTP 响应文本。
     std::string response;
+    // 请求体（Content-Length 读入；无 body 的请求保持为空）。
+    std::string body;
 
     RequestContext() : buffer(kRequestBufferBytes + 1, '\0') {}
 
     void reset() {
         request_id = 0;
         // buffer 不改尺寸：内容会被下一次 recv 覆盖，无需清零。
-        // response 用 clear() 保留 capacity。
+        // response / body 用 clear() 保留 capacity。
         response.clear();
+        body.clear();
     }
 };
 
@@ -62,10 +70,11 @@ struct HttpServerConfig {
 // - 直接基于 BSD socket / Winsock 写 accept 主循环，不依赖任何第三方 HTTP 库；
 // - 仅实现 GET / POST + "一次读取 / 一次响应 / 主动关闭"模型，不做 keep-alive、
 //   chunked、TLS，目的是把"HTTP 协议层"清晰暴露给学习者；
-// - 参数一律走 query string，因此无需实现 Content-Length 感知的循环 recv。
+// - 参数走 query string（旧端点）或 Content-Length 请求体（通用 CRUD 端点，
+//   见 handle_client 的读体段：超限 413、读体超时保护、路由前预校验请求行）。
 //
 // 本服务是纯 API 服务：不托管任何静态资源，客户端由独立的 SDK 承担。
-// API 面只有 8 个端点：4 个 CRUD + 4 个健康/状态查询。
+// API 面共 9 个端点：4 个通用行级 CRUD + schema 自省 + 4 个健康/状态查询。
 //
 // 路由：由 route_table.h 的 constexpr 表集中声明，
 //   route_request 按 RouteId 做 switch 分发。新增端点若忘记补 switch 分支，
@@ -76,7 +85,8 @@ struct HttpServerConfig {
 // 2) 把"处理这个 client_fd"的任务投递到 ThreadPool（避免阻塞 accept）；
 // 3) 工作线程从 ObjectPool 借出 RequestContext（接收缓冲 + 响应字符串），
 //    处理完成后 RAII 自动归还；
-// 4) CRUD 路径里用 DbConnGuard 从 DbConnectionPool 借出连接，作用域结束自动归还。
+// 4) CRUD 路径里按表名经 DataSourceRegistry 路由到对应数据源，
+//    再用 DbConnGuard 从该源的连接池借出连接，作用域结束自动归还。
 //
 // 可观测性：
 //   /api/v1/stats 暴露三大池子的"瞬时 + 历史峰值"以及 API 请求的延迟分位
@@ -86,21 +96,23 @@ public:
     HttpServer(uint16_t port,
                pool::ThreadPool& thread_pool,
                pool::ObjectPool<RequestContext>& request_pool,
-               db::DbConnectionPool& db_pool,
+               db::DataSourceRegistry& registry,
                HttpServerConfig config = {});
 
     // 阻塞启动：进入 accept 循环并持续向线程池分发客户端处理任务。
     void start();
 
     // 解析请求行、匹配路由并分发到对应 handler。
-    // request_complete 为 false 表示请求行可能被接收缓冲截断。
+    // request_complete 为 false 表示请求行可能被接收缓冲截断；
+    // body 是 Content-Length 模型读全的请求体（通用 CRUD 端点的 JSON 入参）。
     //
     // 公开的理由：它不碰 socket，可脱离监听直接测试
     // （test_metrics 等用它验证指标/状态端点）。
     // 注意它**不是无副作用**的：会更新计数器、采样延迟，经 CRUD 路由
     // 还会真实借连接读写后端 —— 测试里当它是"一次真实请求"对待。
     // 生产路径仍由 handle_client 调用。
-    ApiResponse route_request(std::string_view request, bool request_complete);
+    ApiResponse route_request(std::string_view request, bool request_complete,
+                              std::string_view body = {});
 
     // 处理单个客户端连接（recv → 路由 → send → 关 fd，全程 RAII）。
     //
@@ -134,7 +146,7 @@ private:
     // 请求上下文对象池。
     pool::ObjectPool<RequestContext>& request_pool_;
     // 数据库连接池。
-    db::DbConnectionPool& db_pool_;
+    db::DataSourceRegistry& registry_;
     // 运行期调优参数（超时、统计窗口大小等）。
     HttpServerConfig config_;
 

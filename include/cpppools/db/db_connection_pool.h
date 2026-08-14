@@ -1,7 +1,6 @@
 #pragma once
 
-#include "cpppools/db/db_connection.h"
-#include "cpppools/db/mock_score_store.h"
+#include "cpppools/db/database.h"
 #include "cpppools/pool/object_pool.h"  // AcquireStats（借→还池的共用统计形状）
 
 #include <atomic>
@@ -23,29 +22,20 @@ namespace cpppools::db {
 struct DbPoolConfig {
     std::size_t pool_size{8};
 
-    // false -> mock 模式
-    // true  -> mysql 模式
-    bool use_mysql{false};
-
-    // MySQL 参数（仅在 use_mysql=true 时生效）。
-    std::string host{"127.0.0.1"};
-    unsigned int port{3306};
-    std::string user{"root"};
-    std::string password{};
-    std::string database{"cpppools"};
-    std::string table{"user_scores"};
+    // 后端类型标识（"sqlite" / "mysql" / ...）：仅用于指标标签与
+    // /api/v1/get-config 回显，建连逻辑在 ConnectionFactory 里。
+    std::string backend{"sqlite"};
 };
 
-// 创建一条连接。参数是槽位编号（用于连接的 id / 日志）。
-// 返回 nullptr 或抛异常都表示创建失败。
+// 创建一条连接（一个 Database 实例：连接 + 自省快照 + statement cache）。
+// 参数是槽位编号（用于日志）。返回 nullptr 或抛异常都表示创建失败。
 //
-// 为何抽成 factory（而不是池内写死 DbPoolConfig 建连）：
-// 健康检查失败后需要**重建**连接，重建就必须知道「如何创建一条连接」。
-// factory 化后，将来 DB 中间件改造把元素类型换成 Database 时，
-// 只需换 factory 的实现，池代码不用动。
+// 为何抽成 factory（而不是池内写死建连）：健康检查失败后需要**重建**，
+// 重建就必须知道「如何创建一条连接」。factory 化后池代码与后端类型
+// 完全解耦 —— 期 3 把元素从 DbConnection 切到 Database，池零改动。
 //
 // 约束：必须线程安全（acquire 的重建路径在 worker 线程调用）。
-using ConnectionFactory = std::function<std::unique_ptr<DbConnection>(std::size_t slot_index)>;
+using ConnectionFactory = std::function<std::unique_ptr<Database>(std::size_t slot_index)>;
 
 // 连接池的统计：共用的借还形状 + 连接池特有计数。
 struct DbPoolStats {
@@ -56,10 +46,11 @@ struct DbPoolStats {
 };
 
 // DbConnectionPool：有界连接池，带健康检查与失效重建。
+// 元素是 Database（每槽位一个实例：连接 + schema 快照 + statement cache）。
 //
 // 在三级池化协作链路中的位置：
-//   HTTP 请求 -> ThreadPool 调度 -> ObjectPool 复用上下文 -> [DbConnectionPool 查询]
-// 是链路里唯一接触外部资源（mock 后端 / 真实 MySQL）的池。
+//   HTTP 请求 -> ThreadPool 调度 -> ObjectPool 复用上下文 -> [连接池 查询]
+// 是链路里唯一接触外部资源（SQLite / MySQL）的池。
 //
 // 结构：N 个**槽位**（PooledConn），地址在整个池生命周期内稳定。
 // 空闲/借出两个队列存的都是 PooledConn*，因此销毁/重建内层连接
@@ -90,19 +81,12 @@ public:
                      std::chrono::milliseconds idle_probe_threshold = std::chrono::milliseconds{30000});
 
     // 携带配置元数据的变体：factory 化后建连逻辑在 factory 里，
-    // 但 using_mysql()/mode_name()/config() 仍需要配置快照（指标与
+    // 但 mode_name()/config() 仍需要配置快照（指标与
     // /api/v1/get-config 在用）。pool_size 取自 config.pool_size。
     DbConnectionPool(std::string name,
                      ConnectionFactory factory,
                      const DbPoolConfig& config,
                      std::chrono::milliseconds idle_probe_threshold = std::chrono::milliseconds{30000});
-
-    // 便利构造：委托主构造，mock/MySQL 建连逻辑收敛在内置 factory 里。
-    // 注意：mock 模式使用**进程级共享**的 MockScoreStore（见 cpp 注释），
-    // 因此 store 的生命周期必须覆盖所有池 —— 这是 factory 化后
-    // 「store 比池活得久」从类内声明顺序保证退化为调用方自觉的体现。
-    explicit DbConnectionPool(std::size_t pool_size);
-    explicit DbConnectionPool(const DbPoolConfig& config);
 
     ~DbConnectionPool();
 
@@ -110,10 +94,10 @@ public:
     DbConnectionPool& operator=(const DbConnectionPool&) = delete;
 
     // 超时时返回 nullptr。
-    DbConnection* acquire(std::chrono::milliseconds timeout);
+    Database* acquire(std::chrono::milliseconds timeout);
 
     // 将连接归还到空闲队列。
-    void release(DbConnection* conn);
+    void release(Database* conn);
 
     // 一次性取回全部统计（一次锁，一致快照）。
     DbPoolStats stats() const;
@@ -126,17 +110,17 @@ public:
     std::uint64_t rebuild_total() const;
     std::uint64_t rebuild_failed_total() const;
 
-    bool using_mysql() const { return config_.use_mysql; }
-    std::string mode_name() const { return config_.use_mysql ? "mysql" : "mock"; }
+    bool using_mysql() const { return config_.backend == "mysql"; }
+    std::string mode_name() const { return config_.backend; }
     const DbPoolConfig& config() const { return config_; }
     const std::string& name() const { return name_; }
 
 private:
     // 槽位：一个可能为空的连接 + 池的簿记。
-    // last_released_at 放在槽位里（而不是 DbConnection 里）：
+    // last_released_at 放在槽位里（而不是 Database 里）：
     // 这是池的簿记，不是连接的属性；且由 mutex_ 保护，无需 atomic。
     struct PooledConn {
-        std::unique_ptr<DbConnection> conn;  // nullptr = 空槽（重建失败后保留）
+        std::unique_ptr<Database> conn;  // nullptr = 空槽（重建失败后保留）
         std::chrono::steady_clock::time_point last_released_at{};
         std::size_t slot_index{0};
     };
@@ -154,8 +138,8 @@ private:
     std::queue<PooledConn*> free_slots_;
     // 当前已借出的槽位。用于防御重复归还/野指针归还。
     std::unordered_set<PooledConn*> in_use_slots_;
-    // conn 指针 → 槽位的反查表，release(DbConnection*) 用它定位槽位。
-    std::unordered_map<DbConnection*, PooledConn*> conn_to_slot_;
+    // conn 指针 → 槽位的反查表，release(Database*) 用它定位槽位。
+    std::unordered_map<Database*, PooledConn*> conn_to_slot_;
 
     std::string name_;
     ConnectionFactory factory_;
@@ -194,12 +178,12 @@ public:
     DbConnGuard(DbConnGuard&& other) noexcept;
     DbConnGuard& operator=(DbConnGuard&& other) noexcept;
 
-    DbConnection* get() const { return conn_; }
+    Database* get() const { return conn_; }
     bool valid() const { return conn_ != nullptr; }
 
 private:
     DbConnectionPool* pool_{nullptr};
-    DbConnection* conn_{nullptr};
+    Database* conn_{nullptr};
 };
 
 }  // namespace cpppools::db

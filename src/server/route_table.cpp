@@ -9,23 +9,24 @@ namespace {
 // 新增端点只需在此追加一行，然后在 http_server.cpp 的 switch 中补上对应分支
 // —— 忘记补分支会触发 -Werror=switch 编译错误，不会静默变成 404。
 //
-// 约定：读操作用 GET，写操作用 POST，参数一律走 query string（不解析请求体）。
-// 这与 Alluxio 的 create-file / set-user-quota 一致，同时也让服务端无需实现
-// Content-Length 感知的循环 recv。
-constexpr std::array<RouteSpec, 8> kRoutes{{
+// 约定：基础设施/自省端点用 GET；通用 CRUD 统一 POST + JSON body
+// （值可含 & = 空格 中文等任意字符，query string 不胜任；insert 还需一次传多列）。
+constexpr std::array<RouteSpec, 9> kRoutes{{
     // 基础设施端点：不带版本前缀，契约独立于业务 API 演进。
     {"/health",                HttpMethod::kGet,  RouteId::kHealth,      {{"", ""}},            0},
     {"/metrics",               HttpMethod::kGet,  RouteId::kMetrics,     {{"", ""}},            0},
 
-    // 状态查询
+    // 状态查询 / 自省
     {"/api/v1/stats",          HttpMethod::kGet,  RouteId::kStats,       {{"", ""}},            0},
     {"/api/v1/get-config",     HttpMethod::kGet,  RouteId::kGetConfig,   {{"", ""}},            0},
+    {"/api/v1/schema",         HttpMethod::kGet,  RouteId::kSchema,      {{"", ""}},            0},
 
-    // CRUD
-    {"/api/v1/create-score",   HttpMethod::kPost, RouteId::kCreateScore, {{"user", "score"}},   2},
-    {"/api/v1/get-score",      HttpMethod::kGet,  RouteId::kGetScore,    {{"user", ""}},        1},
-    {"/api/v1/update-score",   HttpMethod::kPost, RouteId::kUpdateScore, {{"user", "score"}},   2},
-    {"/api/v1/delete-score",   HttpMethod::kPost, RouteId::kDeleteScore, {{"user", ""}},        1},
+    // 通用行级 CRUD：统一 POST + JSON body（参数在请求体里，
+    // 无 query 必需参数；值可含任意字符，query string 不胜任）。
+    {"/api/v1/select",         HttpMethod::kPost, RouteId::kSelect,      {{"", ""}},            0},
+    {"/api/v1/insert",         HttpMethod::kPost, RouteId::kInsert,      {{"", ""}},            0},
+    {"/api/v1/update",         HttpMethod::kPost, RouteId::kUpdate,      {{"", ""}},            0},
+    {"/api/v1/delete",         HttpMethod::kPost, RouteId::kDelete,      {{"", ""}},            0},
 }};
 
 }  // namespace

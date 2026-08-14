@@ -16,42 +16,57 @@
 using namespace cpppools::db;
 using namespace std::chrono_literals;
 
-// 可控 healthy() 的假连接：批 3 的全部健康检查逻辑都靠它验证。
+// 可控 healthy() 的假 Database：池的全部健康检查逻辑都靠它验证。
 //
-// 为何必须让 healthy() 可注入：DbConnection::healthy() 在 mock 模式下恒真、
-// MySQL 模式下要真连接，都无法制造"探活失败"场景。改虚函数（批 3 同步完成）
-// 之后，测试才能控制这条路径。
-class FakeConn : public DbConnection {
+// 为何必须让 healthy() 可注入：真实后端（SQLite 的 SELECT 1、MySQL 的 ping）
+// 都无法制造"探活失败"场景，只有虚函数注入能控制这条路径。
+class FakeDatabase : public Database {
 public:
-    explicit FakeConn(int id) : DbConnection(id, nullptr) {}
+    FakeDatabase() : Database(Schema{}, "fake") {}
 
     bool healthy() override {
         ++probe_calls;
         return healthy_flag.load();
     }
 
+    std::string backend_type() const override { return "fake"; }
+
     static std::atomic<bool> healthy_flag;
     static std::atomic<int> probe_calls;
+
+protected:
+    DbResult<ResultSet> do_select(const SelectRequest&) override {
+        return {DbStatus::kOk, ResultSet{}, ""};
+    }
+    DbResult<InsertResult> do_insert(const InsertRequest&) override {
+        return {DbStatus::kOk, InsertResult{}, ""};
+    }
+    DbResult<RowCount> do_update(const UpdateRequest&) override {
+        return {DbStatus::kOk, 0, ""};
+    }
+    DbResult<RowCount> do_remove(const DeleteRequest&) override {
+        return {DbStatus::kOk, 0, ""};
+    }
 };
-std::atomic<bool> FakeConn::healthy_flag{true};
-std::atomic<int> FakeConn::probe_calls{0};
+std::atomic<bool> FakeDatabase::healthy_flag{true};
+std::atomic<int> FakeDatabase::probe_calls{0};
 
 // 重建时的人为延迟：让每次重建尝试消耗可测量的时间，
 // deadline 测试靠它区分「绝对 deadline」与「每次重试重新计满」。
 static std::atomic<int> g_rebuild_delay_ms{0};
 
 static void reset_fake_state() {
-    FakeConn::healthy_flag.store(true);
-    FakeConn::probe_calls.store(0);
+    FakeDatabase::healthy_flag.store(true);
+    FakeDatabase::probe_calls.store(0);
     g_rebuild_delay_ms.store(0);
 }
 
 static ConnectionFactory make_fake_factory(std::atomic<int>* created = nullptr) {
-    return [created](std::size_t slot_index) -> std::unique_ptr<DbConnection> {
+    return [created](std::size_t) -> std::unique_ptr<Database> {
         if (created != nullptr) {
             created->fetch_add(1);
         }
-        return std::make_unique<FakeConn>(static_cast<int>(slot_index) + 1);
+        return std::make_unique<FakeDatabase>();
     };
 }
 
@@ -81,7 +96,7 @@ static void test_construction_fails_fast_when_factory_fails() {
     // 任一槽位创建失败 → 整个池拒绝启动（fail-fast，已是现状，补回归测试）。
     // 理由：一个启动了但 0 条可用连接、对所有请求回 500 的池，
     // 比一个拒绝启动并报错的池更糟。
-    auto failing = [](std::size_t) -> std::unique_ptr<DbConnection> { return nullptr; };
+    auto failing = [](std::size_t) -> std::unique_ptr<Database> { return nullptr; };
     bool threw = false;
     try {
         DbConnectionPool pool("p", failing, 2);
@@ -91,7 +106,7 @@ static void test_construction_fails_fast_when_factory_fails() {
     assert(threw && "factory 返回 nullptr 时构造必须失败");
 
     // factory 抛异常同样必须穿出构造函数。
-    auto throwing = [](std::size_t) -> std::unique_ptr<DbConnection> {
+    auto throwing = [](std::size_t) -> std::unique_ptr<Database> {
         throw std::runtime_error("factory boom");
     };
     threw = false;
@@ -186,7 +201,7 @@ static void test_invalid_release_is_counted_and_null_is_not() {
     assert(pool.invalid_release_total() == 1 && "重复归还必须计数");
 
     int external = 0;
-    pool.release(reinterpret_cast<DbConnection*>(&external));  // 野指针归还
+    pool.release(reinterpret_cast<Database*>(&external));  // 野指针归还
     assert(pool.invalid_release_total() == 2 && "野指针归还必须计数");
 
     pool.release(nullptr);  // guard 拿不到连接时的合法路径
@@ -208,7 +223,7 @@ static void test_hot_connection_skips_probe() {
 
     auto* c2 = pool.acquire(10ms);
     assert(c2 == c1 && "热连接应直接复用");
-    assert(FakeConn::probe_calls.load() == 0 && "热连接不得触发探活");
+    assert(FakeDatabase::probe_calls.load() == 0 && "热连接不得触发探活");
     pool.release(c2);
 }
 
@@ -219,12 +234,12 @@ static void test_cold_connection_is_probed_and_reused_when_healthy() {
     DbConnectionPool pool("cold", make_fake_factory(&created), 1, 0ms);
     auto* c1 = pool.acquire(10ms);
     // threshold=0 意味着连第一次借出都探活（刚构造的连接也不例外）。
-    assert(FakeConn::probe_calls.load() == 1);
+    assert(FakeDatabase::probe_calls.load() == 1);
     pool.release(c1);
 
-    FakeConn::probe_calls.store(0);
+    FakeDatabase::probe_calls.store(0);
     auto* c2 = pool.acquire(10ms);
-    assert(FakeConn::probe_calls.load() == 1 && "冷连接必须探活");
+    assert(FakeDatabase::probe_calls.load() == 1 && "冷连接必须探活");
     // 用 factory 计数而非指针相等判断"未重建"：
     // allocator 可能把刚归还的地址再发出来，指针相等不是可靠信号。
     assert(created.load() == 1 && "探活通过后不得重建");
@@ -241,10 +256,10 @@ static void test_unhealthy_connection_is_rebuilt() {
     auto* c1 = pool.acquire(10ms);  // threshold=0：首借也探活（且通过）
     pool.release(c1);
 
-    FakeConn::probe_calls.store(0);  // 重置基线，只数下面这次
-    FakeConn::healthy_flag.store(false);
+    FakeDatabase::probe_calls.store(0);  // 重置基线，只数下面这次
+    FakeDatabase::healthy_flag.store(false);
     auto* c2 = pool.acquire(10ms);
-    assert(FakeConn::probe_calls.load() == 1);
+    assert(FakeDatabase::probe_calls.load() == 1);
     assert(c2 != nullptr && "重建必须成功返回新连接");
     // 重建的证据是 factory 计数 +1，而不是 c2 != c1：
     // delete 之后 allocator 完全可能把同一地址再分配出来。
@@ -262,12 +277,12 @@ static void test_rebuild_failure_preserves_slot_and_self_heals() {
     reset_fake_state();
     std::atomic<int> created{0};
     std::atomic<bool> factory_ok{true};
-    auto flaky = [&](std::size_t slot_index) -> std::unique_ptr<DbConnection> {
+    auto flaky = [&](std::size_t) -> std::unique_ptr<Database> {
         if (!factory_ok.load()) {
             return nullptr;
         }
         created.fetch_add(1);
-        return std::make_unique<FakeConn>(static_cast<int>(slot_index) + 1);
+        return std::make_unique<FakeDatabase>();
     };
 
     DbConnectionPool pool("heal", flaky, 1, 0ms);
@@ -277,8 +292,8 @@ static void test_rebuild_failure_preserves_slot_and_self_heals() {
     pool.release(c1);
 
     // 第一次重建：探活失败 + factory 失败 → 空槽保留 → 超时返回 nullptr。
-    FakeConn::probe_calls.store(0);  // 重置基线
-    FakeConn::healthy_flag.store(false);
+    FakeDatabase::probe_calls.store(0);  // 重置基线
+    FakeDatabase::healthy_flag.store(false);
     factory_ok.store(false);
     auto* none = pool.acquire(50ms);
     assert(none == nullptr && "重建失败时必须超时返回 nullptr");
@@ -303,7 +318,7 @@ static void test_timeout_is_total_bound_including_probe_and_rebuild() {
     //   → 总 ~260ms。断言 < 240ms 即可区分两者。
     reset_fake_state();
     std::atomic<bool> factory_ok{true};
-    auto flaky = [&](std::size_t slot_index) -> std::unique_ptr<DbConnection> {
+    auto flaky = [&](std::size_t) -> std::unique_ptr<Database> {
         const int delay = g_rebuild_delay_ms.load();
         if (delay > 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(delay));
@@ -311,7 +326,7 @@ static void test_timeout_is_total_bound_including_probe_and_rebuild() {
         if (!factory_ok.load()) {
             return nullptr;
         }
-        return std::make_unique<FakeConn>(static_cast<int>(slot_index) + 1);
+        return std::make_unique<FakeDatabase>();
     };
     DbConnectionPool pool("deadline", flaky, 1, 0ms);
 
@@ -320,7 +335,7 @@ static void test_timeout_is_total_bound_including_probe_and_rebuild() {
     assert(pool.free_count() == 1);
 
     // 让探活必失败、重建必延迟 60ms 后失败。
-    FakeConn::healthy_flag.store(false);
+    FakeDatabase::healthy_flag.store(false);
     factory_ok.store(false);
     g_rebuild_delay_ms.store(60);
 
@@ -364,30 +379,17 @@ static void test_stats_reports_consistent_snapshot() {
     assert(pool.stats().base.min_available == 1 && "历史最小空闲数保留");
 }
 
-static void test_legacy_constructors_still_work() {
-    // 旧构造保留为薄封装（委托 factory 构造）：
-    // test_score_api 等既有调用点在迁移完成前继续使用。
-    DbConnectionPool by_size(2);
-    assert(by_size.free_count() == 2);
-
-    DbPoolConfig cfg;
-    cfg.pool_size = 3;
-    DbConnectionPool by_cfg(cfg);
-    assert(by_cfg.free_count() == 3);
-}
-
-
 // 有空槽（重建失败保留）时，stats 的语义：
 // size 只数存活连接（暴露退化程度），available 含空槽，
 // 因此等式是 in_use + available == capacity，而 size <= capacity。
 static void test_stats_reflects_degraded_pool() {
     reset_fake_state();
     std::atomic<bool> factory_ok{true};
-    auto flaky = [&](std::size_t slot_index) -> std::unique_ptr<DbConnection> {
+    auto flaky = [&](std::size_t) -> std::unique_ptr<Database> {
         if (!factory_ok.load()) {
             return nullptr;
         }
-        return std::make_unique<FakeConn>(static_cast<int>(slot_index) + 1);
+        return std::make_unique<FakeDatabase>();
     };
     // 1 个槽位：重建失败一次 → 1 个空槽。不用 2 槽，因为 spec 语义是
     // 同一次 acquire 会尝试**所有**未试过的空闲槽（会继续取下一条），
@@ -397,7 +399,7 @@ static void test_stats_reflects_degraded_pool() {
     auto* a = pool.acquire(10ms);
     pool.release(a);
 
-    FakeConn::healthy_flag.store(false);
+    FakeDatabase::healthy_flag.store(false);
     factory_ok.store(false);
     auto* none = pool.acquire(20ms);  // 探活失败 + 重建失败 → 空槽
     assert(none == nullptr);
@@ -420,18 +422,18 @@ static void test_no_busy_wait_when_all_slots_failed() {
 #if defined(__APPLE__) || defined(__linux__)
     reset_fake_state();
     std::atomic<bool> factory_ok{true};
-    auto flaky = [&](std::size_t slot_index) -> std::unique_ptr<DbConnection> {
+    auto flaky = [&](std::size_t) -> std::unique_ptr<Database> {
         if (!factory_ok.load()) {
             return nullptr;
         }
-        return std::make_unique<FakeConn>(static_cast<int>(slot_index) + 1);
+        return std::make_unique<FakeDatabase>();
     };
     DbConnectionPool pool("nospin", flaky, 1, 0ms);
 
     auto* warm = pool.acquire(10ms);
     pool.release(warm);
 
-    FakeConn::healthy_flag.store(false);
+    FakeDatabase::healthy_flag.store(false);
     factory_ok.store(false);
 
     struct rusage r0;
@@ -469,7 +471,7 @@ static void test_concurrent_acquire_release_with_probes() {
     for (int i = 0; i < kThreads; ++i) {
         workers.emplace_back([&pool] {
             for (int r = 0; r < kRounds; ++r) {
-                DbConnection* c = pool.acquire(500ms);
+                Database* c = pool.acquire(500ms);
                 assert(c != nullptr);
                 pool.release(c);
             }
@@ -485,7 +487,7 @@ static void test_concurrent_acquire_release_with_probes() {
     assert(s.base.size == s.base.capacity);  // 健康连接从不重建
     assert(s.base.acquire_total == static_cast<std::uint64_t>(kThreads) * kRounds);
     assert(s.base.acquire_failed_total == 0);
-    assert(FakeConn::probe_calls.load() == kThreads * kRounds &&
+    assert(FakeDatabase::probe_calls.load() == kThreads * kRounds &&
            "threshold=0 下每次借出都必须探活一次");
 }
 
@@ -505,7 +507,7 @@ static void test_stats_concurrent_with_acquire() {
     });
 
     for (int r = 0; r < 500; ++r) {
-        DbConnection* c = pool.acquire(500ms);
+        Database* c = pool.acquire(500ms);
         assert(c != nullptr);
         pool.release(c);
     }
@@ -531,6 +533,5 @@ int main() {
     test_stats_concurrent_with_acquire();
     test_stats_reports_consistent_snapshot();
     test_stats_reflects_degraded_pool();
-    test_legacy_constructors_still_work();
     return 0;
 }

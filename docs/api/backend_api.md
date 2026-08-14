@@ -1,299 +1,309 @@
 # 后端 API 文档
 
-CppPools 是一个**单节点的三级池化 API 服务**：把客户端 HTTP 请求经
-`ThreadPool → ObjectPool → DBConnectionPool` 三级池化链路，转发到后端真实数据库。
+CppPools 是一个**多数据源数据库中间件**：客户端发送通用的行级 CRUD 请求
+（JSON 请求体），服务端按表名路由到配置的 SQLite / MySQL 数据源，
+客户端不需要知道底层数据库类型。
 
-本服务是**纯 API 服务**，不托管任何静态资源；客户端由独立 SDK（计划中的 Python SDK）承担。
+本文档是对外 API 契约。设计依据：
+`docs/superpowers/specs/2026-08-06-db-middleware-design.md`。
+
+---
 
 ## 1. 通用约定
 
-- 协议：HTTP/1.1
-- 方法：**读操作用 `GET`，写操作用 `POST`**；其余方法返回 `405`
-- **所有参数一律走 query string**，服务端不解析请求体。请求体必须为空
-- 编码：`UTF-8`；JSON 字段统一 **snake_case**
-- 连接：响应统一带 `Connection: close`，单次请求-响应模型，不支持 keep-alive
-- 请求行上限 **4095 字节**，超过返回 `414`
+### 1.1 路径与请求形态
 
-### 1.1 路径版本约定
+- 业务端点带 `/api/v1/` 前缀；`/health`、`/metrics` 是基础设施端点，不带版本前缀。
+- 四个 CRUD 统一 **POST + JSON 请求体**（`Content-Length` 模型）：
+  值可以是任意字符串（含 `&` `=` 空格 中文），query string 不胜任；
+  insert 还需一次传多列。
+- 请求体上限 1 MB，超出返回 `413`；请求行上限 4095 字节，超出返回 `414`。
+- 不支持 keep-alive、chunked、TLS；每连接"一次读取 + 一次响应 + 主动关闭"。
 
-| 前缀 | 用途 |
-|---|---|
-| 无前缀（`/health`、`/metrics`） | 面向基础设施（存活探针 / 指标采集器），契约独立于业务 API 版本演进 |
-| `/api/v1/*` | 业务 API，随版本演进 |
+### 1.2 值类型（严格校验）
 
-### 1.2 错误响应体
+JSON 值与数据库列类型的映射是**严格的**，不做隐式转换：
 
-所有错误（4xx / 5xx）统一为：
+| JSON 类型 | 中间件 Value | 可写入的列类型 |
+|---|---|---|
+| 整数 | integer | INTEGER、REAL（整数可无损表示为实数） |
+| 浮点数 | real | REAL |
+| 字符串 | string | TEXT |
+| null | NULL | 仅 nullable 列 |
+| 布尔 / 对象 / 数组 | —— | 拒绝（400） |
+
+### 1.3 错误响应体
+
+所有非 2xx 响应统一为：
 
 ```json
-{"message": "score not found", "status_code": 404}
+{"message":"<可读消息>","status_code":400}
 ```
 
-`204 No Content` 无响应体。
+### 1.4 状态码矩阵
 
-### 1.3 状态码约定
+| 情形 | 状态码 | 说明 |
+|---|---|---|
+| insert 成功 | `201` | 回传 `inserted_id` |
+| select / update / delete 成功 | `200` | 包括 0 行匹配 |
+| select 无匹配 | `200` + `rows:[]` | **不是 404**（SQL 语义：查询成功但无结果） |
+| update / delete 匹配 0 行 | `200` + `affected_rows:0` | 同上，不解释为"资源不存在" |
+| 表/列不存在、where 列非唯一键、类型不匹配、缺必填列（NOT NULL 违例）、JSON 格式错 | `400` | 契约违反 |
+| 表名跨数据源歧义且未指定 datasource | `409` | 消息列出候选数据源 |
+| insert 唯一键 / 主键冲突 | `409` | |
+| 连接池获取超时 | `503` | 消息 `db connection timeout` |
+| 后端错误 | `500` | 透传后端消息（JSON 转义） |
 
-| 码 | 含义 |
-|---|---|
-| `200 OK` | 读取成功 / 更新成功 |
-| `201 Created` | 创建成功 |
-| `204 No Content` | 删除成功（无响应体，且不含 `Content-Length`） |
-| `400 Bad Request` | 必需参数缺失、或参数非法（非整数 / 负数 / 空值） |
-| `404 Not Found` | 路径不在路由表中，或目标记录不存在 |
-| `405 Method Not Allowed` | 路径存在但方法不匹配（响应带 `Allow` 头） |
-| `409 Conflict` | 创建时记录已存在 |
-| `414 URI Too Long` | 请求行超过 4095 字节 |
-| `500 Internal Server Error` | 数据库操作失败或未预期异常 |
-| `503 Service Unavailable` | 三种成因：① 连接池获取超时；② **线程池队列已满（过载）**——在进入处理链之前就被拒绝；③ **请求对象池耗尽**——进入了处理链但借不到上下文 |
+400 留给真正的契约违反；0 行不是错误 —— 中间件如实转达数据库语义。
 
-## 2. 路由总览（8 个端点）
+### 1.5 安全模型（客户端视角）
 
-API 面故意保持极小：**4 个 CRUD + 4 个健康/状态查询**。压测由客户端 SDK 在真实场景下进行，
-服务端不提供任何人造的压测/演示端点。
+- **where 必须是主键 / 唯一键**：每个操作至多影响一行，接口在结构上
+  无法被用来批量改删。
+- **表名 / 列名必须在启动时自省出的 schema 白名单内**：不在白名单即 400，
+  SQL 注入面在入口处被集合成员判断消除。
+- **接口没有建表/删表能力**：关系模型由使用方在库内预置，中间件只读写行。
+  schema 变更后需重启服务（启动时自省一次）。
 
-| 方法 | 路径 | 必需参数 | 说明 |
+---
+
+## 2. 路由总览（9 个端点）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/v1/select` | 查一行 |
+| POST | `/api/v1/insert` | 插一行 |
+| POST | `/api/v1/update` | 改一行 |
+| POST | `/api/v1/delete` | 删一行 |
+| GET | `/api/v1/schema` | 自省：各数据源的表与列 |
+| GET | `/api/v1/stats` | 三池运行指标 + 延迟分位 |
+| GET | `/api/v1/get-config` | 启动期配置快照 |
+| GET | `/health` | 存活探针（纯文本） |
+| GET | `/metrics` | Prometheus exposition 文本 |
+
+---
+
+## 3. 通用 CRUD 接口
+
+四个端点共用的请求字段：
+
+| 字段 | 类型 | 必需 | 说明 |
 |---|---|---|---|
-| GET | `/health` | — | 存活探针（纯文本） |
-| GET | `/metrics` | — | Prometheus 指标（纯文本） |
-| GET | `/api/v1/stats` | — | 三池运行指标 + 延迟分位 |
-| GET | `/api/v1/get-config` | — | 启动期配置快照 |
-| POST | `/api/v1/create-score` | `user`, `score` | 新建记录 |
-| GET | `/api/v1/get-score` | `user` | 查询记录 |
-| POST | `/api/v1/update-score` | `user`, `score` | 更新记录 |
-| POST | `/api/v1/delete-score` | `user` | 删除记录 |
+| `table` | string | 是 | 表名（必须在 schema 白名单内） |
+| `where` | object | select/update/delete 必需 | `{"column":"<列名>","value":<值>}`；列必须是 PK/UNIQUE；值不得为 null |
+| `datasource` | string | 否 | 显式指定数据源（见 §3.5 路由规则）；非字符串一律 400 |
 
-## 3. CRUD 接口
+所有成功响应都回传 `"datasource":"<实际命中的数据源名>"`，
+便于客户端确认数据写入位置。
 
-资源为 `user_scores` 表（`user_id` 主键、`score`、`updated_at`）。
-Mock 与 MySQL 两种后端共用完全相同的语义与响应字段。
+### 3.1 `POST /api/v1/select`
 
-记录序列化格式：
+额外字段：`columns`（string 数组，可选；缺省或空数组 = 全部列；
+返回列顺序 = 请求顺序）。
 
 ```json
-{"user_id": 42, "score": 99, "updated_at_ms": 1785995899243}
+// 请求
+{"table":"user_scores","columns":["score"],"where":{"column":"user_id","value":42}}
+// 200
+{"datasource":"main","columns":["score"],"rows":[[99]],"row_count":1}
+// 无匹配也是 200
+{"datasource":"main","columns":["score"],"rows":[],"row_count":0}
 ```
 
-`updated_at_ms` 为 epoch 毫秒。Mock 后端在写入时取本地时钟；
-MySQL 后端取 `UNIX_TIMESTAMP(updated_at) * 1000`。
+### 3.2 `POST /api/v1/insert`
 
-> 三级池化就发生在这四个接口的请求路径上：
-> ThreadPool 调度 → ObjectPool 借出接收缓冲与响应字符串 → DbConnectionPool 借出连接。
-
-### 3.1 `POST /api/v1/create-score?user=<id>&score=<n>`
-
-创建一条记录。**不做 upsert**：记录已存在时返回 `409` 且不修改原值。
-
-| 情形 | 状态码 | 响应体 |
-|---|---|---|
-| 创建成功 | `201` | 记录 JSON |
-| 记录已存在 | `409` | `{"message":"score already exists","status_code":409}` |
-| 参数非法/缺失 | `400` | 错误体 |
-| 连接池超时 | `503` | `{"message":"db connection timeout","status_code":503}` |
-
-线程池队列已满时的 `503` **不属于任何端点**——它发生在进入处理链之前，
-accept 循环直接响应：`{"message":"server overloaded","status_code":503}`。
-
-三种 503 的区分方式（指标口径不同）：
-
-| 成因 | 位置 | 计入的指标 | 计入 `total_requests` | 响应体 |
-|---|---|---|---|---|
-| 线程池队列满 | accept 循环，未进处理链 | `rejected_requests` | 否（拒绝率 = `rejected / (total + rejected)`）| `server overloaded` |
-| 请求对象池耗尽 | worker 内，已进处理链 | `error_requests` | 是 | `request pool exhausted` |
-| 连接池超时 | handler 内，已进处理链 | `error_requests` | 是 | `db connection timeout` |
-
-```bash
-curl -X POST 'http://127.0.0.1:8080/api/v1/create-score?user=42&score=99'
-```
-
-### 3.2 `GET /api/v1/get-score?user=<id>`
-
-| 情形 | 状态码 |
-|---|---|
-| 命中 | `200` + 记录 JSON |
-| 记录不存在 | `404` |
-
-```bash
-curl 'http://127.0.0.1:8080/api/v1/get-score?user=42'
-```
-
-### 3.3 `POST /api/v1/update-score?user=<id>&score=<n>`
-
-覆盖 `score` 并刷新 `updated_at_ms`。**不做插入**：记录不存在时返回 `404`。
-
-把 `score` 更新为与原值相同时仍返回 `200`（MySQL 后端通过连接标志
-`CLIENT_FOUND_ROWS` 保证这一语义，否则 `affected_rows` 为 0 会被误判成 `404`）。
-
-```bash
-curl -X POST 'http://127.0.0.1:8080/api/v1/update-score?user=42&score=88'
-```
-
-### 3.4 `POST /api/v1/delete-score?user=<id>`
-
-| 情形 | 状态码 |
-|---|---|
-| 删除成功 | `204`（无响应体） |
-| 记录不存在 | `404` |
-
-```bash
-curl -X POST 'http://127.0.0.1:8080/api/v1/delete-score?user=42'
-```
-
-## 4. 状态查询接口
-
-### 4.1 `GET /health`
-
-存活探针。返回 `text/plain`，固定内容 `cpppools worker is active`。
-刻意不用 JSON —— 契约越简单越不容易随业务演进而破坏。
-
-### 4.2 `GET /metrics`
-
-Prometheus exposition 文本格式。counter 带 `_total` 后缀，单位写入指标名。
-
-> 批 4 起池指标**全部带 `pool` 标签**（为多数据源改造预留：届时会有 N 个连接池，
-> 无标签无法区分数据源），且指标名**直接换新、不双写旧名**
-> （`cpppools_db_pool_free` / `cpppools_object_pool_*` / `cpppools_thread_pool_pending` 等已移除）。
-
-| 指标 | 类型 | 说明 |
-|---|---|---|
-| `cpppools_uptime_ms` | gauge | 进程运行时长 |
-| `cpppools_requests_total` | counter | 累计请求数 |
-| `cpppools_api_requests_total` | counter | 累计 API 请求数 |
-| `cpppools_error_requests_total` | counter | 累计 4xx/5xx 响应数（已进入处理链但出错）|
-| `cpppools_rejected_requests_total` | counter | 在 accept 循环被拒的连接数（**未进入处理链**）：线程池队列已满，或提交本身失败（如分配失败）|
-| `cpppools_db_acquire_timeout_total` | counter | 借连接超时导致 503 的**请求**数（池级计数是 `cpppools_pool_acquire_failed_total`）|
-| `cpppools_active_requests` | gauge | 当前处理中的请求数 |
-| `cpppools_thread_pool_workers{pool}` | gauge | 工作线程数 |
-| `cpppools_thread_pool_queue_capacity{pool}` | gauge | 任务队列上限 |
-| `cpppools_thread_pool_queue_pending{pool}` / `_peak_queue_pending` | gauge | 待处理任务数 / 历史峰值 |
-| `cpppools_thread_pool_submitted_total{pool}` / `_rejected_total` / `_completed_total` | counter | 入队 / 队列满拒绝 / 完成的任务数 |
-| `cpppools_thread_pool_task_exception_total{pool}` | counter | 任务异常数。**仅覆盖 `submit_detached`**；`submit()` 的异常由 future 携带、不计入。值为 0 不等于没发生过异常 |
-| `cpppools_thread_pool_task_exec_us_total{pool}` / `_peak_task_exec_us` | counter/gauge | 任务执行耗时累计 / 单任务最长（µs）|
-| `cpppools_pool_capacity{pool}` | gauge | 池硬上限 |
-| `cpppools_pool_size{pool}` | gauge | 已分配对象 / 存活连接数（≤ capacity；DB 池的重建失败空槽不计，暴露退化程度）|
-| `cpppools_pool_in_use{pool}` / `_available` / `_peak_in_use` / `_min_available` | gauge | 借出中 / 空闲（DB 池含空槽）/ 历史峰值 / 历史最小空闲 |
-| `cpppools_pool_acquire_total{pool}` / `_acquire_failed_total` | counter | acquire 调用数 / 失败数（对象池达上限；连接池超时）。失败率 = failed / total |
-| `cpppools_db_pool_invalid_release_total{pool}` | counter | 重复归还 / 野指针归还次数 |
-| `cpppools_db_pool_rebuild_total{pool}` / `_rebuild_failed_total` | counter | 探活失败后重建成功 / 失败（空槽保留待自愈）次数 |
-| `cpppools_api_latency_ms{quantile}` | summary | P50 / P95 / P99 延迟 |
-
-`pool` 标签取值：`"worker"`（线程池）、`"request"`（请求上下文对象池）、`"db"`（数据库连接池）。
-
-### 4.3 `GET /api/v1/stats`
-
-三池运行状态 + 累计计数器 + 滑动窗口延迟分位。
-
-> 所有字段均为近似实时值：每个池内部是一次锁的一致快照，但多个池与
-> HTTP 层计数器之间独立读取，**整体不构成原子快照**。
-> 因此可能出现 `active_requests > total_requests` 这类瞬时不自洽的组合。
-
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `uptime_ms` | int | 进程已运行时长 |
-| `total_requests` | int | 累计接受请求总数 |
-| `api_requests` | int | `/api/v1/*` 请求计数 |
-| `error_requests` | int | 累计错误响应计数（已进入处理链但出错）|
-| `rejected_requests` | int | 因线程池队列已满被拒的连接数（未进入处理链，指向容量不足）。**不计入 `total_requests`**，故拒绝率 = `rejected / (total + rejected)` |
-| `active_requests` | int | 当前正在处理中的请求数 |
-| `peak_active_requests` | int | 并发处理数历史峰值 |
-| `db_timeout_requests` | int | 因连接获取超时返回 `503` 的次数 |
-| `db_mode` | string | `"mock"` 或 `"mysql"` |
-| `thread_pool_workers` | int | 线程池工作线程数 |
-| `thread_pool_queue_capacity` | int | 任务队列上限 |
-| `thread_pool_pending` | int | 当前待处理任务数 |
-| `peak_thread_pool_pending` | int | 待处理任务历史峰值 |
-| `thread_pool_submitted_total` / `_rejected_total` / `_completed_total` | int | 入队 / 队列满拒绝 / 完成的任务数 |
-| `thread_pool_task_exception_total` | int | 任务异常数（**仅 `submit_detached`**，见 /metrics 同名指标说明）|
-| `thread_pool_task_exec_us_total` / `thread_pool_peak_task_exec_us` | int | 任务执行耗时累计 / 单任务最长（µs）|
-| `db_pool_free` / `db_pool_total` | int | 连接池空闲数（**含重建失败的空槽**）/ 槽位总数 |
-| `db_pool_alive` | int | 存活连接数（空槽不计，暴露池的退化程度）|
-| `min_db_pool_free` | int | 连接池空闲数历史最小值 |
-| `db_pool_acquire_total` / `db_pool_acquire_failed_total` | int | 连接 acquire 调用数 / 超时失败数 |
-| `db_pool_invalid_release_total` | int | 重复归还 / 野指针归还次数 |
-| `db_pool_rebuild_total` / `db_pool_rebuild_failed_total` | int | 探活失败后重建成功 / 失败次数 |
-| `memory_pool_in_use` / `_available` / `_total` | int | 对象池借出 / 空闲 / 已分配数 |
-| `memory_pool_capacity` | int | 对象池硬上限（达上限 acquire 返回空，HTTP 层回 503）|
-| `memory_pool_acquire_total` / `memory_pool_acquire_failed_total` | int | 对象 acquire 调用数 / 达上限失败数 |
-| `peak_memory_pool_in_use` | int | 对象池借出历史峰值 |
-| `db_acquire_timeout_ms` | int | 连接获取超时配置 |
-| `latency_window_size` / `latency_samples` | int | 延迟窗口容量 / 当前样本数 |
-| `avg_latency_ms` | double | 窗口内平均延迟 |
-| `p50_latency_ms` / `p95_latency_ms` / `p99_latency_ms` | double | 分位延迟（最近邻秩法） |
-
-> 池的峰值指标（`min_db_pool_free` / `peak_memory_pool_in_use` / `peak_thread_pool_pending`）
-> 由各个池自己在借出时统计，因此覆盖所有请求路径，不会因新增端点而漏记。
-
-### 4.4 `GET /api/v1/get-config`
-
-启动期配置快照，供客户端自省运行参数而无需读服务端配置文件。
+额外字段：`values`（object，必需，列名 → 值；自增主键列可缺省由数据库生成）。
 
 ```json
-{
-  "version": "0.3.0",
-  "db_mode": "mock",
-  "db_pool_total": 8,
-  "db_acquire_timeout_ms": 100,
-  "thread_pool_workers": 6,
-  "thread_pool_queue_capacity": 1024,
-  "memory_pool_total": 128,
-  "memory_pool_capacity": 128,
-  "latency_window_size": 1024,
-  "max_request_bytes": 4096,
-  "endpoint_count": 8
-}
+// 请求
+{"table":"user_scores","values":{"user_id":42,"score":99}}
+// 201
+{"datasource":"main","affected_rows":1,"inserted_id":42}
 ```
 
-## 5. 运行期可调环境变量
+`inserted_id`：数据库生成的自增主键（SQLite 为 rowid 别名列）。
+表没有自增主键时为 `null`；显式传入主键时回传该值。
+
+### 3.3 `POST /api/v1/update`
+
+额外字段：`set`（object，必需，列名 → 新值）。
+
+```json
+// 请求
+{"table":"user_scores","set":{"score":88},"where":{"column":"user_id","value":42}}
+// 200
+{"datasource":"main","affected_rows":1}
+```
+
+未出现在 `set` 里的列保持原值。
+
+### 3.4 `POST /api/v1/delete`
+
+```json
+// 请求
+{"table":"user_scores","where":{"column":"user_id","value":42}}
+// 200
+{"datasource":"main","affected_rows":1}
+```
+
+### 3.5 多数据源路由规则
+
+配置文件中可定义多个数据源（类型可相同，如同构分片）。请求按表名路由：
+
+| 情形 | 行为 |
+|---|---|
+| 请求显式带 `datasource` | 直接定位该数据源（**优先级最高**） |
+| 表名只在一个数据源出现 | 自动路由 |
+| 表名在多个数据源出现，请求未指定 | **409**，消息列出候选数据源名 |
+| 表名不在任何数据源 | 400 |
+| 指定的 `datasource` 不存在 / 该源没有此表 | 400 |
+
+刻意不做"按配置顺序兜底选第一个"：若两个分片都有 `orders`，兜底会把
+`update` 静默写进其中一个库而另一个库的行不动，客户端却收到
+`affected_rows:1` —— 无报错的数据错乱。歧义表会在**启动日志**里告警。
+
+---
+
+## 4. `GET /api/v1/schema`
+
+返回所有数据源的表与列元信息。**不暴露后端类型**（SQLite/MySQL 是
+客户端不该依赖的实现细节）。
+
+```json
+{"datasources":[
+  {"name":"main","tables":[
+    {"name":"user_scores","columns":[
+      {"name":"user_id","type":"integer","nullable":false,"primary_key":true,"unique":true},
+      {"name":"score","type":"integer","nullable":false,"primary_key":false,"unique":false}
+    ]}
+  ]}
+]}
+```
+
+`type` 取值：`integer` / `real` / `text`。`unique` 覆盖主键与单列
+UNIQUE 约束（联合唯一索引不使任何单列唯一，因此不会出现在 `unique:true`
+的判据里）。
+
+---
+
+## 5. 状态查询接口
+
+### 5.1 `GET /health`
+
+纯文本 `cpppools worker is active`，`200`。契约刻意简单，供探针使用。
+
+### 5.2 `GET /metrics`
+
+Prometheus exposition 文本。池指标统一带 `pool` 标签：
+`"worker"`（线程池）、`"request"`（请求上下文对象池）、
+**数据源名**（每个数据源的连接池，如 `"main"`）。
+
+指标族：
+
+- `cpppools_requests_total / api_requests_total / error_requests_total /
+  rejected_requests_total / active_requests / uptime_ms /
+  db_acquire_timeout_total` — 请求面计数。
+- `cpppools_thread_pool_*{pool="worker"}` — workers / queue_capacity /
+  queue_pending / peak_queue_pending / submitted_total / rejected_total /
+  completed_total / task_exception_total / task_exec_us_total /
+  peak_task_exec_us。注意 `task_exception_total` **仅覆盖 submit_detached**。
+- `cpppools_pool_{capacity,size,in_use,available,peak_in_use,min_available,
+  acquire_total,acquire_failed_total}{pool="..."}` — 借→还两池共用形状。
+  连接池口径：`available` 含重建失败的空槽；`size` 只数存活连接，
+  等式是 `in_use + available == capacity` 且 `size <= capacity`。
+- `cpppools_db_pool_{invalid_release_total,rebuild_total,
+  rebuild_failed_total}{pool="<数据源名>"}` — 连接池特有计数。
+- `cpppools_api_latency_ms{quantile="0.5|0.95|0.99"}` + `_avg` /
+  `_samples` — 业务 API 延迟分位。
+
+两种 503 用指标区分：`cpppools_db_acquire_timeout_total`（连接池耗尽）
+与 `cpppools_rejected_requests_total`（线程池队列满，accept 层背压）。
+
+### 5.3 `GET /api/v1/stats`
+
+JSON。一次锁取每池一致快照后拼装（池内是原子快照；跨池字段逐个读取）。
+
+主要字段：
+
+- 请求面：`uptime_ms / total_requests / api_requests / error_requests /
+  rejected_requests / active_requests / peak_active_requests /
+  db_timeout_requests`
+- 数据源：`datasources`（数据源数量）
+- 线程池：`thread_pool_workers / thread_pool_queue_capacity /
+  thread_pool_pending / peak_thread_pool_pending /
+  thread_pool_submitted_total / thread_pool_rejected_total /
+  thread_pool_completed_total / thread_pool_task_exception_total /
+  thread_pool_task_exec_us_total / thread_pool_peak_task_exec_us`
+- 连接池（**全部数据源池聚合**；分池明细见 /metrics 的 pool 标签）：
+  `db_pool_free / db_pool_total / db_pool_alive / min_db_pool_free /
+  db_pool_acquire_total / db_pool_acquire_failed_total /
+  db_pool_invalid_release_total / db_pool_rebuild_total /
+  db_pool_rebuild_failed_total`
+- 对象池：`memory_pool_in_use / memory_pool_available / memory_pool_total /
+  memory_pool_capacity / peak_memory_pool_in_use /
+  memory_pool_acquire_total / memory_pool_acquire_failed_total`
+- 延迟：`db_acquire_timeout_ms / latency_window_size / latency_samples /
+  avg_latency_ms / p50_latency_ms / p95_latency_ms / p99_latency_ms`
+
+### 5.4 `GET /api/v1/get-config`
+
+启动期配置快照（不含任何凭据）：`version / datasources（名称数组）/
+db_pool_total / db_acquire_timeout_ms / thread_pool_workers /
+thread_pool_queue_capacity / memory_pool_total / memory_pool_capacity /
+latency_window_size / max_request_bytes / endpoint_count`。
+
+---
+
+## 6. 运行期配置与环境变量
+
+数据源建连完全由 **JSON 配置文件**驱动，路径优先级：
+`--config <path>` > `CPPPOOLS_CONFIG` 环境变量 > `config/cpppools.json`。
+格式见 `config/cpppools.example.json`（`server` 段 + `datasources` 数组）。
+配置错误（含数据源不可连）在启动期 fail-fast。
+
+剩余环境变量：
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `CPPPOOLS_DB_MODE` | `mock` | `mock` 或 `mysql` |
-| `CPPPOOLS_DB_HOST` / `CPPPOOLS_DB_PORT` | `127.0.0.1` / `3306` | MySQL 地址 |
-| `CPPPOOLS_DB_USER` / `CPPPOOLS_DB_PASSWORD` | `root` / `（空）` | MySQL 凭据 |
-| `CPPPOOLS_DB_NAME` / `CPPPOOLS_DB_TABLE` | `cpppools` / `user_scores` | 库表名 |
-| `CPPPOOLS_DB_POOL_SIZE` | `8` | 连接池大小 |
-| `CPPPOOLS_MAX_QUEUE_SIZE` | `1024` | 线程池任务队列上限（满则回 503）|
-| `CPPPOOLS_DB_ACQUIRE_TIMEOUT_MS` | `100` | 连接获取超时（毫秒）|
-| `CPPPOOLS_LATENCY_WINDOW_SIZE` | `1024` | 延迟滑动窗口样本数上限 |
+| `CPPPOOLS_MAX_QUEUE_SIZE` | `1024` | 线程池任务队列上限；满则回 `503` |
+| `CPPPOOLS_DB_ACQUIRE_TIMEOUT_MS` | `100` | 连接获取超时 |
+| `CPPPOOLS_LATENCY_WINDOW_SIZE` | `1024` | 延迟窗口样本上限（配置文件 `server.latency_window_size` 优先） |
 
-命令行参数：
+---
 
-```bash
-./cpppools_server [port=8080] [worker_count=6]
-```
-
-> **容量提示**：当 `worker_count <= CPPPOOLS_DB_POOL_SIZE` 时，线程池会先成为瓶颈，
-> 连接池永远打不空，`503` 通路实际不可达。用 SDK 压测想触发连接池耗尽时，
-> 需令 `worker_count > db_pool_size`（例如 `./cpppools_server 8080 32`，池大小仍为 8）。
-
-## 6. 客户端调用示例（Python）
+## 7. 客户端调用示例（Python）
 
 ```python
-import requests
+import json
+import urllib.request
 
 BASE = "http://127.0.0.1:8080"
 
-# 创建
-r = requests.post(f"{BASE}/api/v1/create-score", params={"user": 42, "score": 99})
-assert r.status_code == 201, r.text
-print(r.json())          # {'user_id': 42, 'score': 99, 'updated_at_ms': ...}
+def post(path, payload):
+    req = urllib.request.Request(
+        BASE + path, data=json.dumps(payload).encode(), method="POST")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
 
-# 查询
-r = requests.get(f"{BASE}/api/v1/get-score", params={"user": 42})
-print(r.status_code, r.json())
-
-# 更新
-requests.post(f"{BASE}/api/v1/update-score", params={"user": 42, "score": 88})
-
-# 删除（204 无响应体）
-r = requests.post(f"{BASE}/api/v1/delete-score", params={"user": 42})
-assert r.status_code == 204 and r.content == b""
+# 插入（201；回传 inserted_id）
+print(post("/api/v1/insert", {"table": "user_scores",
+                              "values": {"user_id": 42, "score": 99}}))
+# 查询（200；无匹配时 rows 为空数组）
+print(post("/api/v1/select", {"table": "user_scores",
+                              "columns": ["score"],
+                              "where": {"column": "user_id", "value": 42}}))
+# 更新 / 删除（200 + affected_rows）
+print(post("/api/v1/update", {"table": "user_scores",
+                              "set": {"score": 88},
+                              "where": {"column": "user_id", "value": 42}}))
+print(post("/api/v1/delete", {"table": "user_scores",
+                              "where": {"column": "user_id", "value": 42}}))
 
 # 错误处理：错误体统一 {"message", "status_code"}
-r = requests.get(f"{BASE}/api/v1/get-score", params={"user": 42})
-if r.status_code >= 400:
-    err = r.json()
-    raise RuntimeError(f"{err['status_code']}: {err['message']}")
+code, body = post("/api/v1/select", {"table": "ghost",
+                                     "where": {"column": "id", "value": 1}})
+assert code == 400 and "message" in body
 ```
-
-> 写操作请用 `params=` 传查询参数，**不要用 `json=` 或 `data=`**：
-> 服务端不解析请求体，且发送非空请求体可能导致响应被 RST 打断。

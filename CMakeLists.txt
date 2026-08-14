@@ -64,19 +64,21 @@ endfunction()
 # 头文件分层：
 #   include/cpppools/<模块>/  对外接口
 #   src/<模块>/               实现 + 私有头文件
-# http_util / route_table / score_api 只在 src/server/ 下，属实现细节。
+# http_util / route_table / crud_api 只在 src/server/ 下，属实现细节。
 #
 # 抽成库而非直接塞进可执行文件，是为了让 test/ 能链接并直接调用内部函数——
 # 否则解析与路由逻辑将无法被单元测试触达。
 add_library(cpppools STATIC
+    src/config/config.cpp
     src/pool/thread_pool.cpp
-    src/db/db_connection.cpp
-    src/db/mock_score_store.cpp
+    src/db/database_factory.cpp
     src/db/db_connection_pool.cpp
+    src/db/sqlite_database.cpp
+    src/db/datasource_registry.cpp
     src/server/http_util.cpp
     src/server/api_response.cpp
     src/server/route_table.cpp
-    src/server/score_api.cpp
+    src/server/crud_api.cpp
     src/server/http_server.cpp
 )
 target_include_directories(cpppools
@@ -85,6 +87,9 @@ target_include_directories(cpppools
 )
 find_package(Threads REQUIRED)
 target_link_libraries(cpppools PUBLIC Threads::Threads)
+# SQLite 后端：系统库（macOS SDK / Linux 发行包均自带）。
+# PUBLIC：测试目标直接 #include <sqlite3.h> 造 fixture，也需要链接它。
+target_link_libraries(cpppools PUBLIC sqlite3)
 
 # =========================
 # 第三方依赖：nlohmann/json（vendored 单头文件，见 third_party/README.md）
@@ -183,7 +188,7 @@ cpppools_copy_mysql_dll(cpppools_server)
 # 测试全部基于 assert，因此必须确保 NDEBUG 不生效——否则在 Release 配置下
 # 所有断言会被消除，测试会退化成空 main 并全部“通过”，形成假绿。
 #
-# 测试额外加 -Isrc：需要直接调用 src/server/ 下 http_util / route_table / score_api
+# 测试额外加 -Isrc：需要直接调用 src/server/ 下 http_util / route_table / crud_api
 # 这些私有头文件里的函数。这是测试相对普通消费者的合理特权。
 function(cpppools_add_test name)
     add_executable(${name} test/${name}.cpp)
@@ -198,12 +203,15 @@ endfunction()
 cpppools_add_test(test_thread_pool)
 cpppools_add_test(test_object_pool)
 cpppools_add_test(test_db_pool)
-cpppools_add_test(test_db_connection)
-cpppools_add_test(test_score_store)
 cpppools_add_test(test_http_util)
 cpppools_add_test(test_metrics)
 cpppools_add_test(test_http_server)
-cpppools_add_test(test_score_api)
+cpppools_add_test(test_config)
+cpppools_add_test(test_schema_validator)
+cpppools_add_test(test_statement_cache)
+cpppools_add_test(test_database_conformance)
+cpppools_add_test(test_routing)
+cpppools_add_test(test_crud_api)
 
 # =========================
 # 构建摘要

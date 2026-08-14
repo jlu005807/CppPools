@@ -1,0 +1,16 @@
+{
+  "server": {
+    "port": 8080,
+    "worker_threads": 6,
+    "latency_window_size": 1024
+  },
+  "datasources": [
+    {
+      "name": "main",
+      "type": "sqlite",
+      "default": true,
+      "pool_size": 4,
+      "sqlite": { "path": "data/cpppools_demo.db" }
+    }
+  ]
+}

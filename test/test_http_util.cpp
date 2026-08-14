@@ -173,16 +173,20 @@ static void test_json_escape() {
 // ---------- route_table ----------
 
 static void test_route_match_success() {
-    const auto m = find_route("/api/v1/get-score", HttpMethod::kGet);
+    const auto m = find_route("/api/v1/schema", HttpMethod::kGet);
     assert(m.status == MatchStatus::kMatched);
     assert(m.spec != nullptr);
-    assert(m.spec->id == RouteId::kGetScore);
+    assert(m.spec->id == RouteId::kSchema);
+
+    const auto sel = find_route("/api/v1/select", HttpMethod::kPost);
+    assert(sel.status == MatchStatus::kMatched);
+    assert(sel.spec->id == RouteId::kSelect);
 }
 
 static void test_route_method_mismatch_is_distinct_from_missing() {
     // 改造前的缺陷：任何非 GET 请求一律回 405，连不存在的路径也是。
     // 路由表让「路径存在但方法不对」与「路径不存在」可区分。
-    const auto mismatch = find_route("/api/v1/get-score", HttpMethod::kPost);
+    const auto mismatch = find_route("/api/v1/select", HttpMethod::kGet);
     assert(mismatch.status == MatchStatus::kMethodMismatch);
 
     const auto missing = find_route("/no/such/path", HttpMethod::kPost);
@@ -190,11 +194,13 @@ static void test_route_method_mismatch_is_distinct_from_missing() {
 }
 
 static void test_route_write_endpoints_are_post() {
-    assert(find_route("/api/v1/create-score", HttpMethod::kPost).status == MatchStatus::kMatched);
-    assert(find_route("/api/v1/update-score", HttpMethod::kPost).status == MatchStatus::kMatched);
-    assert(find_route("/api/v1/delete-score", HttpMethod::kPost).status == MatchStatus::kMatched);
+    // 通用 CRUD 统一 POST + JSON body（spec §7.1）。
+    assert(find_route("/api/v1/select", HttpMethod::kPost).status == MatchStatus::kMatched);
+    assert(find_route("/api/v1/insert", HttpMethod::kPost).status == MatchStatus::kMatched);
+    assert(find_route("/api/v1/update", HttpMethod::kPost).status == MatchStatus::kMatched);
+    assert(find_route("/api/v1/delete", HttpMethod::kPost).status == MatchStatus::kMatched);
     // 写端点不接受 GET。
-    assert(find_route("/api/v1/create-score", HttpMethod::kGet).status == MatchStatus::kMethodMismatch);
+    assert(find_route("/api/v1/insert", HttpMethod::kGet).status == MatchStatus::kMethodMismatch);
 }
 
 static void test_infra_endpoints_have_no_version_prefix() {
@@ -207,23 +213,14 @@ static void test_infra_endpoints_have_no_version_prefix() {
 }
 
 static void test_required_params_detection() {
-    const auto m = find_route("/api/v1/create-score", HttpMethod::kPost);
+    // 通用 CRUD 的参数在 JSON 请求体里，路由层无必需 query 参数 ——
+    // first_missing_param 必须恒回 nullopt（否则会在解析 body 前误回 400）。
+    const auto m = find_route("/api/v1/insert", HttpMethod::kPost);
     assert(m.status == MatchStatus::kMatched);
-
-    // 两个必需参数都缺 -> 报告第一个缺失的。
-    const auto missing_both = first_missing_param(*m.spec, "");
-    assert(missing_both.has_value());
-    assert(*missing_both == "user");
-
-    // 只缺 score。
-    const auto missing_score = first_missing_param(*m.spec, "user=1");
-    assert(missing_score.has_value());
-    assert(*missing_score == "score");
-
-    // 齐备。
+    assert(m.spec->required_count == 0);
+    assert(!first_missing_param(*m.spec, "").has_value());
     assert(!first_missing_param(*m.spec, "user=1&score=2").has_value());
 
-    // 无必需参数的端点永远齐备。
     const auto health = find_route("/health", HttpMethod::kGet);
     assert(!first_missing_param(*health.spec, "").has_value());
 }
@@ -231,12 +228,12 @@ static void test_required_params_detection() {
 static void test_method_mismatch_still_reports_allowed_method() {
     // 405 响应必须带 Allow 头，而路由表本就知道该路径允许什么方法，
     // 所以 kMethodMismatch 时也要把 spec 带回来，不能置 nullptr。
-    const auto m = find_route("/api/v1/create-score", HttpMethod::kGet);
+    const auto m = find_route("/api/v1/select", HttpMethod::kGet);
     assert(m.status == MatchStatus::kMethodMismatch);
     assert(m.spec != nullptr);
     assert(m.spec->method == HttpMethod::kPost);
 
-    const auto g = find_route("/api/v1/get-score", HttpMethod::kPost);
+    const auto g = find_route("/api/v1/schema", HttpMethod::kPost);
     assert(g.status == MatchStatus::kMethodMismatch);
     assert(g.spec != nullptr);
     assert(g.spec->method == HttpMethod::kGet);
@@ -304,6 +301,20 @@ static void test_error_message_is_escaped() {
     assert(resp.body.find('\n') == std::string::npos);  // 不得残留真正的换行
 }
 
+static void test_find_content_length_parses_value() {
+    // 头区以空行（\r\n\r\n）结束；Content-Length 大小写不敏感（RFC 7230 头名不区分大小写）。
+    assert(find_content_length("POST /x HTTP/1.1\r\nContent-Length: 17\r\n\r\n{}") == 17);
+    assert(find_content_length("POST /x HTTP/1.1\r\ncontent-length: 5\r\n\r\nabcde") == 5);
+    assert(find_content_length("POST /x HTTP/1.1\r\nContent-Length: 0\r\n\r\n") == 0);
+    // 无头区终结符：视为请求不完整。
+    assert(!find_content_length("POST /x HTTP/1.1\r\nContent-Length: 17").has_value());
+    // 无 Content-Length 头：GET 类请求的正常形态。
+    assert(!find_content_length("GET /x HTTP/1.1\r\nHost: a\r\n\r\n").has_value());
+    // 非法值：非数字 / 负数。
+    assert(!find_content_length("POST /x HTTP/1.1\r\nContent-Length: abc\r\n\r\n").has_value());
+    assert(!find_content_length("POST /x HTTP/1.1\r\nContent-Length: -1\r\n\r\n").has_value());
+}
+
 int main() {
     test_parse_request_line_get();
     test_parse_request_line_post();
@@ -331,5 +342,6 @@ int main() {
     test_response_without_allow_omits_header();
     test_error_body_shape();
     test_error_message_is_escaped();
+    test_find_content_length_parses_value();
     return 0;
 }

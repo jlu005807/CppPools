@@ -171,4 +171,72 @@ double percentile_nearest_rank(const std::vector<double>& sorted, double p) {
     return sorted[index];
 }
 
+
+std::optional<std::size_t> find_content_length(std::string_view raw) {
+    // 头区终结符是头部完整的闸门（同 parse_request_line 对请求行的处理）。
+    const auto header_end = raw.find("\r\n\r\n");
+    if (header_end == std::string_view::npos) {
+        return std::nullopt;
+    }
+    const std::string_view headers = raw.substr(0, header_end);
+
+    static constexpr std::string_view kLowerName = "content-length";
+
+    // 逐行扫描，头名大小写不敏感（RFC 7230 §3.2）。
+    std::size_t pos = 0;
+    while (pos < headers.size()) {
+        const auto line_end = headers.find("\r\n", pos);
+        const std::string_view line =
+            headers.substr(pos, line_end == std::string_view::npos ? std::string_view::npos
+                                                                   : line_end - pos);
+        const auto colon = line.find(':');
+        if (colon != std::string_view::npos) {
+            const std::string_view name = line.substr(0, colon);
+            bool match = name.size() == kLowerName.size();
+            if (match) {
+                // 头名仅 ASCII 字母/数字/连字符，逐字符 tolower 比较安全。
+                for (std::size_t i = 0; i < name.size(); ++i) {
+                    const char c = name[i];
+                    const char lower =
+                        (c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : c;
+                    if (lower != kLowerName[i]) {
+                        match = false;
+                        break;
+                    }
+                }
+            }
+            if (match) {
+                // 值：跳过两端空白（OWS），要求全为非负数字。
+                std::string_view value = line.substr(colon + 1);
+                while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
+                    value.remove_prefix(1);
+                }
+                while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) {
+                    value.remove_suffix(1);
+                }
+                if (value.empty()) {
+                    return std::nullopt;
+                }
+                std::size_t result = 0;
+                for (const char c : value) {
+                    if (c < '0' || c > '9') {
+                        return std::nullopt;
+                    }
+                    // 溢出保护：超过 1GB 的声明必然非法（服务端有 kMaxBodyBytes 上限）。
+                    if (result > (std::size_t{1} << 30)) {
+                        return std::nullopt;
+                    }
+                    result = result * 10 + static_cast<std::size_t>(c - '0');
+                }
+                return result;
+            }
+        }
+        if (line_end == std::string_view::npos) {
+            break;
+        }
+        pos = line_end + 2;
+    }
+    return std::nullopt;
+}
+
 }  // namespace cpppools::server
