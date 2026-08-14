@@ -3,6 +3,7 @@
 #include "server/http_util.h"
 #include "server/route_table.h"
 #include "server/crud_api.h"
+#include "server/ownership_router.h"
 #include "db/row_cache.h"
 
 #include <nlohmann/json.hpp>
@@ -256,7 +257,11 @@ HttpServer::HttpServer(uint16_t port,
     if (config_.latency_window_size == 0) {
         config_.latency_window_size = 1;
     }
+    // 归属路由器：启动期一次性建环，运行期只读（HashRing 的线程契约）。
+    router_ = std::make_unique<OwnershipRouter>(config_.cluster_view);
 }
+
+HttpServer::~HttpServer() = default;
 
 void HttpServer::start() {
 #ifdef _WIN32
@@ -602,6 +607,11 @@ ApiResponse HttpServer::route_request(std::string_view request, bool request_com
     const bool api_route = is_api_route(id);
     if (api_route) {
         api_requests_.fetch_add(1, std::memory_order_relaxed);
+        // Rejoin（spec §5.2 规则 B）：客户端黑名单过期回切的首请求 ——
+        // 清空本地缓存加速归队收敛（10s 节流，best-effort）。
+        if (find_header(request, "x-cpppools-rejoin").has_value()) {
+            handle_rejoin();
+        }
     }
 
     // 必需参数缺失统一回 400，与 Alluxio 的 mRequiredQueryParams 校验同款。
@@ -613,7 +623,14 @@ ApiResponse HttpServer::route_request(std::string_view request, bool request_com
     }
 
     const auto begin = std::chrono::steady_clock::now();
-    const CrudApiContext api_ctx{registry_, body, config_.db_acquire_timeout};
+    // 集群提示头（spec §3.6/§5.4）：缺失 = 未携带（curl 兼容）。
+    const auto fallback_hdr = find_header(request, "x-cpppools-fallback");
+    const auto epoch_hdr = find_header(request, "x-cpppools-epoch");
+    const CrudApiContext api_ctx{registry_, body, config_.db_acquire_timeout,
+                                 fallback_hdr.has_value(),
+                                 epoch_hdr.has_value() ? std::string(*epoch_hdr)
+                                                       : std::string{},
+                                 router_.get()};
 
     ApiResponse resp;
     // switch 覆盖全部 RouteId：新增路由若忘记补分支，-Werror=switch 会报编译错误。
@@ -640,6 +657,8 @@ ApiResponse HttpServer::route_request(std::string_view request, bool request_com
     }
 
     // 统一收口错误计数：handler 只管产出状态码，计数由这里统一处理。
+    // 307（归属重定向）是 3xx：不算错误，不进入任何错误计数 ——
+    // 它是"流量打错节点"的中性信号，由 cpppools_redirects_total 单独度量。
     if (resp.status_code >= 400) {
         error_requests_.fetch_add(1, std::memory_order_relaxed);
     }
@@ -816,7 +835,9 @@ ApiResponse HttpServer::handle_metrics() const {
             << "# HELP cpppools_cache_bypass_total Entries skipped, by reason (spec §8.1; 期1 仅 too_large).\n"
             << "# TYPE cpppools_cache_bypass_total counter\n"
             << "# HELP cpppools_cache_backfill_dropped_total Backfills dropped by generation CAS (spec §4.3.1).\n"
-            << "# TYPE cpppools_cache_backfill_dropped_total counter\n";
+            << "# TYPE cpppools_cache_backfill_dropped_total counter\n"
+            << "# HELP cpppools_cache_flush_total Full cache flushes, by reason (spec §5.2 rule B).\n"
+            << "# TYPE cpppools_cache_flush_total counter\n";
         for (const auto& [name, cache] : cache_list) {
             const RowCacheStats cs = cache->stats();
             const std::string label = "{pool=\"" + name + "\"}";
@@ -831,7 +852,31 @@ ApiResponse HttpServer::handle_metrics() const {
                 << "cpppools_cache_bypass_total{pool=\"" << name << "\",reason=\"too_large\"} "
                 << cs.bypass_too_large << "\n"
                 << "cpppools_cache_backfill_dropped_total" << label << " "
-                << cs.backfill_dropped << "\n";
+                << cs.backfill_dropped << "\n"
+                << "cpppools_cache_flush_total{pool=\"" << name
+                << "\",reason=\"rejoin\"} " << cs.flushes << "\n";
+        }
+    }
+
+    // ===== 集群路由决策计数（spec §8.1，计数点 = 决策点）=====
+    {
+        const OwnershipRouter::Stats rs = router_->stats();
+        out << "# HELP cpppools_redirects_total 307 redirects issued to the key owner.\n"
+            << "# TYPE cpppools_redirects_total counter\n"
+            << "cpppools_redirects_total " << rs.redirects << "\n"
+            << "# HELP cpppools_cache_bypass_total Local processing that bypassed cache (cluster-level reasons; too_large is cache-level, above).\n"
+            << "# TYPE cpppools_cache_bypass_total counter\n";
+        for (const auto& [pool, n] : rs.bypass_not_owner) {
+            out << "cpppools_cache_bypass_total{pool=\"" << pool
+                << "\",reason=\"not_owner\"} " << n << "\n";
+        }
+        for (const auto& [pool, n] : rs.bypass_fallback) {
+            out << "cpppools_cache_bypass_total{pool=\"" << pool
+                << "\",reason=\"fallback\"} " << n << "\n";
+        }
+        for (const auto& [pool, n] : rs.bypass_epoch) {
+            out << "cpppools_cache_bypass_total{pool=\"" << pool
+                << "\",reason=\"epoch_mismatch\"} " << n << "\n";
         }
     }
 
@@ -1065,6 +1110,26 @@ ApiResponse HttpServer::handle_cluster() const {
     ApiResponse resp;
     resp.body = root.dump();
     return resp;
+}
+
+void HttpServer::handle_rejoin() {
+    // 规则 B 是 best-effort 优化（正确性由 I1 + TTL 承担）：被节流/竞态
+    // 挡下的请求静默跳过，不重试不清理（幂等语义）。
+    const long long now_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    long long last = last_rejoin_ms_.load(std::memory_order_relaxed);
+    if (now_ms - last < 10000) {
+        return;
+    }
+    if (!last_rejoin_ms_.compare_exchange_strong(last, now_ms)) {
+        return;  // 窗口争夺失败：另一请求已执行清理
+    }
+    for (const auto& [name, cache] : registry_.caches()) {
+        cache->clear();
+        (void)name;
+    }
 }
 
 ApiResponse HttpServer::handle_cache_control(bool enable) {

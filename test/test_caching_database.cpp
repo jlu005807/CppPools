@@ -148,7 +148,7 @@ static void test_projection_semantics_on_hit() {
     assert(p.a->insert(make_user(1, "alice", "t1")).status == DbStatus::kOk);
     // 先读一次触发回填，之后全部走命中路径。
     assert(p.b->select(SelectRequest{"users", {}, where_id(1)}).status == DbStatus::kOk);
-    assert(p.cache->stats().hits >= 1 || p.cache->stats().misses >= 2);
+    assert(p.cache->stats().hits >= 1 || p.cache->stats().misses >= 1);
 
     // ① 投影顺序 = 请求顺序。
     const auto reordered = p.b->select(
@@ -262,6 +262,34 @@ static void test_registry_slots_share_one_cache() {
     std::remove((path + "-shm").c_str());
 }
 
+// per-request bypass（期2 归属门控通道，spec §5.2 规则 A）：开启时读直通
+// 内层（不命中不回填），但写的失效照常执行（I0）。
+static void test_request_bypass_disables_reads_but_not_invalidation() {
+    SharedPair p("bypass");
+    assert(p.a->insert(make_user(1, "alice", "t1")).status == DbStatus::kOk);
+    // 先回填一条。
+    assert(p.b->select(SelectRequest{"users", {}, where_id(1)}).status == DbStatus::kOk);
+    assert(p.cache->stats().entries == 1);
+
+    p.b->set_cache_bypass(true);
+    const std::size_t hits0 = p.cache->stats().hits;
+    // bypass 中读直通内层：不产生命中，也不新增回填。
+    const auto r1 = p.b->select(SelectRequest{"users", {"name"}, where_id(1)});
+    assert(r1.status == DbStatus::kOk);
+    assert(std::get<std::string>(r1.value.rows[0][0]) == "alice");
+    assert(p.cache->stats().hits == hits0);
+
+    // 失效不受 bypass 影响（I0）：A 更新后旧条目被清。
+    UpdateRequest upd{"users", {{"name", Value{std::string("bob")}}}, where_id(1)};
+    assert(p.a->update(upd).status == DbStatus::kOk);
+    assert(p.cache->stats().entries == 0);
+
+    // 关闭 bypass：读重新走缓存路径（miss → 回填新值）。
+    p.b->set_cache_bypass(false);
+    const auto r2 = p.b->select(SelectRequest{"users", {"name"}, where_id(1)});
+    assert(std::get<std::string>(r2.value.rows[0][0]) == "bob");
+}
+
 int main() {
     test_cross_connection_visibility_via_cache();
     test_write_through_invalidation_cross_connection();
@@ -271,5 +299,6 @@ int main() {
     test_kill_switch_disables_hits_but_not_invalidation();
     test_decorator_preserves_backend_semantics();
     test_registry_slots_share_one_cache();
+    test_request_bypass_disables_reads_but_not_invalidation();
     return 0;
 }

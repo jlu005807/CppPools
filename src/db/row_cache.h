@@ -71,6 +71,7 @@ struct RowCacheStats {
     std::uint64_t singleflight_merged{0};
     std::uint64_t bypass_too_large{0};
     std::uint64_t backfill_dropped{0};
+    std::uint64_t flushes{0};
     std::size_t entries{0};
     std::size_t bytes{0};
 };
@@ -146,6 +147,22 @@ public:
         ++shard.stats.invalidations;
     }
 
+    // 全量清空（归队 Rejoin，spec §5.2 规则 B：best-effort 优化）。
+    // 只清条目，不抬世代号：规则 B 的语义是"丢弃旧条目加速收敛"，
+    // 不是失效 —— 在途回填仍有世代 CAS 兜底，不改变一致性契约。
+    // 节流（10s 窗口）由服务端层负责，本方法自身幂等可重入。
+    // const：与 set_enabled 同模式（registry 以 const 指针暴露缓存）。
+    void clear() const {
+        for (const Shard& shard : shards_) {
+            std::lock_guard<std::mutex> lock(shard.mu);
+            shard.entries.clear();
+            shard.lru.clear();
+            shard.bytes = 0;
+        }
+        // flush 是缓存级事件（一次 clear 计一次，不按分片累加）。
+        flushes_.fetch_add(1, std::memory_order_relaxed);
+    }
+
     // 当前分片世代号（回填 CAS 用：回源前记录，回填时比对）。
     std::uint64_t generation(const RowCacheKey& key) {
         const std::string k = key.encode();
@@ -184,7 +201,9 @@ public:
         auto shared = std::make_shared<std::shared_future<std::optional<RowData>>>(
             promise->get_future().share());
         shard.flights.emplace(k, std::make_pair(std::move(promise), shared));
-        ++shard.stats.misses;
+        // 不在此计 miss：调用方（装饰器）必先经 get() 才到 join_flight，
+        // miss 已由 get() 计过一次 —— 再计即一次回源两条 miss（§8.1：
+        // misses = backed by DB read 的读，一次回源一条）。
         Flight f;
         f.future = shared;
         f.leader = true;
@@ -237,6 +256,7 @@ public:
             total.entries += shard.entries.size();
             total.bytes += shard.bytes;
         }
+        total.flushes = flushes_.load(std::memory_order_relaxed);
         return total;
     }
 
@@ -265,9 +285,11 @@ private:
 
     struct Shard {
         mutable std::mutex mu;
-        std::unordered_map<std::string, Entry> entries;
-        std::list<std::string> lru;  // 头部 = 最近使用
-        std::size_t bytes{0};
+        // mutable：缓存实例经 registry 以 const 指针暴露（kill-switch/
+        // rejoin 需经 const 句柄改状态，与 enabled_ 同模式）。
+        mutable std::unordered_map<std::string, Entry> entries;
+        mutable std::list<std::string> lru;  // 头部 = 最近使用
+        mutable std::size_t bytes{0};
         std::uint64_t generation{0};
         // 键 → (promise, shared_future)：leader 兑现，等待者共享。
         std::unordered_map<
@@ -360,6 +382,8 @@ private:
     const std::size_t per_shard_max_entries_;
     const std::size_t per_shard_max_bytes_;
     mutable std::atomic<bool> enabled_{true};
+    // 缓存级 flush 计数（clear 一次计一次，与分片无关；mutable 同 enabled_）。
+    mutable std::atomic<std::uint64_t> flushes_{0};
 };
 
 }  // namespace cpppools::db

@@ -71,3 +71,7 @@ third_party/*/build/
 
 #plan
 docs/superpowers/
+
+# Python
+__pycache__/
+*.pyc

@@ -38,12 +38,17 @@ public:
     bool healthy() override { return inner_->healthy(); }
     std::string backend_type() const override { return inner_->backend_type(); }
 
+    // per-request bypass（spec §5.2 规则 A / §5.4）：归属门控的直通通道。
+    // 借出的连接被单个请求线程独占，普通成员即可（与基类注释同口径）。
+    void set_cache_bypass(bool bypass) override { bypass_ = bypass; }
+
     RowCache* cache() { return cache_.get(); }
 
 protected:
     DbResult<ResultSet> do_select(const SelectRequest& req) override {
-        // bypass 三态：缓存关闭 / REAL 键列 / where 列查不到（不应发生，防御）。
-        if (cache_ == nullptr || !cache_->enabled()) {
+        // bypass 四态：缓存关闭 / kill-switch / per-request 门控（非 owner
+        // 就地处理或 epoch 不匹配，spec §5.2 规则 A / §5.4）/ REAL 键列。
+        if (cache_ == nullptr || !cache_->enabled() || bypass_) {
             return inner_->select(req);  // 内层 public：校验幂等
         }
         const ColumnInfo* where_col = schema_.find_column(req.table, req.where.column);
@@ -234,6 +239,8 @@ private:
 
     std::unique_ptr<Database> inner_;
     std::shared_ptr<RowCache> cache_;
+    // per-request 门控标志（handler 借出期间置位/复位，线程独占无竞态）。
+    bool bypass_{false};
 };
 
 }  // namespace cpppools::db

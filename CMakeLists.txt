@@ -81,6 +81,7 @@ add_library(cpppools STATIC
     src/server/crud_api.cpp
     src/server/http_server.cpp
     src/server/hash_ring.cpp
+    src/server/ownership_router.cpp
 )
 target_include_directories(cpppools
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -218,6 +219,7 @@ cpppools_add_test(test_cluster_api)
 cpppools_add_test(test_row_cache)
 cpppools_add_test(test_caching_database)
 cpppools_add_test(test_cache_metrics)
+cpppools_add_test(test_ownership)
 
 # =========================
 # 构建摘要

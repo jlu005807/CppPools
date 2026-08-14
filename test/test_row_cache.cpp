@@ -243,6 +243,29 @@ static void test_backfill_after_invalidation_is_dropped() {
     assert(cache.stats().backfill_dropped == 1);
 }
 
+// 全量清空（期4 归队 Rejoin，spec §5.2 规则 B）：条目/字节归零，
+// flush 计数递增；clear 自身不节流（节流在服务端层，§5.2 的 10s 窗口）。
+static void test_clear_removes_all_and_counts_flush() {
+    RowCache cache(fast_ttl_config());
+    cache.put(key_of("users", 1), make_row(1, "a"));
+    cache.put(key_of("users", 2), make_row(2, "b"));
+    assert(cache.stats().entries == 2);
+
+    cache.clear();
+    assert(cache.stats().entries == 0);
+    assert(cache.stats().bytes == 0);
+    assert(!cache.get(key_of("users", 1)).has_value());
+    assert(!cache.get(key_of("users", 2)).has_value());
+    assert(cache.stats().flushes == 1);
+
+    // 幂等：空缓存再 clear 也计数（节流职责不在这里）。
+    cache.clear();
+    assert(cache.stats().flushes == 2);
+    // 清空后可正常重新回填。
+    cache.put(key_of("users", 3), make_row(3, "c"));
+    assert(cache.get(key_of("users", 3)).has_value());
+}
+
 int main() {
     test_put_get_roundtrip();
     test_different_keys_do_not_collide();
@@ -254,5 +277,6 @@ int main() {
     test_singleflight_only_one_leader();
     test_singleflight_releases_key_after_finish();
     test_backfill_after_invalidation_is_dropped();
+    test_clear_removes_all_and_counts_flush();
     return 0;
 }

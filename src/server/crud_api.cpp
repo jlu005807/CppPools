@@ -4,6 +4,8 @@
 
 #include "server/crud_api.h"
 
+#include "server/ownership_router.h"
+
 #include "cpppools/db/database.h"
 #include "cpppools/db/datasource_registry.h"
 #include "cpppools/db/db_connection_pool.h"
@@ -206,6 +208,9 @@ njson value_to_json(const Value& v) {
 struct RoutedPool {
     DbConnectionPool* pool{nullptr};
     std::string datasource;
+    // 客户端显式给的 datasource（未给 = 空串）：路由哈希输入的 D1 口径，
+    // 与解析后的 datasource 是两个独立量（spec §3.3 期2 修订）。
+    std::string explicit_datasource;
 };
 
 std::optional<ApiResponse> route_and_prepare(const CrudApiContext& ctx, const njson& doc,
@@ -225,7 +230,72 @@ std::optional<ApiResponse> route_and_prepare(const CrudApiContext& ctx, const nj
     }
     routed->pool = route.pool;
     routed->datasource = route.datasource;
+    routed->explicit_datasource = datasource;
     return std::nullopt;
+}
+
+// ===== 归属门控（cluster-cache spec §3.6 决策矩阵）=====
+
+// 307 而非 302/303：保留 POST 方法与 body，客户端原样重发（决策⑧）。
+ApiResponse make_redirect(const std::string& location, const char* path) {
+    njson doc;
+    doc["code"] = "not_owner";
+    doc["message"] = "this node does not own the routing key; retry at Location";
+    ApiResponse resp = json_response(307, "Temporary Redirect", safe_dump(doc));
+    resp.extra_headers.emplace_back("Location", location + path);
+    return resp;
+}
+
+struct GateOutcome {
+    bool bypass{false};        // 本地处理但 bypass 缓存（规则 A / epoch 门控）
+    bool epoch_mismatch{false};
+};
+
+// 服务端权威自判：用已借连接查 schema 定路由键 → decide。
+// 返回非空 = 直接回 307；否则继续本地执行（门控结果写入 *out）。
+// 只对"唯一列且非 REAL"的键门控：非唯一列留给本地校验管道回 400
+//（非法请求不踢给 owner）；REAL 键/无键请求不参与环路由（spec §3.6 补充）。
+std::optional<ApiResponse> apply_ownership_gate(const CrudApiContext& ctx,
+                                                Database& db,
+                                                const RoutedPool& routed,
+                                                const std::string& table,
+                                                const std::string& column,
+                                                const Value& value,
+                                                const char* path,
+                                                GateOutcome* out) {
+    if (ctx.router == nullptr) {
+        return std::nullopt;
+    }
+    const db::ColumnInfo* col = db.schema().find_column(table, column);
+    // NULL 键值必然被校验管道拒（400）：不门控，避免非法请求被 307
+    // 踢给 owner 再拒（与"非法请求不踢给 owner"同口径，不污染 redirects）。
+    if (col == nullptr || !col->unique || col->kind == db::ValueKind::kReal ||
+        db::is_null(value)) {
+        return std::nullopt;
+    }
+    const OwnershipDecision d = ctx.router->decide(
+        routed.explicit_datasource, table, column, value,
+        ctx.fallback, ctx.epoch, routed.datasource);
+    if (d.action == OwnershipDecision::Action::kRedirect) {
+        return make_redirect(d.location, path);
+    }
+    out->bypass = !d.cache_allowed;
+    out->epoch_mismatch = d.epoch_mismatch;
+    if (out->bypass) {
+        db.set_cache_bypass(true);
+    }
+    return std::nullopt;
+}
+
+// insert 路由键辅助：values 中指定列的值（无则 nullptr）。
+const Value* find_column_value(
+    const std::vector<std::pair<std::string, Value>>& pairs, const std::string& col) {
+    for (const auto& [name, v] : pairs) {
+        if (name == col) {
+            return &v;
+        }
+    }
+    return nullptr;
 }
 
 }  // namespace
@@ -267,10 +337,27 @@ ApiResponse handle_select(const CrudApiContext& ctx) {
     if (!guard.valid()) {
         return make_error_response(503, "Service Unavailable", "db connection timeout");
     }
+    GateOutcome gate;
+    if (const auto redirect = apply_ownership_gate(ctx, *guard.get(), routed, table,
+                                                   where.column, where.value,
+                                                   "/api/v1/select", &gate)) {
+        return *redirect;
+    }
+    // 统一收口：bypass 复位（归还前）+ epoch 回显（§5.4）。
+    auto finalize = [&](ApiResponse r) {
+        if (gate.bypass) {
+            guard.get()->set_cache_bypass(false);
+        }
+        if (gate.epoch_mismatch) {
+            r.extra_headers.emplace_back("X-CppPools-Epoch",
+                                         std::to_string(ctx.router->self_epoch()));
+        }
+        return r;
+    };
     const DbResult<ResultSet> result =
         guard.get()->select(SelectRequest{table, std::move(columns), std::move(where)});
     if (result.status != DbStatus::kOk) {
-        return map_db_error(result.status, result.message);
+        return finalize(map_db_error(result.status, result.message));
     }
 
     njson rows = njson::array();
@@ -286,7 +373,7 @@ ApiResponse handle_select(const CrudApiContext& ctx) {
     resp["columns"] = result.value.columns;
     resp["rows"] = std::move(rows);
     resp["row_count"] = result.value.rows.size();
-    return json_response(200, "OK", safe_dump(resp));
+    return finalize(json_response(200, "OK", safe_dump(resp)));
 }
 
 ApiResponse handle_insert(const CrudApiContext& ctx) {
@@ -317,10 +404,48 @@ ApiResponse handle_insert(const CrudApiContext& ctx) {
     if (!guard.valid()) {
         return make_error_response(503, "Service Unavailable", "db connection timeout");
     }
+    GateOutcome gate;
+    {
+        // 路由键（spec §3.6 补充/D6）：schema 列序第一个"给了值且非 NULL"
+        // 的唯一列；一个都没有（纯自增）⇒ 不门控，本地处理。
+        const db::TableInfo* tinfo = guard.get()->schema().find_table(table);
+        const db::ColumnInfo* key_col = nullptr;
+        const Value* key_val = nullptr;
+        if (tinfo != nullptr) {
+            for (const auto& c : tinfo->columns) {
+                if (!c.unique) {
+                    continue;
+                }
+                const Value* v = find_column_value(values, c.name);
+                if (v != nullptr && !db::is_null(*v)) {
+                    key_col = &c;
+                    key_val = v;
+                    break;
+                }
+            }
+        }
+        if (key_col != nullptr) {
+            if (const auto redirect = apply_ownership_gate(
+                    ctx, *guard.get(), routed, table, key_col->name, *key_val,
+                    "/api/v1/insert", &gate)) {
+                return *redirect;
+            }
+        }
+    }
+    auto finalize = [&](ApiResponse r) {
+        if (gate.bypass) {
+            guard.get()->set_cache_bypass(false);
+        }
+        if (gate.epoch_mismatch) {
+            r.extra_headers.emplace_back("X-CppPools-Epoch",
+                                         std::to_string(ctx.router->self_epoch()));
+        }
+        return r;
+    };
     const DbResult<InsertResult> result =
         guard.get()->insert(InsertRequest{table, std::move(values)});
     if (result.status != DbStatus::kOk) {
-        return map_db_error(result.status, result.message);
+        return finalize(map_db_error(result.status, result.message));
     }
 
     njson resp;
@@ -329,7 +454,7 @@ ApiResponse handle_insert(const CrudApiContext& ctx) {
     resp["inserted_id"] = result.value.inserted_id.has_value()
                               ? njson(*result.value.inserted_id)
                               : njson(nullptr);
-    return json_response(201, "Created", safe_dump(resp));
+    return finalize(json_response(201, "Created", safe_dump(resp)));
 }
 
 ApiResponse handle_update(const CrudApiContext& ctx) {
@@ -364,15 +489,31 @@ ApiResponse handle_update(const CrudApiContext& ctx) {
     if (!guard.valid()) {
         return make_error_response(503, "Service Unavailable", "db connection timeout");
     }
+    GateOutcome gate;
+    if (const auto redirect = apply_ownership_gate(ctx, *guard.get(), routed, table,
+                                                   where.column, where.value,
+                                                   "/api/v1/update", &gate)) {
+        return *redirect;
+    }
+    auto finalize = [&](ApiResponse r) {
+        if (gate.bypass) {
+            guard.get()->set_cache_bypass(false);
+        }
+        if (gate.epoch_mismatch) {
+            r.extra_headers.emplace_back("X-CppPools-Epoch",
+                                         std::to_string(ctx.router->self_epoch()));
+        }
+        return r;
+    };
     const DbResult<RowCount> result =
         guard.get()->update(UpdateRequest{table, std::move(set), std::move(where)});
     if (result.status != DbStatus::kOk) {
-        return map_db_error(result.status, result.message);
+        return finalize(map_db_error(result.status, result.message));
     }
     njson resp;
     resp["datasource"] = routed.datasource;
     resp["affected_rows"] = result.value;
-    return json_response(200, "OK", safe_dump(resp));
+    return finalize(json_response(200, "OK", safe_dump(resp)));
 }
 
 ApiResponse handle_delete(const CrudApiContext& ctx) {
@@ -398,15 +539,31 @@ ApiResponse handle_delete(const CrudApiContext& ctx) {
     if (!guard.valid()) {
         return make_error_response(503, "Service Unavailable", "db connection timeout");
     }
+    GateOutcome gate;
+    if (const auto redirect = apply_ownership_gate(ctx, *guard.get(), routed, table,
+                                                   where.column, where.value,
+                                                   "/api/v1/delete", &gate)) {
+        return *redirect;
+    }
+    auto finalize = [&](ApiResponse r) {
+        if (gate.bypass) {
+            guard.get()->set_cache_bypass(false);
+        }
+        if (gate.epoch_mismatch) {
+            r.extra_headers.emplace_back("X-CppPools-Epoch",
+                                         std::to_string(ctx.router->self_epoch()));
+        }
+        return r;
+    };
     const DbResult<RowCount> result =
         guard.get()->remove(DeleteRequest{table, std::move(where)});
     if (result.status != DbStatus::kOk) {
-        return map_db_error(result.status, result.message);
+        return finalize(map_db_error(result.status, result.message));
     }
     njson resp;
     resp["datasource"] = routed.datasource;
     resp["affected_rows"] = result.value;
-    return json_response(200, "OK", safe_dump(resp));
+    return finalize(json_response(200, "OK", safe_dump(resp)));
 }
 
 ApiResponse handle_schema(const CrudApiContext& ctx) {

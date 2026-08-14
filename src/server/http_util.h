@@ -55,6 +55,12 @@ TargetParts split_target(std::string_view target);
 // 旧实现把两者都返回空字符串，导致 "?user=" 被误判成缺少参数。
 std::optional<std::string_view> find_query_value(std::string_view query, std::string_view key);
 
+// 从原始请求文本的头区取指定头的值（头名大小写不敏感，RFC 7230 §3.2）。
+// 头区以 "\r\n\r\n" 结束；找不到终结符返回 nullopt（请求不完整）。
+// 只匹配完整头名（X-Foo 不中 X-Foo-Extra）；请求行不参与匹配。
+// 值去掉两端 OWS；缺失 → nullopt，头存在但值空 → optional 持空视图。
+std::optional<std::string_view> find_header(std::string_view raw, std::string_view name);
+
 // 从原始请求文本的头区解析 Content-Length。
 // 头区以 "\r\n\r\n" 结束；找不到终结符返回 nullopt（请求不完整，
 // 与请求行的完整性闸门同理 —— 防止半截头部被当作完整请求处理）。

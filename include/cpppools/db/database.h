@@ -66,6 +66,13 @@ public:
     // 连接可用性检测（探活）。应廉价且尽量不阻塞。
     virtual bool healthy() = 0;
 
+    // per-request 缓存 bypass 提示（cluster-cache spec §5.2 规则 A / §5.4）：
+    // 归属门控判定"非 owner 就地处理"或 epoch 不匹配时，handler 在借出的
+    // 连接上置位，读完复位。默认 no-op：无缓存的后端无感知。
+    // 线程安全前提：池借出的实例被单个请求线程独占（与类注释线程模型一致）。
+    // 只关读命中与回填；写的失效不受影响（不变量 I0 由装饰器自己保证）。
+    virtual void set_cache_bypass(bool) {}
+
     const Schema& schema() const { return schema_; }
 
     // ===== 行级 CRUD（public 非虚：校验管道）=====

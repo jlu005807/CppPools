@@ -172,7 +172,38 @@ double percentile_nearest_rank(const std::vector<double>& sorted, double p) {
 }
 
 
-std::optional<std::size_t> find_content_length(std::string_view raw) {
+namespace {
+
+char to_lower_ascii(char c) {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : c;
+}
+
+// 头名大小写不敏感全等比较（头名仅 ASCII 字母/数字/连字符）。
+bool header_name_equals(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (to_lower_ascii(a[i]) != to_lower_ascii(b[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string_view trim_ows(std::string_view s) {
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) {
+        s.remove_prefix(1);
+    }
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) {
+        s.remove_suffix(1);
+    }
+    return s;
+}
+
+}  // namespace
+
+std::optional<std::string_view> find_header(std::string_view raw, std::string_view name) {
     // 头区终结符是头部完整的闸门（同 parse_request_line 对请求行的处理）。
     const auto header_end = raw.find("\r\n\r\n");
     if (header_end == std::string_view::npos) {
@@ -180,56 +211,21 @@ std::optional<std::size_t> find_content_length(std::string_view raw) {
     }
     const std::string_view headers = raw.substr(0, header_end);
 
-    static constexpr std::string_view kLowerName = "content-length";
-
-    // 逐行扫描，头名大小写不敏感（RFC 7230 §3.2）。
-    std::size_t pos = 0;
+    // 跳过请求行：它不是头，但可能含冒号（如 target 里的 ':'）。
+    const auto first_line_end = headers.find("\r\n");
+    if (first_line_end == std::string_view::npos) {
+        return std::nullopt;
+    }
+    std::size_t pos = first_line_end + 2;
     while (pos < headers.size()) {
         const auto line_end = headers.find("\r\n", pos);
         const std::string_view line =
             headers.substr(pos, line_end == std::string_view::npos ? std::string_view::npos
                                                                    : line_end - pos);
         const auto colon = line.find(':');
-        if (colon != std::string_view::npos) {
-            const std::string_view name = line.substr(0, colon);
-            bool match = name.size() == kLowerName.size();
-            if (match) {
-                // 头名仅 ASCII 字母/数字/连字符，逐字符 tolower 比较安全。
-                for (std::size_t i = 0; i < name.size(); ++i) {
-                    const char c = name[i];
-                    const char lower =
-                        (c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : c;
-                    if (lower != kLowerName[i]) {
-                        match = false;
-                        break;
-                    }
-                }
-            }
-            if (match) {
-                // 值：跳过两端空白（OWS），要求全为非负数字。
-                std::string_view value = line.substr(colon + 1);
-                while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
-                    value.remove_prefix(1);
-                }
-                while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) {
-                    value.remove_suffix(1);
-                }
-                if (value.empty()) {
-                    return std::nullopt;
-                }
-                std::size_t result = 0;
-                for (const char c : value) {
-                    if (c < '0' || c > '9') {
-                        return std::nullopt;
-                    }
-                    // 溢出保护：超过 1GB 的声明必然非法（服务端有 kMaxBodyBytes 上限）。
-                    if (result > (std::size_t{1} << 30)) {
-                        return std::nullopt;
-                    }
-                    result = result * 10 + static_cast<std::size_t>(c - '0');
-                }
-                return result;
-            }
+        if (colon != std::string_view::npos &&
+            header_name_equals(line.substr(0, colon), name)) {
+            return trim_ows(line.substr(colon + 1));
         }
         if (line_end == std::string_view::npos) {
             break;
@@ -237,6 +233,30 @@ std::optional<std::size_t> find_content_length(std::string_view raw) {
         pos = line_end + 2;
     }
     return std::nullopt;
+}
+
+std::optional<std::size_t> find_content_length(std::string_view raw) {
+    // 复用通用头解析（大小写不敏感 + OWS trim + 完整性闸门）。
+    const auto value_opt = find_header(raw, "content-length");
+    if (!value_opt.has_value()) {
+        return std::nullopt;
+    }
+    const std::string_view value = *value_opt;
+    if (value.empty()) {
+        return std::nullopt;
+    }
+    std::size_t result = 0;
+    for (const char c : value) {
+        if (c < '0' || c > '9') {
+            return std::nullopt;
+        }
+        // 溢出保护：超过 1GB 的声明必然非法（服务端有 kMaxBodyBytes 上限）。
+        if (result > (std::size_t{1} << 30)) {
+            return std::nullopt;
+        }
+        result = result * 10 + static_cast<std::size_t>(c - '0');
+    }
+    return result;
 }
 
 }  // namespace cpppools::server

@@ -11,12 +11,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace cpppools::server {
+
+class OwnershipRouter;  // 归属路由器（期2）：实现细节在 src/server/。
 
 // 单次请求的接收缓冲上限。请求行超过此值会得到 414。
 inline constexpr std::size_t kRequestBufferBytes = 4096;
@@ -117,6 +120,8 @@ public:
                pool::ObjectPool<RequestContext>& request_pool,
                db::DataSourceRegistry& registry,
                HttpServerConfig config = {});
+    // 在 .cpp 定义：router_ 是不完整类型的前向声明 + unique_ptr。
+    ~HttpServer();
 
     // 阻塞启动：进入 accept 循环并持续向线程池分发客户端处理任务。
     // 收到 request_stop() 后优雅退出：停止 accept → 等待在途请求排空
@@ -167,6 +172,10 @@ private:
     // 缓存 kill-switch（spec §8.3）：对全部数据源的共享缓存生效。
     ApiResponse handle_cache_control(bool enable);
 
+    // 归队清缓存（spec §5.2 规则 B）：带 X-CppPools-Rejoin 头的请求触发，
+    // 10s 节流，best-effort（非正确性依赖，无回报）。
+    void handle_rejoin();
+
     // 记录 API 请求延迟样本，用于后续分位数统计。
     void record_api_latency_ms(double latency_ms);
     LatencyStats collect_latency_stats() const;
@@ -180,10 +189,17 @@ private:
     db::DataSourceRegistry& registry_;
     // 运行期调优参数（超时、统计窗口大小等）。
     HttpServerConfig config_;
+    // 归属路由器（spec §3.6）：从 config_.cluster_view 建环，启动后只读。
+    // 单节点模式下 decide 恒本地，行为与无集群时逐字节一致。
+    std::unique_ptr<OwnershipRouter> router_;
 
     // 优雅停机标志：request_stop() 置位后 accept 循环退出（SIGTERM/SIGINT
     // 经 main 注册的信号处理函数调用 request_stop，只碰这个原子量，信号安全）。
     std::atomic<bool> stopping_{false};
+
+    // Rejoin 节流（cluster-cache spec §5.2 规则 B）：上次执行归队清缓存的
+    // steady_clock 毫秒时刻；10s 窗口内至多一次（CAS 抢占）。
+    std::atomic<long long> last_rejoin_ms_{-(1LL << 40)};
 
     // bind 后的实际监听端口（port 0 时内核分配临时端口，回填供测试连接）。
     std::atomic<std::uint16_t> bound_port_{0};

@@ -86,10 +86,12 @@ struct Fixture {
         std::remove((db_path + "-shm").c_str());
     }
 
-    server::ApiResponse post(const std::string& path, const std::string& body) {
+    server::ApiResponse post(const std::string& path, const std::string& body,
+                             const std::string& extra_headers = "") {
         return server->route_request(
             "POST " + path + " HTTP/1.1\r\n"
-            "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body,
+            "Content-Length: " + std::to_string(body.size()) + "\r\n" +
+                extra_headers + "\r\n" + body,
             true, body);
     }
 
@@ -102,6 +104,15 @@ struct Fixture {
         const std::string prefix = name + "{pool=\"main\"} ";
         const auto pos = body.find(prefix);
         assert(pos != std::string::npos && "指标缺失");
+        return std::atoll(body.c_str() + pos + prefix.size());
+    }
+
+    long long flush_metric() {
+        const std::string body = get("/metrics").body;
+        const std::string prefix =
+            "cpppools_cache_flush_total{pool=\"main\",reason=\"rejoin\"} ";
+        const auto pos = body.find(prefix);
+        assert(pos != std::string::npos && "flush 指标缺失");
         return std::atoll(body.c_str() + pos + prefix.size());
     }
 };
@@ -198,10 +209,52 @@ static void test_kill_switch_endpoint_controls_hits() {
     assert(contains(r.body, "carol") && "重开缓存后不得读到旧值");
 }
 
+// Rejoin 头（spec §5.2 规则 B）：清空本地缓存加速归队收敛；10s 内至多一次
+//（节流），flush 指标按 {pool,reason="rejoin"} 导出（§8.1）。
+static void test_rejoin_header_flushes_cache_with_throttle() {
+    Fixture f;
+    assert(f.post("/api/v1/insert",
+                  R"({"table":"users","values":{"id":1,"name":"alice"}})")
+               .status_code == 201);
+    assert(f.post("/api/v1/select",
+                  R"({"table":"users","where":{"column":"id","value":1}})")
+               .status_code == 200);
+    assert(f.metric_value("cpppools_cache_entries") >= 1);
+
+    // 带 Rejoin 头的请求：清空发生在请求处理前，因此本次 select 必然
+    // miss（命中被清掉的证据），随后自行回填一条。
+    const long long hits0 = f.metric_value("cpppools_cache_hits_total");
+    const long long misses0 = f.metric_value("cpppools_cache_misses_total");
+    const auto r1 = f.post("/api/v1/select",
+                           R"({"table":"users","where":{"column":"id","value":1}})",
+                           "X-CppPools-Rejoin: 1\r\n");
+    assert(r1.status_code == 200);
+    assert(f.flush_metric() == 1);
+    assert(f.metric_value("cpppools_cache_hits_total") == hits0 &&
+           "Rejoin 请求自身必须 miss（缓存已被清空）");
+    assert(f.metric_value("cpppools_cache_misses_total") == misses0 + 1);
+
+    // 10s 窗口内再来一次：节流（flush 不增长），且这次读命中了
+    // 上一次回填的条目 —— 证明未发生第二次清空。
+    f.post("/api/v1/select",
+           R"({"table":"users","where":{"column":"id","value":1}})",
+           "X-CppPools-Rejoin: 1\r\n");
+    assert(f.flush_metric() == 1 && "10s 内至多清一次（节流）");
+    assert(f.metric_value("cpppools_cache_hits_total") == hits0 + 1 &&
+           "被节流时不得二次清空（上次回填的条目仍在）");
+
+    // 清空后回填照常（规则 B 只清旧条目，不改变缓存能力）。
+    assert(f.post("/api/v1/select",
+                  R"({"table":"users","where":{"column":"id","value":1}})")
+               .status_code == 200);
+    assert(f.metric_value("cpppools_cache_entries") >= 1);
+}
+
 int main() {
     test_metrics_expose_cache_family();
     test_metrics_track_hits_and_invalidations();
     test_stats_expose_cache_aggregates();
     test_kill_switch_endpoint_controls_hits();
+    test_rejoin_header_flushes_cache_with_throttle();
     return 0;
 }

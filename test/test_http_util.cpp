@@ -315,6 +315,26 @@ static void test_find_content_length_parses_value() {
     assert(!find_content_length("POST /x HTTP/1.1\r\nContent-Length: -1\r\n\r\n").has_value());
 }
 
+static void test_find_header_generic() {
+    // 大小写不敏感（RFC 7230 §3.2）。
+    const auto v1 = find_header("POST /x HTTP/1.1\r\nX-CppPools-Epoch: 5\r\n\r\n",
+                                "x-cpppools-epoch");
+    assert(v1.has_value() && *v1 == "5");
+    // 值的前导空格去掉（OWS，RFC 7230 §3.2.4）。
+    const auto v2 = find_header("POST /x HTTP/1.1\r\nX-Foo:    bar  \r\n\r\n", "X-FOO");
+    assert(v2.has_value() && *v2 == "bar");
+    // 缺失 → nullopt；无头区终结符也视为缺失（请求不完整）。
+    assert(!find_header("POST /x HTTP/1.1\r\nHost: a\r\n\r\n", "X-Foo").has_value());
+    assert(!find_header("POST /x HTTP/1.1\r\nX-Foo: bar", "X-Foo").has_value());
+    // 只匹配完整头名：前缀同名不得误中。
+    assert(!find_header("POST /x HTTP/1.1\r\nX-Foo-Extra: 1\r\n\r\n", "X-Foo").has_value());
+    // 请求行不是头：首行含冒号也不匹配。
+    assert(!find_header("POST /x:a HTTP/1.1\r\n\r\n", "POST /x").has_value());
+    // 空值合法（与缺失区分：optional 持有空视图）。
+    const auto v3 = find_header("POST /x HTTP/1.1\r\nX-Foo:\r\n\r\n", "X-Foo");
+    assert(v3.has_value() && v3->empty());
+}
+
 int main() {
     test_parse_request_line_get();
     test_parse_request_line_post();
@@ -343,5 +363,6 @@ int main() {
     test_error_body_shape();
     test_error_message_is_escaped();
     test_find_content_length_parses_value();
+    test_find_header_generic();
     return 0;
 }
