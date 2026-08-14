@@ -1,34 +1,26 @@
-# CppPools — 多数据源数据库中间件（三级池化）
+# CppPools — 多数据源数据库中间件（三级池化 + 分布式集群）
 
-> C++17 / SQLite（MySQL 后端规划中）/ 自研 Socket HTTP。
+> C++17 / SQLite（MySQL 后端规划中）/ 自研 Socket HTTP / Python SDK。
 > 客户端发送通用 JSON CRUD 请求，服务端按表名透明路由到配置的数据源 ——
 > 三大池子（线程池 / 对象池 / 连接池）是它真实的运行时骨架。
+> 多节点部署时按一致性哈希把每个键路由到唯一 owner，带行级写穿透缓存。
 
 ## 定位
 
 ```
-HTTP 客户端 (SDK / curl)
-      │  POST /api/v1/insert|select|update|delete（JSON body）
-      ▼
-┌──────────────────────────────────────────────────┐
-│ CppPools 单节点中间件                             │
-│                                                  │
-│  ThreadPool     ── 请求调度，accept 不阻塞        │
-│       ▼                                          │
-│  ObjectPool     ── 复用 RequestContext           │
-│       ▼                                          │
-│  校验管道        ── schema 白名单 / where 唯一键   │
-│       ▼                                          │
-│  路由            ── table → datasource           │
-│       ▼                                          │
-│  DbConnectionPool × N ── 每数据源一个连接池        │
-└──────────────────────────────────────────────────┘
-      │
-      ▼
-  SQLite（已实现） / MySQL（规划中）…… 可同时挂多个数据源
+SDK / curl
+  │  建环（/api/v1/cluster）→ 按 (源,表,唯一列,值) 直连 owner
+  ▼
+┌─────────────────── CppPools 节点 × N（单节点即退化形态）────────────┐
+│  ThreadPool → ObjectPool → 校验管道 → 表路由 → 归属门控（307/epoch）  │
+│       → RowCache（行级写穿透缓存，每数据源共享）                    │
+│       → DbConnectionPool × 数据源数                                 │
+└───────────────────────────────────────────────────────────┘
+  ▼
+SQLite（已实现） / MySQL（规划中）…… 每节点各自的数据源（真理之源）
 ```
 
-两条主线：
+三条主线：
 
 1. **三级池化**：把「昂贵资源的创建」与「请求的到来」解耦。线程、请求上下文、
    数据库连接都在启动期预建，请求路径上只做借还，借不到时以超时（`503`）
@@ -36,10 +28,15 @@ HTTP 客户端 (SDK / curl)
 2. **数据库中间件**：客户端不必知道底层是 SQLite 还是 MySQL（透明性）；
    但客户端应当知道数据去了哪个逻辑库（响应回传 `datasource`，
    歧义表必须显式指定，绝不兜底猜）。
+3. **分布式集群（可选）**：配置 `cluster` 段后，每个键归唯一 owner 节点
+   （单 owner ⇒ 无需失效广播/分布式锁）；非 owner 回 307；节点故障由
+   SDK 黑名单 + attempt 绕行承担；缓存行级写穿透，稳态同键强一致。
+   不配 `cluster`/`cache` 段 = 单节点无缓存，行为逐字节不变。
 
 - API 契约：[docs/api/backend_api.md](docs/api/backend_api.md)
-- 设计文档：`docs/superpowers/specs/2026-08-06-db-middleware-design.md`
-- 客户端：暂无，计划以独立 SDK 实现（本仓库只提供服务端）
+- SDK 文档：[docs/api/sdk.md](docs/api/sdk.md)（`sdk/python/`，零依赖）
+- 设计文档：`docs/superpowers/specs/2026-08-06-db-middleware-design.md`（中间件）、
+  `docs/superpowers/specs/2026-08-11-cluster-cache-design.md`（集群与缓存）
 
 ---
 
@@ -52,10 +49,10 @@ CppPools/
 ├── LICENSE                                 # MIT
 │
 ├── config/
-│   └── cpppools.example.json               # 配置示例（server 段 + datasources 数组）
+│   └── cpppools.example.json               # 配置示例（server + cluster + cache + datasources）
 │
 ├── include/cpppools/                       # 公开头文件（对外接口）
-│   ├── config/config.h                     #   JSON 配置类型与加载
+│   ├── config/config.h                     #   JSON 配置类型与加载（含 cluster/cache 段）
 │   ├── pool/                               #   namespace cpppools::pool
 │   │   ├── thread_pool.h                   #     固定 worker + 有界队列与 503 拒绝 + 双提交入口
 │   │   └── object_pool.h                   #     泛型对象池（RAII 归还 + reset 复用）
@@ -63,40 +60,53 @@ CppPools/
 │   │   ├── value.h / schema.h / row_request.h  # 适配层类型系统（Value/Schema/CRUD 请求）
 │   │   ├── database.h                      #     NVI 基类 + 内联校验管道
 │   │   ├── database_factory.h              #     后端工厂注册表（type → 工厂函数）
-│   │   ├── datasource_registry.h           #     多数据源 + table→datasource 路由
+│   │   ├── datasource_registry.h           #     多数据源 + table→datasource 路由 + 共享缓存注入
 │   │   └── db_connection_pool.h            #     有界连接池 + DbConnGuard
 │   └── server/                             #   namespace cpppools::server
 │       ├── api_response.h                  #     响应模型 + HTTP 报文组装
-│       └── http_server.h                   #     accept 循环 + 分发 + 遥测
+│       └── http_server.h                   #     accept 循环 + 分发 + 归属门控 + 遥测
 │
 ├── src/                                    # 实现 + 私有头文件
-│   ├── main.cpp                            #   服务进程入口（配置驱动）
+│   ├── main.cpp                            #   服务进程入口（配置驱动 + 优雅停机）
 │   ├── config/config.cpp
 │   ├── pool/thread_pool.cpp
 │   ├── db/
 │   │   ├── database_factory.cpp
 │   │   ├── sqlite_database.cpp             #   SQLite 后端（自省/stmt 缓存/WAL）
 │   │   ├── statement_cache.h               #   私有：每连接 prepared statement 缓存
+│   │   ├── row_cache.h                     #   私有：行级缓存（分片锁/LRU/TTL/世代号/Singleflight）
+│   │   ├── caching_database.h              #   私有：缓存装饰器（写穿透双删失效）
 │   │   ├── datasource_registry.cpp
 │   │   └── db_connection_pool.cpp
 │   └── server/
-│       ├── http_util.{h,cpp}               #   私有：零拷贝请求解析
+│       ├── http_util.{h,cpp}               #   私有：零拷贝请求/头解析
 │       ├── route_table.{h,cpp}             #   私有：constexpr 声明式路由表
-│       ├── crud_api.{h,cpp}                #   私有：通用行级 CRUD + schema handler
+│       ├── crud_api.{h,cpp}                #   私有：通用行级 CRUD + 归属门控接入
+│       ├── hash_ring.{h,cpp}               #   私有：murmur3 + 一致性哈希环（黄金向量钉死）
+│       ├── ownership_router.{h,cpp}        #   私有：归属决策矩阵（307/Fallback/epoch）
 │       ├── api_response.cpp
 │       └── http_server.cpp
 │
-├── test/                                   # 12 个 CTest 用例（见 §6）
+├── sdk/python/                             # Python SDK（零依赖，见 docs/api/sdk.md）
+│   ├── cpppools/                           #   hashing/ring/transport/errors/client
+│   └── tests/                              #   51 单测 + 三节点 live e2e
+│
+├── test/                                   # 18 个 CTest 用例（见 §7）
 ├── third_party/                            # vendored 依赖（nlohmann/json 单头文件）
 ├── docs/
 │   ├── api/backend_api.md                  #   API 契约
+│   ├── api/sdk.md                          #   SDK 文档
+│   ├── benchmarks/                         #   性能基线与验收归档
 │   ├── mysql_setup.sql                     #   MySQL 初始化脚本（MySQL 后端启用后用）
 │   ├── learning_log.md
 │   └── superpowers/                        #   设计 spec 与实施计划
 ├── scripts/
 │   ├── build.sh                            #   构建 + 测试（Linux/macOS）
 │   ├── run_server.sh                       #   启动服务（自动种子演示库）
-│   └── init_demo_db.sql                    #   演示库建表脚本
+│   ├── init_demo_db.sql                    #   演示库建表脚本
+│   ├── cluster_e2e.sh                      #   双节点集群 e2e（307/Fallback/epoch）
+│   ├── sdk_e2e.sh                          #   三节点 SDK e2e（杀节点/归队/滚动重启）
+│   └── bench_baseline.py                   #   性能基线采集
 └── build/                                  # 构建输出（已 gitignore）
 ```
 
@@ -104,8 +114,9 @@ CppPools/
 
 - `include/cpppools/<模块>/` —— 对外接口。库的消费者与 `main.cpp` 只用这些。
 - `src/<模块>/` —— 实现，以及**私有头文件**。
-  `http_util` / `route_table` / `crud_api` / `statement_cache` 是实现细节；
-  测试通过额外的 `-Isrc` 直接访问它们（测试相对普通消费者的合理特权）。
+  `http_util` / `route_table` / `crud_api` / `statement_cache` /
+  `hash_ring` / `ownership_router` / `row_cache` / `caching_database`
+  是实现细节；测试通过额外的 `-Isrc` 直接访问它们（测试相对普通消费者的合理特权）。
 
 ### 模块依赖
 
@@ -238,9 +249,53 @@ accept 主循环（主线程）
 
 ---
 
-## 4. 网络与可观测性
+## 4. 分布式集群与行级缓存（可选）
 
-### 4.1 自研 Socket 级 HTTP/1.1
+设计全文见 `docs/superpowers/specs/2026-08-11-cluster-cache-design.md`；
+API 契约见 `docs/api/backend_api.md` §3.6/§5.5/§5.6。
+
+### 4.1 单 owner 路由
+
+路由键 = 缓存键 = `(datasource, table, 唯一键列, 键值)`，在一致性哈希环
+（murmur3_32 seed=0 无符号，100 vnodes/节点，长度前缀编码）上归唯一
+owner。同一键的增删改查都经同一节点的同一份缓存副本 —— **无需失效广播、
+无需分布式锁**，稳态同键强一致。SDK 与服务端各自建环、逐字同参，
+由 spec 冻结的黄金向量两端共同钉死（跨语言一致是路由契约的根）。
+
+服务端权威自判归属：非 owner 且未带 Fallback 头 → **307 重定向**到
+owner（不做代理转发：零出向依赖、零线程占用）。拓扑变更用 `epoch`
+门控：视图落后的一端自动退化为"正确但无加速"。
+
+### 4.2 行级缓存（RowCache + 装饰器）
+
+- **每数据源一个共享实例**（跨连接；per-connection 缓存会打破单节点内
+  的强一致），16 分片锁；LRU 双阈值（条目数 + 字节数）+ 单条上限。
+- **写穿透 + 双删失效**：写直达 DB，成功后删键（而非更新：自增主键/
+  读改写结果都在后端才确定，删掉让下次读回源显然正确）；失效永不 bypass。
+- **回填防陈旧**：分片世代号 CAS（回源前记世代，回填时锁内原子比对）——
+  写后到达的旧回填直接丢弃；同键并发 miss 由 Singleflight 合并为一次回源。
+- 只缓存 kOk 非空单行；TTL 惰性过期；REAL 键列不缓存不路由。
+- 故障语义：owner 不可达时 SDK 绕行，替补节点就地处理但**不缓存**
+  （规则 A）；归队后由 TTL + Rejoin 清缓存收敛（规则 B/C）。
+- 运行期 kill-switch：`POST /api/v1/cache/disable|enable`（疑似脏读时
+  第一动作是关缓存而非重启）。
+
+### 4.3 SDK 与可观测性
+
+`sdk/python/`（零依赖）：建环、直连 owner、307 跟随、黑名单 + attempt
+绕行 + Fallback 头、全黑清空重试一轮、回切带 Rejoin 头、epoch 不符立即
+刷拓扑、错误分类重试（自增 insert 非幂等不重试）。详见 docs/api/sdk.md。
+
+指标：`cache_*` 族（hits/misses/entries/bytes/evictions/invalidations/
+singleflight/bypass{reason}/flush{reason}，per-datasource）、
+`cpppools_redirects_total`；验收归档见 `docs/benchmarks/`（命中率 99.97%、
+DB 读 QPS 降 99.8%、服务端读 p99 降 80%、写退化 ≤2.4%）。
+
+---
+
+## 5. 网络与可观测性
+
+### 5.1 自研 Socket 级 HTTP/1.1
 
 [src/server/http_server.cpp](src/server/http_server.cpp)
 
@@ -248,23 +303,27 @@ accept 主循环（主线程）
 - 模型：一次读取 + 一次响应 + 主动关闭。仅 GET / POST。
   CRUD 端点的 JSON 请求体按 **Content-Length** 循环读取（上限 1 MB，
   超限 413；读体 5 秒超时防"声明 body 却不发"钉死 worker；
-  路由前预校验请求行）。
+  路由前预校验请求行）。所有响应带 `X-Request-Id`（对账用）。
 - **过载背压**：线程池队列满时，accept 循环直接回 503 并关连接。
+- **优雅停机**：SIGTERM/SIGINT → 停 accept（poll 200ms 唤醒）→ 排空
+  在途请求（上限 5s）。
 - 路由由 `constexpr` 表集中声明；`RouteId` 配 `switch` 全覆盖分发，
   **新增路由忘接 handler 会被 `-Werror=switch` 拦成编译错误**。
 - 未预期异常在 `handle_client` 兜底为 500（连接不会静默悬挂）。
 
-### 4.2 指标端点
+### 5.2 指标端点
 
 - `GET /health` — 存活探针（纯文本）
 - `GET /metrics` — Prometheus exposition 文本；池指标统一带 `pool` 标签
   （`worker` / `request` / 各数据源名）
-- `GET /api/v1/stats` — 三池瞬时值 + 历史峰值 + 累计计数器 + P50/P95/P99
+- `GET /api/v1/stats` — 三池瞬时值 + 历史峰值 + 累计计数器 + 缓存聚合
+  + 集群身份 + P50/P95/P99
 - `GET /api/v1/get-config` — 启动期配置快照（不含凭据）
+- `GET /api/v1/cluster` — 拓扑/哈希参数/TTL/配置摘要（SDK 建环唯一信息源）
 
 字段明细见 `docs/api/backend_api.md` §5。
 
-### 4.3 统一统计：两类形状，不强行拉平
+### 5.3 统一统计：两类形状，不强行拉平
 
 - **借→还池**（ObjectPool / DbConnectionPool）共用 `AcquireStats`。
   等式不变式因池而异：对象池 `in_use + available == size`；
@@ -277,15 +336,16 @@ accept 主循环（主线程）
 
 ---
 
-## 5. 快速开始
+## 6. 快速开始
 
-### 5.1 环境要求
+### 6.1 环境要求
 
 - C++17 编译器（GCC 7+ / Clang 6+ / MSVC 2017+ / MinGW-w64）
 - CMake 3.16+
 - SQLite3 开发库（macOS SDK / 主流 Linux 发行包自带）
+- Python 3.8+（仅 SDK 与其测试需要，零第三方依赖）
 
-### 5.2 构建与测试
+### 6.2 构建与测试
 
 ```bash
 # Linux / macOS：一条命令完成构建 + 测试
@@ -294,12 +354,13 @@ scripts/build.sh
 # 或手动
 cmake -S . -B build
 cmake --build build -j
-ctest --test-dir build --output-on-failure   # 预期 12/12 通过
+ctest --test-dir build --output-on-failure   # 预期 18/18 通过
+python3 -m unittest discover -s sdk/python/tests   # SDK 单测，预期 51 全绿
 ```
 
-产物：`build/bin/cpppools_server` 与 12 个测试二进制。
+产物：`build/bin/cpppools_server` 与 18 个测试二进制。
 
-### 5.3 启动并验证
+### 6.3 启动并验证（单节点）
 
 ```bash
 # 首次使用：cp config/cpppools.example.json config/cpppools.json
@@ -320,7 +381,27 @@ curl        http://127.0.0.1:8080/api/v1/stats
 多数据源：在配置文件的 `datasources` 数组里加源即可；
 表名跨源重复时请求需带 `"datasource":"<源名>"`（否则 409）。
 
-### 5.4 观察池化行为
+### 6.4 集群与缓存
+
+配置文件加 `cluster`（节点身份 + 拓扑 + epoch）与 `cache`（`enabled:true`）
+两段（格式见 `docs/api/backend_api.md` §6 与 `config/cpppools.example.json`）；
+每个节点各自启动，`node_id` 不同、`nodes` 列表相同。集群验证：
+
+```bash
+bash scripts/cluster_e2e.sh   # 双节点：路由分布/307 跟随/Fallback/epoch
+bash scripts/sdk_e2e.sh       # 三节点：杀节点绕行/归队清缓存/滚动重启
+```
+
+客户端用 SDK 直连 owner（裸 curl 需自己处理 307，加 `-L`）：
+
+```python
+import sys; sys.path.insert(0, "sdk/python")
+from cpppools.client import ClusterClient
+client = ClusterClient(["http://127.0.0.1:8080"])
+client.insert("user_scores", {"user_id": 42, "score": 99, "updated_at_ms": 0})
+```
+
+### 6.5 观察池化行为
 
 ```bash
 # 观察连接池耗尽（503）需要 worker 数 > 连接池大小
@@ -336,7 +417,7 @@ curl -s http://127.0.0.1:8080/api/v1/stats  # 看 db_timeout_requests 与 min_db
 两种 503 用指标区分：`cpppools_db_acquire_timeout_total`（连接池耗尽）
 与 `cpppools_rejected_requests_total`（线程池队列满）。
 
-### 5.5 运行期环境变量
+### 6.6 运行期环境变量
 
 数据源建连完全由 JSON 配置驱动，不再有数据库连接环境变量。剩余：
 
@@ -348,22 +429,31 @@ curl -s http://127.0.0.1:8080/api/v1/stats  # 看 db_timeout_requests 与 min_db
 
 ---
 
-## 6. 测试
+## 7. 测试
 
 | 用例 | 覆盖 |
 |---|---|
 | `test_thread_pool` | 17 用例：有界队列拒绝 / 双提交入口 / move-only 参数 / shutdown 与 shutdown_now / TaskStats / 线程命名 |
 | `test_object_pool` | 有界 max_size 与立即失败、异常安全窗口（reset 抛出时销毁并回滚）、无状态 deleter、一致快照 |
 | `test_db_pool` | 构造 fail-fast、探活/重建/自愈、绝对 deadline、无忙等待（rusage）、guard 移动、非法归还计数、并发借还（TSan 干净） |
-| `test_config` | JSON 配置解析：缺字段、类型错、password_env、多 default 冲突 |
+| `test_config` | JSON 配置解析：缺字段、类型错、password_env、多 default 冲突、cluster/cache 段与不变量 I1 |
 | `test_schema_validator` | NVI 校验管道全拒绝分支（表/列/where 唯一键/NULL/类型/重复列）、工厂注册 |
 | `test_statement_cache` | 每连接 statement 缓存：命中/淘汰/计数 |
-| `test_database_conformance` | SQLite 后端一致性矩阵（自省/类型往返/冲突/读改写/脏数据受控）—— MySQL 后端的复用基线 |
+| `test_database_conformance` | SQLite 后端一致性矩阵（自省/类型往返/冲突/读改写/脏数据受控）——裸后端与套缓存装饰器**双跑**；MySQL 后端的复用基线 |
 | `test_routing` | 多数据源：自动路由、歧义 409、显式消歧、跨源隔离、构建错误 |
-| `test_http_util` | 请求行解析（含截断防御）、Content-Length 解析、路由三态匹配、报文组装 |
-| `test_http_server` | handle_client 端到端（socketpair）：对象池耗尽 503、DB 超时 503、请求体读取边界、计数器口径 |
+| `test_http_util` | 请求行解析（含截断防御）、Content-Length/通用头解析、路由三态匹配、报文组装 |
+| `test_http_server` | handle_client 端到端（socketpair）：对象池耗尽 503、DB 超时 503、请求体边界、X-Request-Id、优雅停机、计数器口径 |
 | `test_metrics` | /metrics 与 /api/v1/stats 的格式契约：pool 标签、task_exception 的 detached-only 警告、stats 字段 |
 | `test_crud_api` | 通用 CRUD 状态码矩阵：201/200/400/409/歧义 409/JSON 异常面/脏 UTF-8 容错/schema 结构 |
+| `test_hash_ring` | murmur3 + 环：spec 黄金向量（含碰撞 tie-break/回绕），与 Python SDK 跨语言同源 |
+| `test_cluster_api` | /api/v1/cluster 契约、单节点退化、epoch/TTL/digest 回显 |
+| `test_row_cache` | 命中/miss/TTL/双阈值 LRU/超限拒收/世代号拦回填（确定性构造）/Singleflight/clear |
+| `test_caching_database` | 装饰器语义：**跨连接/跨槽位共享缓存**（B1 守卫）、写后失效、投影三语义、per-request bypass |
+| `test_cache_metrics` | cache_* 指标族、kill-switch 端点行为、Rejoin 节流 |
+| `test_ownership` | 归属决策矩阵五行（路由器级 + HTTP 级）、B5 失效专项、307/epoch/Fallback 头组合 |
+
+另：SDK 51 单测（fake 集群）+ 两个 live e2e 脚本（双节点 `cluster_e2e.sh`、
+三节点 `sdk_e2e.sh`：稳态 0 个 307 = 两端环一致的硬证据）。
 
 ```bash
 ctest --test-dir build --output-on-failure
@@ -375,12 +465,13 @@ ctest --test-dir build --output-on-failure
 
 ---
 
-## 7. 演进方向
+## 8. 演进方向
 
 | 方向 | 现有基础 |
 |---|---|
-| **MySQL 后端** | 工厂注册表已留位：实现 `Database` 子类 + 注册一行；`test_database_conformance` 断言矩阵直接复用 |
-| 多节点 + 一致性哈希 | `route_table` 与 handler 解耦，可在前面加转发层 |
+| **MySQL 后端**（暂缓，保留） | 工厂注册表已留位：实现 `Database` 子类 + 注册一行；`test_database_conformance` 断言矩阵直接复用；另有唯一性自省口径专项待做（`COLUMN_KEY='UNI'` 与联合唯一/前缀索引的对应） |
+| 集群 v1.1 | SDK keep-alive（requests 注入）、热键账本 + 归队预热（判据：归队后 miss 率/DB QPS 尖峰）、缓存前置到池外（命中免借连接，触发条件见 spec §4.1.2） |
+| Redis 共享缓存模式 | 同一缓存抽象换后端；该模式下环退化为负载均衡（spec §10 扩展位） |
 | 数据源级只读标记 | 配置加字段即可，写操作在路由层拒绝 |
 | 多条件 where / 比较运算符 | `WhereClause` 可扩展为条件数组，基类接口不动 |
 
@@ -390,7 +481,7 @@ ctest --test-dir build --output-on-failure
 
 ---
 
-## 8. 已知限制
+## 9. 已知限制
 
 - 请求行上限 4095 字节（超出 `414`），请求体上限 1 MB（超出 `413`）；
   不支持 keep-alive、chunked、TLS。
@@ -401,3 +492,7 @@ ctest --test-dir build --output-on-failure
   `:memory:` 字面路径强制单槽；写并发受 SQLite 单写者模型限制（WAL 下多读单写）。
 - `/api/v1/stats` 的跨池字段逐个读取，池内是一致快照、跨池不构成全局原子快照。
 - 连接探活失败后由 factory 重建；`:memory:` 数据源重建会得到空库（固有属性，仅影响该用法）。
+- 集群：缓存命中仍需借连接（`pool_size` 即并发上限，spec §4.1.2）；
+  故障窗口内经替补写入的数据，owner 归队后读 owner 库读不到（同键最终一致，
+  旧读窗口 ≤ TTL，spec §5.1 例外②）；SDK 无连接复用（v1.1）；
+  节点间配置一致性无强制手段，由 `datasource_digest` 比对提供检测。

@@ -4,6 +4,21 @@
     "worker_threads": 6,
     "latency_window_size": 1024
   },
+  "cluster": {
+    "node_id": "node-a",
+    "epoch": 1,
+    "nodes": [
+      { "node_id": "node-a", "host": "127.0.0.1", "port": 8080 }
+    ]
+  },
+  "cache": {
+    "enabled": true,
+    "max_entries": 100000,
+    "max_bytes": 268435456,
+    "max_entry_bytes": 65536,
+    "ttl_ms": 60000,
+    "blacklist_ttl_ms": 60000
+  },
   "datasources": [
     {
       "name": "main",

@@ -71,7 +71,11 @@ third_party/*/build/
 
 #plan
 docs/superpowers/
+docs/benchmarks/
 
 # Python
 __pycache__/
 *.pyc
+
+# 演示库（run_server.sh 自动种子）
+data/
