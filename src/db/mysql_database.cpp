@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -152,10 +153,14 @@ bool introspect_columns(MYSQL* conn, const std::string& table, TableInfo* out,
                         std::string* error) {
     // 查询本表的列。table_schema 由 make_mysql_database 传入，这里用 SELECT DATABASE()
     // 取当前连接的默认库 —— 与 mysql_real_connect 指定的库一致，避免再传 schema 参数。
+    char esc_table[2 * table.size() + 1];
+    const unsigned long esc_len = mysql_real_escape_string_quote(
+        conn, esc_table, table.c_str(), static_cast<unsigned long>(table.size()), '\'');
+    const std::string escaped_table(esc_table, esc_len);
     const std::string sql =
         "SELECT column_name, data_type, is_nullable, column_key, extra "
         "FROM information_schema.columns "
-        "WHERE table_schema = DATABASE() AND table_name = '" + table + "' " +
+        "WHERE table_schema = DATABASE() AND table_name = '" + escaped_table + "' " +
         "ORDER BY ordinal_position";
     MysqlRows rows(conn, sql, error);
     if (!rows.ok()) {
@@ -223,10 +228,15 @@ bool introspect_columns(MYSQL* conn, const std::string& table, TableInfo* out,
 // - 普通索引（non_unique=1）：忽略。
 // 用 statistics 聚合判联合，绝不用 columns.column_key='UNI'（会误标联合唯一）。
 bool introspect_unique_indexes(MYSQL* conn, TableInfo* table, std::string* error) {
+    char esc_tbl[2 * table->name.size() + 1];
+    const unsigned long esc_len2 = mysql_real_escape_string_quote(
+        conn, esc_tbl, table->name.c_str(),
+        static_cast<unsigned long>(table->name.size()), '\'');
+    const std::string escaped_tbl(esc_tbl, esc_len2);
     const std::string sql =
         "SELECT index_name, column_name, sub_part, non_unique "
         "FROM information_schema.statistics "
-        "WHERE table_schema = DATABASE() AND table_name = '" + table->name + "' " +
+        "WHERE table_schema = DATABASE() AND table_name = '" + escaped_tbl + "' " +
         "ORDER BY index_name, seq_in_index";
     MysqlRows rows(conn, sql, error);
     if (!rows.ok()) {
@@ -362,7 +372,8 @@ DbStatus map_mysql_error(unsigned int errno_val, std::string* message,
 // ---------------------------------------------------------------------------
 // SQL 生成（对齐 sqlite_database 的模板策略：每表每操作每 where 列一条固定语句）
 // ---------------------------------------------------------------------------
-std::string select_sql(const TableInfo& table, const std::string& where_column) {
+std::string select_sql(const TableInfo& table, const std::string& where_column,
+                           bool lock_for_update = false) {
     std::string sql = "SELECT ";
     for (std::size_t i = 0; i < table.columns.size(); ++i) {
         if (i > 0) {
@@ -372,6 +383,9 @@ std::string select_sql(const TableInfo& table, const std::string& where_column) 
     }
     sql += " FROM " + quote_ident(table.name) +
            " WHERE " + quote_ident(where_column) + " = ?";
+    if (lock_for_update) {
+        sql += " FOR UPDATE";
+    }
     return sql;
 }
 
@@ -566,7 +580,9 @@ bool MysqlStmt::bind_result() {
                 b.buffer_type = MYSQL_TYPE_LONGLONG;
                 b.buffer = &s.iv;
                 b.buffer_length = sizeof(long long);
-                b.is_unsigned = false;
+                // Read UNSIGNED_FLAG to know if the column is unsigned.
+                s.is_unsigned = (f->flags & UNSIGNED_FLAG) != 0;
+                b.is_unsigned = static_cast<my_bool>(s.is_unsigned);
                 break;
             case MYSQL_TYPE_FLOAT:
             case MYSQL_TYPE_DOUBLE:
@@ -659,10 +675,18 @@ bool MysqlStmt::read_column(std::size_t i, const TableInfo& table, Value* out) {
     }
     const ValueKind kind = table.columns[i].kind;
     if (kind == ValueKind::kInteger) {
+        // Reject unsigned values that overflow int64_t.
+        if (s.is_unsigned && static_cast<unsigned long long>(s.iv) >
+                             static_cast<unsigned long long>(std::numeric_limits<std::int64_t>::max())) {
+            return false;
+        }
         *out = Value{static_cast<std::int64_t>(s.iv)};
         return true;
     }
     if (kind == ValueKind::kReal) {
+        if (s.error) {
+            return false;
+        }
         *out = Value{s.dv};
         return true;
     }
@@ -919,7 +943,50 @@ DbResult<RowCount> MysqlDatabase::do_update(const UpdateRequest& req) {
 
     // 读当前行。
     SelectRequest current{req.table, {}, req.where};
-    const DbResult<ResultSet> cur = do_select(current);
+    // Locking read: SELECT ... FOR UPDATE to prevent lost updates.
+    const std::string lock_key = "UPDSEL|" + req.table + "|" + req.where.column;
+    std::unique_ptr<MysqlStmt>* lock_holder = &cache_.get_or_create(lock_key, [this, &table, &req] {
+        return std::make_unique<MysqlStmt>(conn_, select_sql(*table, req.where.column, true));
+    });
+    MysqlStmt* lock_stmt = lock_holder->get();
+    if (lock_stmt != nullptr && !lock_stmt->valid()) {
+        *lock_holder = std::make_unique<MysqlStmt>(conn_, select_sql(*table, req.where.column, true));
+        lock_stmt = lock_holder->get();
+    }
+    if (lock_stmt == nullptr || !lock_stmt->valid()) {
+        return {DbStatus::kBackendError, 0,
+                lock_stmt != nullptr ? lock_stmt->error() : "null lock stmt"};
+    }
+    if (!lock_stmt->rebind_reset()) {
+        return {DbStatus::kBackendError, 0, lock_stmt->error()};
+    }
+    if (!lock_stmt->bind_params({req.where.value})) {
+        return {DbStatus::kBackendError, 0, lock_stmt->error()};
+    }
+    if (!lock_stmt->bind_result()) {
+        return {DbStatus::kBackendError, 0, lock_stmt->error()};
+    }
+    if (!lock_stmt->execute_read()) {
+        return {DbStatus::kBackendError, 0, lock_stmt->error()};
+    }
+    ResultSet lock_rs;
+    lock_rs.columns = table->columns;
+    if (table->columns.size() == 0) {
+        // no columns? treat as empty
+    }
+    if (lock_stmt->fetch_row()) {
+        std::vector<Value> lock_row;
+        lock_row.reserve(table->columns.size());
+        for (std::size_t i = 0; i < table->columns.size(); ++i) {
+            Value v;
+            if (!lock_stmt->read_column(i, *table, &v)) {
+                return {DbStatus::kBackendError, 0, "foreign data of wrong type in locking read"};
+            }
+            lock_row.push_back(std::move(v));
+        }
+        lock_rs.rows.push_back(std::move(lock_row));
+    }
+    const DbResult<ResultSet> cur{DbStatus::kOk, std::move(lock_rs), ""};
     if (cur.status != DbStatus::kOk) {
         return {cur.status, 0, cur.message};  // guard ROLLBACK
     }
@@ -963,7 +1030,14 @@ DbResult<RowCount> MysqlDatabase::do_update(const UpdateRequest& req) {
         return {status, 0, std::move(message)};  // guard ROLLBACK
     }
     guard.finished = true;
-    guard.commit = true;  // 写成功 → COMMIT
+    // Explicit COMMIT with error check (don't rely on guard destructor).
+    if (mysql_query(conn_, "COMMIT") != 0) {
+        guard.finished = true;
+        mysql_query(conn_, "ROLLBACK");
+        return {DbStatus::kBackendError, 0,
+                std::string("commit failed: ") + mysql_error(conn_)};
+    }
+    guard.finished = true;
     return {DbStatus::kOk, affected, ""};
 }
 

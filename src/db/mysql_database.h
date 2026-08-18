@@ -85,11 +85,12 @@ private:
     struct ReadSlot {
         long long iv{0};
         double dv{0.0};
-        std::vector<char> raw;   // 不定长（TEXT）缓冲，按列 max 长度预分配
+        std::vector<char> raw;   // text buffer, pre-allocated per column max length
         unsigned long length{0};
         bool is_null{false};
         bool error{false};
-    };
+        bool is_unsigned{false};
+    };;
     std::vector<ReadSlot> read_slots_;
     std::vector<MYSQL_BIND> read_binds_;
 

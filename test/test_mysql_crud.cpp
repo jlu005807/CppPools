@@ -344,10 +344,10 @@ int main() {
     if (mysql_real_connect(root, conn.host.c_str(), conn.user.c_str(),
                            conn.password.c_str(), nullptr,
                            static_cast<unsigned int>(conn.port), nullptr, 0) == nullptr) {
-        std::cerr << "[skip] cannot connect to mysql as " << conn.user << "@" << conn.host
+        std::cerr << "[fail] cannot connect to mysql as " << conn.user << "@" << conn.host
                   << ":" << conn.port << ": " << mysql_error(root) << std::endl;
         mysql_close(root);
-        return 0;
+        return 1;
     }
 
     // 建临时库 + 建表 + CRUD 断言，全部在作用域内完成。
