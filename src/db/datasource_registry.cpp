@@ -101,13 +101,14 @@ RegistryBuildResult DataSourceRegistry::build(
             cache = std::make_shared<RowCache>(rc);
         }
         const config::DataSourceConfig pool_cfg = cfg;  // 值拷贝：factory 捕获
-        ConnectionFactory factory = [pool_cfg, cache](std::size_t) -> std::unique_ptr<Database> {
+        const std::vector<std::string> cache_tables = cache_cfg.tables;
+        ConnectionFactory factory = [pool_cfg, cache, cache_tables](std::size_t) -> std::unique_ptr<Database> {
             DatabaseCreateResult result = create_database(pool_cfg);
             if (result.db == nullptr) {
                 return nullptr;  // 池 fail-fast
             }
             if (cache) {
-                return std::make_unique<CachingDatabase>(std::move(result.db), cache);
+                return std::make_unique<CachingDatabase>(std::move(result.db), cache, cache_tables);
             }
             return std::move(result.db);
         };

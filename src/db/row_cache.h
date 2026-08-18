@@ -113,12 +113,10 @@ public:
         std::lock_guard<std::mutex> lock(shard.mu);
         const auto it = shard.entries.find(k);
         if (it == shard.entries.end()) {
-            ++shard.stats.misses;
             return std::nullopt;
         }
         if (expired(shard, it->second)) {
             erase_entry(shard, it);
-            ++shard.stats.misses;
             return std::nullopt;
         }
         ++shard.stats.hits;
@@ -131,20 +129,31 @@ public:
         const std::string k = key.encode();
         Shard& shard = shard_of(k);
         std::lock_guard<std::mutex> lock(shard.mu);
-        put_locked(shard, k, std::move(row));
+        put_locked(shard, k, std::move(row), std::chrono::steady_clock::now());
     }
 
     // 失效：删条目 + 分片世代号 +1（无条件，见 spec 不变量 I0）。
     void invalidate(const RowCacheKey& key) {
         const std::string k = key.encode();
         Shard& shard = shard_of(k);
-        std::lock_guard<std::mutex> lock(shard.mu);
-        const auto it = shard.entries.find(k);
-        if (it != shard.entries.end()) {
-            erase_entry(shard, it);
+        std::shared_ptr<std::promise<std::optional<RowData>>> retired;
+        {
+            std::lock_guard<std::mutex> lock(shard.mu);
+            const auto it = shard.entries.find(k);
+            if (it != shard.entries.end()) {
+                erase_entry(shard, it);
+            }
+            const auto fit = shard.flights.find(k);
+            if (fit != shard.flights.end()) {
+                retired = fit->second.promise;
+                shard.flights.erase(fit);
+            }
+            ++shard.generation;
+            ++shard.stats.invalidations;
         }
-        ++shard.generation;
-        ++shard.stats.invalidations;
+        if (retired) {
+            retired->set_value(std::nullopt);
+        }
     }
 
     // 全量清空（归队 Rejoin，spec §5.2 规则 B：best-effort 优化）。
@@ -153,14 +162,22 @@ public:
     // 节流（10s 窗口）由服务端层负责，本方法自身幂等可重入。
     // const：与 set_enabled 同模式（registry 以 const 指针暴露缓存）。
     void clear() const {
+        std::vector<std::shared_ptr<std::promise<std::optional<RowData>>>> retired;
         for (const Shard& shard : shards_) {
             std::lock_guard<std::mutex> lock(shard.mu);
             shard.entries.clear();
             shard.lru.clear();
             shard.bytes = 0;
+            for (auto& [k, flight] : shard.flights) {
+                retired.push_back(flight.promise);
+            }
+            shard.flights.clear();
+            ++shard.generation;
         }
-        // flush 是缓存级事件（一次 clear 计一次，不按分片累加）。
         flushes_.fetch_add(1, std::memory_order_relaxed);
+        for (auto& p : retired) {
+            p->set_value(std::nullopt);
+        }
     }
 
     // 当前分片世代号（回填 CAS 用：回源前记录，回填时比对）。
@@ -193,17 +210,15 @@ public:
         if (fit != shard.flights.end()) {
             ++shard.stats.singleflight_merged;
             Flight f;
-            f.future = fit->second.second;
+            f.future = fit->second.future;
             f.leader = false;
             return f;
         }
         auto promise = std::make_shared<std::promise<std::optional<RowData>>>();
         auto shared = std::make_shared<std::shared_future<std::optional<RowData>>>(
             promise->get_future().share());
-        shard.flights.emplace(k, std::make_pair(std::move(promise), shared));
-        // 不在此计 miss：调用方（装饰器）必先经 get() 才到 join_flight，
-        // miss 已由 get() 计过一次 —— 再计即一次回源两条 miss（§8.1：
-        // misses = backed by DB read 的读，一次回源一条）。
+        shard.flights.emplace(k, Shard::FlightEntry{promise, shared, shard.generation});
+        ++shard.stats.misses;
         Flight f;
         f.future = shared;
         f.leader = true;
@@ -216,7 +231,8 @@ public:
     // 正是 spec §4.3.1 要防的"旧值遮蔽已成功的写"。
     // 世代不匹配 → 丢弃回填并计 backfill_dropped；返回是否实际入缓存。
     bool finish_flight(const RowCacheKey& key, std::optional<RowData> result,
-                       std::uint64_t expected_generation) {
+                       std::uint64_t expected_generation,
+                       std::chrono::steady_clock::time_point cached_at = std::chrono::steady_clock::now()) {
         const std::string k = key.encode();
         Shard& shard = shard_of(k);
         std::shared_ptr<std::promise<std::optional<RowData>>> promise;
@@ -224,13 +240,14 @@ public:
         {
             std::lock_guard<std::mutex> lock(shard.mu);
             const auto fit = shard.flights.find(k);
-            if (fit != shard.flights.end()) {
-                promise = fit->second.first;
+            if (fit != shard.flights.end() &&
+                fit->second.generation == expected_generation) {
+                promise = fit->second.promise;
                 shard.flights.erase(fit);
             }
             if (result.has_value()) {
                 if (shard.generation == expected_generation) {
-                    stored = put_locked(shard, k, *result);
+                    stored = put_locked(shard, k, *result, cached_at);
                 } else {
                     ++shard.stats.backfill_dropped;
                 }
@@ -290,13 +307,14 @@ private:
         mutable std::unordered_map<std::string, Entry> entries;
         mutable std::list<std::string> lru;  // 头部 = 最近使用
         mutable std::size_t bytes{0};
-        std::uint64_t generation{0};
+        mutable std::uint64_t generation{0};
         // 键 → (promise, shared_future)：leader 兑现，等待者共享。
-        std::unordered_map<
-            std::string,
-            std::pair<std::shared_ptr<std::promise<std::optional<RowData>>>,
-                      std::shared_ptr<std::shared_future<std::optional<RowData>>>>>
-            flights;
+        struct FlightEntry {
+            std::shared_ptr<std::promise<std::optional<RowData>>> promise;
+            std::shared_ptr<std::shared_future<std::optional<RowData>>> future;
+            std::uint64_t generation{0};
+        };
+        mutable std::unordered_map<std::string, FlightEntry> flights;
         ShardStats stats;
     };
 
@@ -359,7 +377,8 @@ private:
     }
 
     // put 的锁内主体（调用方持有 shard.mu）。返回是否实际入缓存。
-    bool put_locked(Shard& shard, const std::string& k, RowData row) {
+    bool put_locked(Shard& shard, const std::string& k, RowData row,
+                    std::chrono::steady_clock::time_point cached_at) {
         const std::size_t bytes = row_bytes(row);
         if (bytes > cfg_.max_entry_bytes) {
             ++shard.stats.bypass_too_large;
@@ -370,7 +389,7 @@ private:
             erase_entry(shard, it);
         }
         shard.lru.push_front(k);
-        shard.entries.emplace(k, Entry{std::move(row), std::chrono::steady_clock::now(),
+        shard.entries.emplace(k, Entry{std::move(row), cached_at,
                                        bytes, shard.lru.begin()});
         shard.bytes += bytes;
         evict_until_fit(shard);

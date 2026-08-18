@@ -192,13 +192,24 @@ bool introspect_columns(MYSQL* conn, const std::string& table, TableInfo* out,
         col.kind = kind;
         col.nullable = (is_nullable == "YES");
         col.primary_key = (column_key == "PRI");
-        // unique 的最终判定在 introspect_unique_indexes 里按索引聚合；
-        // 这里先按 column_key='PRI' 给 PK 标 unique（与 SQLite PK 口径一致）。
-        // 不用 column_key='UNI'：联合唯一索引每列都标 UNI，会误标（spec §五.2 坑1）。
-        col.unique = (column_key == "PRI");
+        // Composite PK columns are not unique per column; unique is set
+        // after the loop based on PK cardinality (single-column PK only).
+        col.unique = false;
         // autoincrement：仅显式 AUTO_INCREMENT 才算（MySQL 无 SQLite 的 rowid 魔法）。
         col.autoincrement = extra_upper.find("AUTO_INCREMENT") != std::string::npos;
         out->columns.push_back(std::move(col));
+    }
+    // Single-column PK → that column is unique; composite PK → none per column.
+    int pk_count = 0;
+    std::size_t pk_index = 0;
+    for (std::size_t i = 0; i < out->columns.size(); ++i) {
+        if (out->columns[i].primary_key) {
+            ++pk_count;
+            pk_index = i;
+        }
+    }
+    if (pk_count == 1) {
+        out->columns[pk_index].unique = true;
     }
     return true;
 }

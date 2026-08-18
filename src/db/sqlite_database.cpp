@@ -220,7 +220,7 @@ bool introspect_columns(sqlite3* db, const std::string& table, TableInfo* out,
         // PK 列按定义 NOT NULL（即使 PRAGMA 对 rowid 别名报 notnull=0）。
         col.nullable = (notnull == 0) && (pk == 0);
         col.primary_key = pk > 0;
-        col.unique = pk > 0;
+        col.unique = false;  // set after loop based on PK cardinality
         col.autoincrement = false;
         out->columns.push_back(std::move(col));
         if (pk > 0) {
@@ -239,6 +239,10 @@ bool introspect_columns(sqlite3* db, const std::string& table, TableInfo* out,
     if (pk_count == 1 && upper_copy(pk_declared) == "INTEGER") {
         out->columns[pk_index].autoincrement = true;
         out->columns[pk_index].nullable = false;
+    }
+    // A single-column PK is unique per column; composite PK columns are not.
+    if (pk_count == 1) {
+        out->columns[pk_index].unique = true;
     }
     return true;
 }
@@ -445,21 +449,32 @@ protected:
     DbResult<RowCount> do_update(const UpdateRequest& req) override {
         const TableInfo* table = schema_.find_table(req.table);
 
-        // 读改写（口径 D2）：先取当前行，缺省列以现值回填，
-        // 使 UPDATE 语句保持“每表每 where 列一条”的固定形态。
+        // Serialize read-modify-write with BEGIN IMMEDIATE so concurrent
+        // updates on the same row cannot lose columns.
+        char* errmsg = nullptr;
+        if (sqlite3_exec(db_, "BEGIN IMMEDIATE", nullptr, nullptr, &errmsg) != SQLITE_OK) {
+            std::string msg = errmsg ? errmsg : "BEGIN IMMEDIATE failed";
+            sqlite3_free(errmsg);
+            return {DbStatus::kBackendError, 0, std::move(msg)};
+        }
+
+        // Read current row for default backfill (D2 contract).
         SelectRequest current{req.table, {}, req.where};
         const DbResult<ResultSet> cur = do_select(current);
         if (cur.status != DbStatus::kOk) {
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
             return {cur.status, 0, cur.message};
         }
         if (cur.value.rows.empty()) {
-            return {DbStatus::kOk, 0, ""};  // 决策②：0 行影响不是错误
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+            return {DbStatus::kOk, 0, ""};
         }
         const std::vector<Value>& row = cur.value.rows[0];
 
         const std::string key = "UPD|" + req.table + "|" + req.where.column;
         SqliteStmt* stmt = stmt_for(key, update_sql(*table, req.where.column));
         if (!stmt->valid()) {
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
             return {DbStatus::kBackendError, 0, stmt->error()};
         }
         stmt->rebind_reset();
@@ -468,18 +483,27 @@ protected:
             const Value* given = find_value(req.set, table->columns[i].name);
             const Value& v = (given != nullptr) ? *given : row[i];
             if (stmt->bind_value(index, v) != SQLITE_OK) {
+                sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
                 return {DbStatus::kBackendError, 0, sqlite3_errmsg(db_)};
             }
             ++index;
         }
         if (stmt->bind_value(index, req.where.value) != SQLITE_OK) {
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
             return {DbStatus::kBackendError, 0, sqlite3_errmsg(db_)};
         }
         const int rc = stmt->step();
         if (rc != SQLITE_DONE) {
             std::string message;
             const DbStatus status = map_constraint_error(db_, &message);
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
             return {status, 0, std::move(message)};
+        }
+        if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &errmsg) != SQLITE_OK) {
+            std::string msg = errmsg ? errmsg : "COMMIT failed";
+            sqlite3_free(errmsg);
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+            return {DbStatus::kBackendError, 0, std::move(msg)};
         }
         return {DbStatus::kOk, static_cast<RowCount>(sqlite3_changes(db_)), ""};
     }

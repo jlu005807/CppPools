@@ -290,6 +290,99 @@ static void test_request_bypass_disables_reads_but_not_invalidation() {
     assert(std::get<std::string>(r2.value.rows[0][0]) == "bob");
 }
 
+
+// cache.tables whitelist: only listed tables get cache wrappers.
+static void test_table_allowlist_skips_non_listed_tables() {
+    register_sqlite_backend();
+    std::string path = std::string("/tmp/cpppools_allowlist_XXXXXX");
+    std::vector<char> buf(path.begin(), path.end());
+    buf.push_back(' ');
+    const int fd = mkstemp(buf.data());
+    assert(fd >= 0);
+    close(fd);
+    const std::string real_path(buf.data());
+
+    sqlite3* raw = nullptr;
+    assert(sqlite3_open(real_path.c_str(), &raw) == SQLITE_OK);
+    assert(sqlite3_exec(raw,
+        "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL);"
+        "CREATE TABLE audit(id INTEGER PRIMARY KEY, msg TEXT);",
+        nullptr, nullptr, nullptr) == SQLITE_OK);
+    assert(sqlite3_exec(raw,
+        "INSERT INTO users(id, name) VALUES(1, 'alice');"
+        "INSERT INTO audit(id, msg) VALUES(1, 'hello');",
+        nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(raw);
+
+    RowCacheConfig rc;
+    rc.ttl = std::chrono::seconds(60);
+    auto cache = std::make_shared<RowCache>(rc);
+
+    // Only "users" is cacheable; "audit" is not.
+    auto db = std::make_unique<CachingDatabase>(
+        make_sqlite(real_path, "main"), cache,
+        std::vector<std::string>{"users"});
+
+    // Read users: should miss and backfill (cacheable).
+    auto r1 = db->select(SelectRequest{"users", {}, where_id(1)});
+    assert(r1.status == DbStatus::kOk);
+    assert(std::get<std::string>(r1.value.rows[0][1]) == "alice");
+    assert(cache->stats().entries == 1);
+
+    // Read audit: should bypass cache entirely (not cacheable).
+    auto r2 = db->select(SelectRequest{"audit", {}, where_id(1)});
+    assert(r2.status == DbStatus::kOk);
+    assert(std::get<std::string>(r2.value.rows[0][1]) == "hello");
+    // Cache still has only 1 entry (users), no audit entry.
+    assert(cache->stats().entries == 1);
+
+    // Update audit: should not trigger any invalidation.
+    std::size_t inv0 = cache->stats().invalidations;
+    UpdateRequest upd{"audit", {{"msg", Value{std::string("world")}}}, where_id(1)};
+    assert(db->update(upd).status == DbStatus::kOk);
+    assert(cache->stats().invalidations == inv0);
+
+    // Read users again: should hit cache (not affected by audit update).
+    auto r3 = db->select(SelectRequest{"users", {}, where_id(1)});
+    assert(r3.status == DbStatus::kOk);
+    assert(cache->stats().hits >= 1);
+
+    db.reset();
+    std::remove(real_path.c_str());
+    std::remove((real_path + "-wal").c_str());
+    std::remove((real_path + "-shm").c_str());
+}
+
+
+// Full-row backfill: a narrow projection miss must cache the complete row,
+// so a later request for other columns returns real values, not NULLs.
+static void test_narrow_miss_backfills_full_row() {
+    SharedPair p("fullrow");
+    assert(p.a->insert(make_user(1, "alice", "t1")).status == DbStatus::kOk);
+
+    // First select: request only "name" (narrow projection miss).
+    const auto r1 = p.b->select(SelectRequest{"users", {"name"}, where_id(1)});
+    assert(r1.status == DbStatus::kOk);
+    assert(std::get<std::string>(r1.value.rows[0][0]) == "alice");
+    assert(p.cache->stats().entries == 1);
+
+    // Second select: request "id" and "rating" using the same key.
+    // This should be a cache hit, and the values must be real, not NULL.
+    const auto r2 = p.b->select(SelectRequest{"users", {"id", "rating"}, where_id(1)});
+    assert(r2.status == DbStatus::kOk);
+    assert(r2.value.rows.size() == 1);
+    assert(std::get<std::int64_t>(r2.value.rows[0][0]) == 1);
+    assert(std::holds_alternative<double>(r2.value.rows[0][1]));
+    assert(std::get<double>(r2.value.rows[0][1]) == 4.5);
+    assert(p.cache->stats().hits >= 1);
+
+    // Also verify a full-column select (empty columns) returns all values.
+    const auto r3 = p.b->select(SelectRequest{"users", {}, where_id(1)});
+    assert(r3.status == DbStatus::kOk);
+    assert(r3.value.columns.size() == 4);
+    assert(std::get<std::string>(r3.value.rows[0][1]) == "alice");
+}
+
 int main() {
     test_cross_connection_visibility_via_cache();
     test_write_through_invalidation_cross_connection();
@@ -300,5 +393,8 @@ int main() {
     test_decorator_preserves_backend_semantics();
     test_registry_slots_share_one_cache();
     test_request_bypass_disables_reads_but_not_invalidation();
+    test_table_allowlist_skips_non_listed_tables();
+    test_narrow_miss_backfills_full_row();
     return 0;
 }
+

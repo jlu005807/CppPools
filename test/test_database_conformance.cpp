@@ -22,6 +22,8 @@
 #include <string>
 #include <unistd.h>
 #include <vector>
+#include <atomic>
+#include <thread>
 
 using namespace cpppools::db;
 namespace config = cpppools::config;
@@ -59,6 +61,7 @@ int seed_schema(const std::string& path) {
         "  tag TEXT UNIQUE"
         ");"
         "CREATE TABLE pairs(a INTEGER, b INTEGER, UNIQUE(a, b));"
+        "CREATE TABLE pk_pairs(a INTEGER, b INTEGER, PRIMARY KEY(a, b));"
         "CREATE TABLE nums(id INTEGER PRIMARY KEY, v NUMERIC);";
     char* err = nullptr;
     const int rc = sqlite3_exec(raw, ddl, nullptr, nullptr, &err);
@@ -146,7 +149,7 @@ static void test_introspection() {
 
     assert(s.has_table("users"));
     assert(s.has_table("pairs"));
-    assert(s.table_names().size() == 3);
+    assert(s.table_names().size() == 4);
 
     // id: INTEGER PRIMARY KEY = rowid 别名 → 口径 D5：
     // nullable=false（拒绝显式 NULL）、autoincrement=true、unique。
@@ -625,6 +628,78 @@ static void test_schema_change_recovers_invalid_statement() {
     assert(std::get<std::string>(r2.value.rows[0][1]) == "bob");
 }
 
+
+// Composite primary key: columns should have primary_key=true but unique=false.
+// Selecting by a single PK column should fail (not a unique where clause).
+static void test_composite_primary_key_not_unique_per_column() {
+    if (g_with_cache) return;
+
+    TempDb t = open_seeded_db("compound_pk");
+    const Schema& sch = t.db->schema();
+    const TableInfo* tbl = sch.find_table("pk_pairs");
+    assert(tbl != nullptr);
+    for (const auto& col : tbl->columns) {
+        assert(col.primary_key);
+        assert(!col.unique && "composite PK columns must not be marked unique per column");
+    }
+    // Selecting by only column "a" should be rejected: not a unique where clause.
+    const auto r = t.db->select(SelectRequest{"pk_pairs", {}, WhereClause{"a", Value{std::int64_t(1)}}});
+    assert(r.status == DbStatus::kInvalidRequest);
+}
+
+
+// Two-connection concurrent update: both column changes must be preserved.
+// SQLite in WAL mode allows concurrent readers, but do_update does a
+// read-then-write. BEGIN IMMEDIATE serializes the read-modify-write so
+// neither update is lost.
+static void test_concurrent_update_preserves_both_columns() {
+    if (g_with_cache) return;
+
+    TempDb t = open_seeded_db("conc");
+    assert(t.db->insert(make_user("alice", 30, 90.0, "t1")).status == DbStatus::kOk);
+
+    // Open a second independent connection to the same file.
+    config::DataSourceConfig cfg2;
+    cfg2.name = "conc2";
+    cfg2.type = "sqlite";
+    cfg2.sqlite_path = t.path;
+    DatabaseCreateResult r2 = make_sqlite_database(cfg2);
+    assert(r2.db != nullptr);
+    std::unique_ptr<Database> db2 = std::move(r2.db);
+
+    std::atomic<bool> go{false};
+    auto worker = [&go](Database* db, const std::string& col, const Value& v) {
+        while (!go.load()) { /* spin-wait on barrier */ }
+        UpdateRequest upd{"users", {{col, v}}, where_id(1)};
+        db->update(upd);
+    };
+
+    std::thread t1(worker, t.db.get(), "age", Value{std::int64_t{31}});
+    std::thread t2(worker, db2.get(), "score", Value{95.5});
+    go.store(true);
+    t1.join();
+    t2.join();
+
+    // Read the final row and verify both columns reflect their updates.
+    const auto result = t.db->select(SelectRequest{"users", {}, where_id(1)});
+    assert(result.status == DbStatus::kOk);
+    assert(!result.value.rows.empty());
+    const auto& row = result.value.rows[0];
+    // Find the age and score columns.
+    std::int64_t age = 0;
+    double score = 0.0;
+    for (std::size_t i = 0; i < result.value.columns.size(); ++i) {
+        if (result.value.columns[i] == "age" && i < row.size()) {
+            if (auto* p = std::get_if<std::int64_t>(&row[i])) age = *p;
+        }
+        if (result.value.columns[i] == "score" && i < row.size()) {
+            if (auto* p = std::get_if<double>(&row[i])) score = *p;
+        }
+    }
+    assert(age == 31 && "age column must reflect update from connection 1");
+    assert(score == 95.5 && "score column must reflect update from connection 2");
+}
+
 }  // namespace
 
 // CRUD 语义子集：两遍跑同一批用例（裸后端 / 套装饰器，spec §9）。
@@ -650,6 +725,8 @@ static void run_all_cases() {
     test_partial_unique_index_not_marked_unique();
     test_foreign_data_read_is_controlled();
     test_schema_change_recovers_invalid_statement();
+    test_composite_primary_key_not_unique_per_column();
+    test_concurrent_update_preserves_both_columns();
 }
 
 int main() {

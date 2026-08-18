@@ -30,10 +30,12 @@ namespace cpppools::db {
 // - 失效永不 bypass：kill-switch 关闭时读直通内层，但写的失效仍执行。
 class CachingDatabase : public Database {
 public:
-    CachingDatabase(std::unique_ptr<Database> inner, std::shared_ptr<RowCache> cache)
+    CachingDatabase(std::unique_ptr<Database> inner, std::shared_ptr<RowCache> cache,
+                    std::vector<std::string> cache_tables = {})
         : Database(inner->schema(), inner->name()),
           inner_(std::move(inner)),
-          cache_(std::move(cache)) {}
+          cache_(std::move(cache)),
+          cache_tables_(std::move(cache_tables)) {}
 
     bool healthy() override { return inner_->healthy(); }
     std::string backend_type() const override { return inner_->backend_type(); }
@@ -48,7 +50,7 @@ protected:
     DbResult<ResultSet> do_select(const SelectRequest& req) override {
         // bypass 四态：缓存关闭 / kill-switch / per-request 门控（非 owner
         // 就地处理或 epoch 不匹配，spec §5.2 规则 A / §5.4）/ REAL 键列。
-        if (cache_ == nullptr || !cache_->enabled() || bypass_) {
+        if (cache_ == nullptr || !cache_->enabled() || bypass_ || !cacheable_table(req.table)) {
             return inner_->select(req);  // 内层 public：校验幂等
         }
         const ColumnInfo* where_col = schema_.find_column(req.table, req.where.column);
@@ -85,24 +87,35 @@ protected:
             }
         } guard{cache_.get(), key, seq0};
 
-        DbResult<ResultSet> result = inner_->select(req);
+        // Always read the full row so later requests for other columns get real values.
+        // Record the read-start time so TTL begins at source-read initiation.
+        const auto read_started = std::chrono::steady_clock::now();
+        SelectRequest full = req;
+        full.columns.clear();
+        DbResult<ResultSet> result = inner_->select(full);
         if (result.status == DbStatus::kOk && !result.value.rows.empty()) {
             RowData row = to_row_data(result);
             // 世代比对在 finish_flight 的临界区内与写入原子完成；
             // 被拦下的回填由 RowCache 计 backfill_dropped（§8.1 导出）。
-            cache_->finish_flight(key, std::move(row), seq0);
+            cache_->finish_flight(key, std::move(row), seq0, read_started);
         } else {
-            cache_->finish_flight(key, std::nullopt, seq0);
+            cache_->finish_flight(key, std::nullopt, seq0, read_started);
         }
         guard.finished = true;
+        if (result.status == DbStatus::kOk && !result.value.rows.empty()) {
+            return project_result(req, result);
+        }
         return result;
     }
 
     DbResult<InsertResult> do_insert(const InsertRequest& req) override {
         // 双删前置删（spec §4.3）：落库前先失效新行可达的唯一键，
         // 覆盖"读回填 → 写落库"窗口内的并发回填（rowid 复用复活旧条目场景）。
-        invalidate_unique_keys(req.table, req.values);
+        if (cacheable_table(req.table)) {
+            invalidate_unique_keys(req.table, req.values);
+        }
         DbResult<InsertResult> result = inner_->insert(req);
+        if (result.status == DbStatus::kOk && !cacheable_table(req.table)) return result;
         if (result.status == DbStatus::kOk) {
             // 后置删：失效新行可达的全部唯一键（含自增 id）。
             const TableInfo* table = schema_.find_table(req.table);
@@ -126,9 +139,12 @@ protected:
 
     DbResult<RowCount> do_update(const UpdateRequest& req) override {
         // 双删前置删（spec §4.3）。
-        cache_->invalidate(RowCacheKey{name(), req.table, req.where.column,
-                                       req.where.value});
+        if (cacheable_table(req.table)) {
+            cache_->invalidate(RowCacheKey{name(), req.table, req.where.column,
+                                           req.where.value});
+        }
         DbResult<RowCount> result = inner_->update(req);
+        if (result.status == DbStatus::kOk && !cacheable_table(req.table)) return result;
         if (result.status == DbStatus::kOk) {
             // 后置删（无条件执行，I0）：0 行更新未改 DB，本可不失效，
             // 此处口径取宽 —— 方向安全，代价仅失效计数放大。
@@ -151,9 +167,12 @@ protected:
 
     DbResult<RowCount> do_remove(const DeleteRequest& req) override {
         // 双删前置删（spec §4.3）。
-        cache_->invalidate(RowCacheKey{name(), req.table, req.where.column,
-                                       req.where.value});
+        if (cacheable_table(req.table)) {
+            cache_->invalidate(RowCacheKey{name(), req.table, req.where.column,
+                                           req.where.value});
+        }
         DbResult<RowCount> result = inner_->remove(req);
+        if (result.status == DbStatus::kOk && !cacheable_table(req.table)) return result;
         if (result.status == DbStatus::kOk) {
             cache_->invalidate(RowCacheKey{name(), req.table, req.where.column,
                                            req.where.value});
@@ -182,6 +201,35 @@ private:
 
     // 命中路径：整行条目 → 按请求列投影（复现三条可观测语义：
     // 投影顺序 = 请求顺序；重复列不去重；全列 = schema 顺序且空行也带列名）。
+    // Project a full-row result down to the requested columns.
+    DbResult<ResultSet> project_result(const SelectRequest& req, DbResult<ResultSet>& full) const {
+        if (req.columns.empty()) {
+            return {full.status, std::move(full.value), full.message};
+        }
+        ResultSet rs;
+        rs.columns = req.columns;
+        if (!full.value.rows.empty()) {
+            const auto& src_row = full.value.rows[0];
+            std::vector<Value> picked;
+            picked.reserve(req.columns.size());
+            for (const auto& col : req.columns) {
+                bool found = false;
+                for (std::size_t i = 0; i < full.value.columns.size(); ++i) {
+                    if (full.value.columns[i] == col && i < src_row.size()) {
+                        picked.push_back(src_row[i]);
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    picked.push_back(Value{});
+                }
+            }
+            rs.rows.push_back(std::move(picked));
+        }
+        return {full.status, std::move(rs), full.message};
+    }
+
     DbResult<ResultSet> make_hit(const SelectRequest& req, RowData&& row) const {
         auto find_cell = [&row](const std::string& col) -> const Value* {
             for (const auto& [name, v] : row) {
@@ -239,8 +287,17 @@ private:
 
     std::unique_ptr<Database> inner_;
     std::shared_ptr<RowCache> cache_;
+    std::vector<std::string> cache_tables_;
     // per-request 门控标志（handler 借出期间置位/复位，线程独占无竞态）。
     bool bypass_{false};
+
+    bool cacheable_table(const std::string& table) const {
+        if (cache_tables_.empty()) return true;
+        for (const auto& t : cache_tables_) {
+            if (t == table) return true;
+        }
+        return false;
+    }
 };
 
 }  // namespace cpppools::db

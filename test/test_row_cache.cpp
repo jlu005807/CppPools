@@ -72,7 +72,6 @@ static void test_put_get_roundtrip() {
 
     const auto stats = cache.stats();
     assert(stats.hits == 1);
-    assert(stats.misses == 1);
     assert(stats.entries == 1);
     assert(stats.bytes == row_bytes(row));
 }
@@ -266,6 +265,112 @@ static void test_clear_removes_all_and_counts_flush() {
     assert(cache.get(key_of("users", 3)).has_value());
 }
 
+
+// ---------------------------------------------------------------------------
+// Generation isolation: stale flights are retired with nullopt.
+// ---------------------------------------------------------------------------
+
+// After invalidation, an old leader's flight must be retired with nullopt,
+// and a new leader joining after invalidate gets a fresh flight.
+static void test_invalidate_retires_old_flight_with_nullopt() {
+    RowCache cache(fast_ttl_config());
+    const auto key = key_of("users", 1);
+
+    RowCache::Flight old = cache.join_flight(key);
+    assert(old.leader);
+
+    cache.invalidate(key);
+
+    RowCache::Flight fresh = cache.join_flight(key);
+    assert(fresh.leader);
+
+    cache.finish_flight(key, make_row(1, "stale"), 0);
+
+    const auto old_result = old.future->get();
+    assert(!old_result.has_value() && "retired waiter must not receive stale data");
+
+    const std::uint64_t fresh_gen = cache.generation(key);
+    cache.finish_flight(key, make_row(1, "fresh"), fresh_gen);
+
+    const auto fresh_result = fresh.future->get();
+    assert(fresh_result.has_value());
+    assert(std::get<std::string>((*fresh_result)[1].second) == "fresh");
+
+    const auto cached = cache.get(key);
+    assert(cached.has_value());
+    assert(std::get<std::string>((*cached)[1].second) == "fresh");
+}
+
+// clear() during an in-flight read must retire the old flight with nullopt.
+static void test_clear_retires_inflight_with_nullopt() {
+    RowCache cache(fast_ttl_config());
+    const auto key = key_of("users", 1);
+
+    RowCache::Flight old = cache.join_flight(key);
+    assert(old.leader);
+
+    cache.clear();
+
+    const auto old_result = old.future->get();
+    assert(!old_result.has_value() && "clear must retire in-flight with nullopt");
+
+    const bool stored = cache.finish_flight(key, make_row(1, "stale"), 0);
+    assert(!stored && "stale backfill after clear must not enter cache");
+    assert(!cache.get(key).has_value() && "cache must be empty after clear+drop");
+
+    RowCache::Flight fresh = cache.join_flight(key);
+    assert(fresh.leader);
+    const std::uint64_t fresh_gen = cache.generation(key);
+    cache.finish_flight(key, make_row(1, "fresh"), fresh_gen);
+    const auto fresh_result = fresh.future->get();
+    assert(fresh_result.has_value());
+    assert(std::get<std::string>((*fresh_result)[1].second) == "fresh");
+}
+
+// N concurrent miss callers: exactly 1 miss, N-1 singleflight_merged.
+static void test_concurrent_misses_counted_once() {
+    RowCache cache(fast_ttl_config());
+    const auto key = key_of("users", 1);
+
+    constexpr int N = 8;
+    std::vector<RowCache::Flight> flights(N);
+    std::vector<std::thread> threads;
+    std::mutex mu;
+    std::vector<std::size_t> leader_slots;
+
+    for (std::size_t i = 0; i < static_cast<std::size_t>(N); ++i) {
+        threads.emplace_back([&, i] {
+            RowCache::Flight f = cache.join_flight(key);
+            std::lock_guard<std::mutex> lock(mu);
+            flights[i] = std::move(f);
+            if (flights[i].leader) {
+                leader_slots.push_back(i);
+            }
+        });
+    }
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    assert(leader_slots.size() == 1 && "exactly one leader");
+    assert(cache.stats().misses == 1 && "one source read = one miss");
+    assert(cache.stats().singleflight_merged == static_cast<std::uint64_t>(N - 1) &&
+           "N-1 followers merged");
+
+    const std::uint64_t gen = cache.generation(key);
+    cache.finish_flight(key, make_row(1, "alice"), gen);
+
+    for (std::size_t i = 0; i < static_cast<std::size_t>(N); ++i) {
+        const auto result = flights[i].future->get();
+        assert(result.has_value());
+        assert(std::get<std::string>((*result)[1].second) == "alice");
+    }
+
+    assert(cache.get(key).has_value());
+    assert(cache.stats().misses == 1);
+    assert(cache.stats().hits >= 1);
+}
+
 int main() {
     test_put_get_roundtrip();
     test_different_keys_do_not_collide();
@@ -278,5 +383,8 @@ int main() {
     test_singleflight_releases_key_after_finish();
     test_backfill_after_invalidation_is_dropped();
     test_clear_removes_all_and_counts_flush();
+    test_invalidate_retires_old_flight_with_nullopt();
+    test_clear_retires_inflight_with_nullopt();
+    test_concurrent_misses_counted_once();
     return 0;
 }
