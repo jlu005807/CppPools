@@ -158,6 +158,13 @@ static void test_reset_exception_destroys_object_and_rolls_back() {
            "若为 3，说明抛异常的对象被放回了 free_list 又被借出");
     assert(obj->value == 0 && "扩容出的必须是全新构造的对象");
     assert(pool.total_size() == 1);
+
+    // Strengthened: reset exception must not inflate acquire_failed_total.
+    // It is a task exception, not a pool rejection.
+    const AcquireStats stats = pool.stats();
+    assert(stats.acquire_total == 2 && "two acquire calls were made");
+    assert(stats.acquire_failed_total == 0 && "reset exception must not count as pool rejection");
+    assert(stats.peak_in_use == 1 && "peak should reflect the successful second acquire");
 }
 
 // ---------------------------------------------------------------------------

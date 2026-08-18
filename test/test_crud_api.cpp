@@ -352,6 +352,15 @@ static void test_non_string_datasource_is_400() {
 // /api/v1/schema：自省快照（不暴露后端 type）
 // ---------------------------------------------------------------------------
 
+static void test_unsigned_overflow_is_400() {
+    // 9223372036854775808 == INT64_MAX + 1; exceeds int64_t range.
+    Fixture f;
+    const auto resp = f.post("/api/v1/insert",
+                             R"({"table":"orders","values":{"amount":9223372036854775808}})");
+    assert(resp.status_code == 400);
+    assert(contains(resp.body, "out of range"));
+}
+
 static void test_schema_endpoint() {
     Fixture f;
     const auto resp = f.get("/api/v1/schema");
@@ -380,6 +389,7 @@ int main() {
     test_malformed_requests_are_400();
     test_validation_pipeline_rejections_are_400();
     test_overflow_number_is_400_not_500();
+    test_unsigned_overflow_is_400();
     test_missing_notnull_column_is_400();
     test_invalid_utf8_text_is_replaced_not_500();
     test_non_string_datasource_is_400();

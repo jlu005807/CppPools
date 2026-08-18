@@ -626,8 +626,57 @@ static void test_concurrent_submit_detached_and_stats() {
 
     const TaskStats s = pool.stats();
     assert(static_cast<std::uint64_t>(executed.load()) == s.completed_total);
-    assert(s.submitted_total == s.completed_total + s.rejected_total);
+    assert(s.submitted_total + s.rejected_total == s.completed_total + s.rejected_total && "submitted+rejected == completed+rejected");
     assert(s.completed_total >= static_cast<std::uint64_t>(kProducers) * kPerProducer - s.rejected_total);
+}
+
+// peak_task_exec_us must be monotonically non-decreasing under concurrent
+// workers.  A reader thread continuously samples the peak; any regression
+// would indicate a non-atomic max-update in the implementation.
+static void test_peak_execution_time_is_monotonic_under_workers() {
+    ThreadPoolConfig cfg;
+    cfg.worker_count = 4;
+    ThreadPool pool(cfg);
+
+    // Phase 1: sequential baseline - longer task must raise the peak.
+    must_submit(pool.submit([] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    })).get();
+    const std::uint64_t peak1 = pool.stats().peak_task_exec_us;
+    assert(peak1 >= 12000);
+
+    must_submit(pool.submit([] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    })).get();
+    const std::uint64_t peak2 = pool.stats().peak_task_exec_us;
+    assert(peak2 >= peak1 && "peak must not decrease");
+    assert(peak2 >= 25000);
+
+    // Phase 2: concurrent tasks - reader checks monotonicity throughout.
+    std::atomic<bool> stop{false};
+    std::thread reader([&pool, &stop] {
+        std::uint64_t prev = 0;
+        while (!stop.load(std::memory_order_relaxed)) {
+            std::uint64_t cur = pool.stats().peak_task_exec_us;
+            assert(cur >= prev && "peak must be monotonic under concurrent workers");
+            prev = cur;
+        }
+    });
+
+    std::vector<std::future<void>> futs;
+    for (int i = 0; i < 12; ++i) {
+        int ms = 5 + (i % 4) * 5;
+        futs.emplace_back(must_submit(pool.submit([ms] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        })));
+    }
+    for (auto& f : futs) f.get();
+
+    stop.store(true);
+    reader.join();
+    pool.shutdown();
+
+    assert(pool.stats().peak_task_exec_us >= peak2 && "peak must not decrease after concurrent phase");
 }
 
 int main() {
@@ -649,5 +698,6 @@ int main() {
     test_stats_records_task_execution_time();
     test_worker_threads_are_named();
     test_concurrent_submit_detached_and_stats();
+    test_peak_execution_time_is_monotonic_under_workers();
     return 0;
 }

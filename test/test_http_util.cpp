@@ -170,6 +170,17 @@ static void test_json_escape() {
     assert(json_escape(std::string(1, '\x01')) == "\\u0001");
 }
 
+// ---------- prometheus_label_escape ----------
+static void test_prometheus_label_escape() {
+    assert(prometheus_label_escape("plain") == "plain");
+    assert(prometheus_label_escape("say\"hi\"") == "say\\\"hi\\\"");
+    assert(prometheus_label_escape("back\\slash") == "back\\\\slash");
+    assert(prometheus_label_escape("line\nbreak") == "line\\nbreak");
+    assert(prometheus_label_escape("") == "");
+    assert(prometheus_label_escape("a\"b\\c\n") == "a\\\"b\\\\c\\n");
+    assert(prometheus_label_escape("pool_1") == "pool_1");
+}
+
 // ---------- route_table ----------
 
 static void test_route_match_success() {
@@ -350,6 +361,7 @@ int main() {
     test_parse_int_non_negative();
     test_percentile_edges();
     test_json_escape();
+    test_prometheus_label_escape();
     test_route_match_success();
     test_route_method_mismatch_is_distinct_from_missing();
     test_route_write_endpoints_are_post();

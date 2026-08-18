@@ -15,6 +15,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -85,6 +86,13 @@ bool json_to_value(const njson& j, Value* out, std::string* error) {
         return true;
     }
     if (j.is_number_integer() || j.is_number_unsigned()) {
+        if (j.is_number_unsigned()) {
+            const auto u = j.get<std::uint64_t>();
+            if (u > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+                *error = "integer value out of range (exceeds INT64_MAX)";
+                return false;
+            }
+        }
         *out = Value{j.get<std::int64_t>()};
         return true;
     }

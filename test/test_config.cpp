@@ -207,6 +207,18 @@ static void test_resolve_config_path_precedence() {
 
     assert(resolve_config_path(1, argv_with_flag) == "config/cpppools.json");
 }
+static void test_resolve_config_path_missing_arg_throws() {
+    const char* argv[] = {"cpppools_server", "--config"};
+    bool threw = false;
+    try {
+        resolve_config_path(2, argv);
+    } catch (const std::invalid_argument& ex) {
+        threw = true;
+        assert(std::string(ex.what()).find("--config") != std::string::npos);
+        assert(std::string(ex.what()).find("path") != std::string::npos);
+    }
+    assert(threw && "--config without a path must throw invalid_argument");
+}
 
 static void test_zero_pool_size_fails() {
     const std::string path = write_tmp_config(R"({
@@ -446,6 +458,7 @@ int main() {
     test_multiple_defaults_fail();
     test_server_defaults_apply();
     test_resolve_config_path_precedence();
+    test_resolve_config_path_missing_arg_throws();
     test_zero_pool_size_fails();
     test_field_type_errors_fail_with_message();
     test_negative_numbers_fail();

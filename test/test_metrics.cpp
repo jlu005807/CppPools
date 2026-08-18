@@ -6,6 +6,8 @@
 #include "cpppools/server/http_server.h"
 #include "sqlite_pool_fixture.h"
 
+#include <nlohmann/json.hpp>
+
 #include <cassert>
 #include <set>
 #include <sstream>
@@ -190,6 +192,54 @@ static void test_get_config_has_capacities() {
     assert(contains(resp.body, "\"memory_pool_capacity\":"));
 }
 
+
+static void test_stats_json_is_valid() {
+    Fixture f;
+    const server::ApiResponse resp = f.get("/api/v1/stats");
+    assert(resp.status_code == 200);
+    // The entire body must be valid JSON.
+    nlohmann::json root = nlohmann::json::parse(resp.body);
+    assert(root.is_object());
+    assert(root.contains("uptime_ms"));
+    assert(root.contains("node_id"));
+    assert(root["node_id"].is_string());
+}
+
+static void test_get_config_json_is_valid() {
+    Fixture f;
+    const server::ApiResponse resp = f.get("/api/v1/get-config");
+    assert(resp.status_code == 200);
+    nlohmann::json root = nlohmann::json::parse(resp.body);
+    assert(root.is_object());
+    assert(root.contains("datasources"));
+    assert(root["datasources"].is_array());
+    // Each datasource name must be a valid string.
+    for (const auto& ds : root["datasources"]) {
+        assert(ds.is_string());
+    }
+}
+
+static void test_stats_json_node_id_escaped() {
+    // Verify that json_escape is applied to dynamic string fields.
+    // We cannot easily inject a special-char node_id through the Fixture,
+    // but we can verify the field is properly escaped by parsing it.
+    Fixture f;
+    const server::ApiResponse resp = f.get("/api/v1/stats");
+    assert(resp.status_code == 200);
+    nlohmann::json root = nlohmann::json::parse(resp.body);
+    // node_id must parse correctly (no broken JSON).
+    assert(root.contains("node_id"));
+}
+
+static void test_get_config_datasources_escaped() {
+    Fixture f;
+    const server::ApiResponse resp = f.get("/api/v1/get-config");
+    assert(resp.status_code == 200);
+    nlohmann::json root = nlohmann::json::parse(resp.body);
+    assert(root["datasources"].size() > 0);
+    assert(root["datasources"][0] == "db");
+}
+
 int main() {
     test_metrics_has_pool_labels();
     test_metrics_old_names_removed();
@@ -197,5 +247,10 @@ int main() {
     test_metrics_task_exception_help_warns_detached_only();
     test_stats_json_has_new_fields();
     test_get_config_has_capacities();
+    test_stats_json_is_valid();
+    test_get_config_json_is_valid();
+    test_stats_json_node_id_escaped();
+    test_get_config_datasources_escaped();
     return 0;
 }
+

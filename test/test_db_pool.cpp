@@ -516,6 +516,38 @@ static void test_stats_concurrent_with_acquire() {
     reader.join();
 }
 
+// When one slot fails rebuild (empty slot preserved), acquire must advance
+// to the next free slot rather than blocking or spinning on the failed one.
+// This freezes the proven "try all untried slots" behavior.
+static void test_acquire_advances_past_a_failed_slot() {
+    reset_fake_state();
+    std::atomic<int> created{0};
+    std::atomic<int> factory_calls{0};
+    auto flaky = [&](std::size_t) -> std::unique_ptr<Database> {
+        int n = factory_calls.fetch_add(1);
+        if (n == 2) {
+            return nullptr;
+        }
+        created.fetch_add(1);
+        return std::make_unique<FakeDatabase>();
+    };
+    DbConnectionPool pool("advance", flaky, 2, 0ms);
+    assert(created.load() == 2);
+
+    auto* a = pool.acquire(10ms);
+    auto* b = pool.acquire(10ms);
+    pool.release(a);
+    pool.release(b);
+
+    FakeDatabase::healthy_flag.store(false);
+    auto* c = pool.acquire(500ms);
+    assert(c != nullptr && "acquire must advance past the failed slot");
+    assert(created.load() == 3 && "only one rebuild should succeed");
+    assert(pool.rebuild_failed_total() == 1);
+    assert(pool.rebuild_total() == 1);
+    pool.release(c);
+}
+
 int main() {
     test_constructor_rejects_invalid_arguments();
     test_construction_fails_fast_when_factory_fails();
@@ -533,5 +565,6 @@ int main() {
     test_stats_concurrent_with_acquire();
     test_stats_reports_consistent_snapshot();
     test_stats_reflects_degraded_pool();
+    test_acquire_advances_past_a_failed_slot();
     return 0;
 }

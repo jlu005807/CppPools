@@ -160,6 +160,20 @@ std::string json_escape(std::string_view s) {
     return out;
 }
 
+std::string prometheus_label_escape(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (const char c : s) {
+        switch (c) {
+            case '\\': out += "\\\\"; break;
+            case '"':  out += "\\\""; break;
+            case '\n': out += "\\n";  break;
+            default:   out += c; break;
+        }
+    }
+    return out;
+}
+
 double percentile_nearest_rank(const std::vector<double>& sorted, double p) {
     if (sorted.empty()) {
         return 0.0;

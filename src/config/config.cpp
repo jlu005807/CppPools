@@ -70,6 +70,9 @@ std::string resolve_config_path(int argc, const char* const* argv) {
     if (argc >= 3 && argv != nullptr && std::string(argv[1]) == "--config") {
         return argv[2];
     }
+    if (argc >= 2 && argv != nullptr && std::string(argv[1]) == "--config") {
+        throw std::invalid_argument("--config requires a path argument");
+    }
     if (const char* env = std::getenv("CPPPOOLS_CONFIG"); env != nullptr && env[0] != '\0') {
         return env;
     }

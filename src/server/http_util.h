@@ -78,6 +78,11 @@ std::optional<int> parse_int_non_negative(std::string_view s);
 // 若不转义可能产出非法 JSON。
 std::string json_escape(std::string_view s);
 
+// Escape a string for safe use as a Prometheus label value.
+// Backslash, double-quote, and newline are the characters that must be
+// escaped per the Prometheus exposition format.
+std::string prometheus_label_escape(std::string_view s);
+
 // 最近邻秩法分位数（Nearest Rank）。入参必须已升序排序。
 // 空输入返回 0.0。
 double percentile_nearest_rank(const std::vector<double>& sorted, double p);

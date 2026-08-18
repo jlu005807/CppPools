@@ -842,7 +842,7 @@ ApiResponse HttpServer::handle_metrics() const {
     // ===== 线程池（TaskStats）=====
     // 命名约定与其他池一致（counter 带 _total、峰值带 peak_），但形状不同：
     // 线程池不是“借→还”池，不复用 AcquireStats（见 spec §7）。
-    const std::string tp_label = "{pool=\"" + tps.name + "\"}";
+    const std::string tp_label = "{pool=\"" + prometheus_label_escape(tps.name) + "\"}";
     out << "# HELP cpppools_thread_pool_workers Configured worker thread count.\n"
         << "# TYPE cpppools_thread_pool_workers gauge\n"
         << "cpppools_thread_pool_workers" << tp_label << " " << tps.worker_count << "\n"
@@ -881,7 +881,7 @@ ApiResponse HttpServer::handle_metrics() const {
     // 空槽语义：available 含重建失败的空槽；size 只数存活连接/对象，
     // 因此 DbPool 的等式是 in_use + available == capacity、size <= capacity。
     const auto emit_acquire_family = [&out](const pool::AcquireStats& s) {
-        const std::string label = "{pool=\"" + s.name + "\"}";
+        const std::string label = "{pool=\"" + prometheus_label_escape(s.name) + "\"}";
         out << "cpppools_pool_capacity" << label << " " << s.capacity << "\n"
             << "cpppools_pool_size" << label << " " << s.size << "\n"
             << "cpppools_pool_in_use" << label << " " << s.in_use << "\n"
@@ -923,7 +923,7 @@ ApiResponse HttpServer::handle_metrics() const {
            "(slot kept empty for self-healing).\n"
         << "# TYPE cpppools_db_pool_rebuild_failed_total counter\n";
     for (const auto& dps : db_stats) {
-        const std::string db_label = "{pool=\"" + dps.base.name + "\"}";
+        const std::string db_label = "{pool=\"" + prometheus_label_escape(dps.base.name) + "\"}";
         out << "cpppools_db_pool_invalid_release_total" << db_label << " " << dps.invalid_release_total << "\n"
             << "cpppools_db_pool_rebuild_total" << db_label << " " << dps.rebuild_total << "\n"
             << "cpppools_db_pool_rebuild_failed_total" << db_label << " " << dps.rebuild_failed_total << "\n";
@@ -954,7 +954,7 @@ ApiResponse HttpServer::handle_metrics() const {
             << "# TYPE cpppools_cache_flush_total counter\n";
         for (const auto& [name, cache] : cache_list) {
             const RowCacheStats cs = cache->stats();
-            const std::string label = "{pool=\"" + name + "\"}";
+            const std::string label = "{pool=\"" + prometheus_label_escape(name) + "\"}";
             out << "cpppools_cache_hits_total" << label << " " << cs.hits << "\n"
                 << "cpppools_cache_misses_total" << label << " " << cs.misses << "\n"
                 << "cpppools_cache_entries" << label << " " << cs.entries << "\n"
@@ -963,11 +963,11 @@ ApiResponse HttpServer::handle_metrics() const {
                 << "cpppools_cache_invalidations_total" << label << " " << cs.invalidations << "\n"
                 << "cpppools_cache_singleflight_merged_total" << label << " "
                 << cs.singleflight_merged << "\n"
-                << "cpppools_cache_bypass_total{pool=\"" << name << "\",reason=\"too_large\"} "
+                << "cpppools_cache_bypass_total{pool=\"" << prometheus_label_escape(name) << "\",reason=\"too_large\"} "
                 << cs.bypass_too_large << "\n"
                 << "cpppools_cache_backfill_dropped_total" << label << " "
                 << cs.backfill_dropped << "\n"
-                << "cpppools_cache_flush_total{pool=\"" << name
+                << "cpppools_cache_flush_total{pool=\"" << prometheus_label_escape(name)
                 << "\",reason=\"rejoin\"} " << cs.flushes << "\n";
         }
     }
@@ -981,15 +981,15 @@ ApiResponse HttpServer::handle_metrics() const {
             << "# HELP cpppools_cache_bypass_total Local processing that bypassed cache (cluster-level reasons; too_large is cache-level, above).\n"
             << "# TYPE cpppools_cache_bypass_total counter\n";
         for (const auto& [pool, n] : rs.bypass_not_owner) {
-            out << "cpppools_cache_bypass_total{pool=\"" << pool
+            out << "cpppools_cache_bypass_total{pool=\"" << prometheus_label_escape(pool)
                 << "\",reason=\"not_owner\"} " << n << "\n";
         }
         for (const auto& [pool, n] : rs.bypass_fallback) {
-            out << "cpppools_cache_bypass_total{pool=\"" << pool
+            out << "cpppools_cache_bypass_total{pool=\"" << prometheus_label_escape(pool)
                 << "\",reason=\"fallback\"} " << n << "\n";
         }
         for (const auto& [pool, n] : rs.bypass_epoch) {
-            out << "cpppools_cache_bypass_total{pool=\"" << pool
+            out << "cpppools_cache_bypass_total{pool=\"" << prometheus_label_escape(pool)
                 << "\",reason=\"epoch_mismatch\"} " << n << "\n";
         }
     }
@@ -1104,7 +1104,7 @@ ApiResponse HttpServer::handle_stats() const {
                    << "\"cache_misses_total\":" << misses << ","
                    // 集群身份（spec §8.1）：与缓存聚合并列，便于运维一屏定位。
                    << "\"cluster_epoch\":" << config_.cluster_view.epoch << ","
-                   << "\"node_id\":\"" << config_.cluster_view.node_id << "\",";
+                   << "\"node_id\":\"" << json_escape(config_.cluster_view.node_id) << "\",";
                 return os.str();
             }()
          << "\"latency_samples\":" << lstats.samples << ","
@@ -1140,7 +1140,7 @@ ApiResponse HttpServer::handle_get_config() const {
                     if (!names.empty()) {
                         names += ",";
                     }
-                    names += "\"" + n + "\"";
+                    names += "\"" + json_escape(n) + "\"";
                 }
                 return names;
             }() << "],"
