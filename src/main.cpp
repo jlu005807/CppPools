@@ -1,6 +1,9 @@
 #include "cpppools/config/config.h"
 #include "cpppools/db/datasource_registry.h"
 #include "db/sqlite_database.h"
+#ifdef CPPPOOLS_USE_MYSQL
+#include "cpppools/db/mysql_database.h"
+#endif
 #include "cpppools/pool/object_pool.h"
 #include "cpppools/server/http_server.h"
 #include "cpppools/pool/thread_pool.h"
@@ -144,8 +147,11 @@ int main(int argc, char** argv) {
                       << (ds.is_default ? " [default]" : "") << std::endl;
         }
         // 后端注册（显式调用，避免全局静态初始化顺序依赖）。
-        // MySQL 后端在期 6 注册。
+        // MySQL 后端仅在使用 CPPPOOLS_USE_MYSQL 编译时注册。
         register_sqlite_backend();
+#ifdef CPPPOOLS_USE_MYSQL
+        register_mysql_backend();
+#endif
 
         // 多数据源注册表（期 4）：逐源探连 + 自省 → 每源一个连接池 →
         // table→datasource 索引。任一源失败整体 fail-fast；

@@ -355,6 +355,50 @@ fail-fast 保证）。
 两段均可缺省：无 `cluster` = 单节点模式（行为与无集群逐字节一致）；
 无 `cache` 或 `enabled:false` = 无缓存。
 
+### 6.1 数据源配置（`datasources` 数组）
+
+每个数据源一个对象，`type` 决定后端（`sqlite` / `mysql`）。`name` 全配置唯一；
+至多一个 `default:true`。`pool_size` 为该源的连接池容量。
+
+**SQLite 数据源：**
+
+```json
+{
+  "name": "main", "type": "sqlite", "default": true, "pool_size": 4,
+  "sqlite": { "path": "data/cpppools_demo.db" }
+}
+```
+
+中间件不建库（`READWRITE` 不带 `CREATE`）；`path` 不存在则启动期 fail-fast。
+
+**MySQL 数据源**（需编译时 `-DCPPPOOLS_USE_MYSQL=ON`，否则启动期报
+"unknown database type"）：
+
+```json
+{
+  "name": "mysql-main", "type": "mysql", "pool_size": 4,
+  "mysql": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "user": "cpppools",
+    "password_env": "CPPPOOLS_MYSQL_PASSWORD",
+    "database": "cpppools"
+  }
+}
+```
+
+字段：`host`（默认 `127.0.0.1`）、`port`（默认 `3306`，范围 [1,65535]）、
+`user`（必需）、`database`（必需）、`password_env`（推荐：环境变量名，
+不落盘；未设置则启动 fail-fast）或 `password`（明文，不推荐）。连接参数：
+utf8mb4 字符集；不自动重连；连接超时 5s、读写超时 10s。启动时
+`information_schema` 自省一次（口径见 README §3.4）；表结构变更需重启服务。
+建库脚本参考 `docs/mysql_setup.sql`。
+
+> **值边界**：单个 TEXT 值上限 64KB（超出报 `foreign data of wrong type` 500）。
+> 中间件只搬运单值 TEXT，超长值超出「单列单值」语义；`DECIMAL` 精度只到 double。
+
+### 6.2 集群与缓存段
+
 ```json
 {
   "cluster": {

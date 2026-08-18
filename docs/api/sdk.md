@@ -97,6 +97,7 @@ client.delete("users", {"column": "id", "value": 42})
 ```bash
 python3 -m unittest discover -s sdk/python/tests        # 单测（fake 集群）
 bash scripts/sdk_e2e.sh                                 # 三节点 live e2e
+python3 sdk/python/examples/e2e_crud.py                 # 单节点 CRUD 往返（自管 server）
 ```
 
 - `test_hash_ring.py`：spec §3.2 黄金向量（与 C++ 端跨语言一致）、环归属、
@@ -106,3 +107,16 @@ bash scripts/sdk_e2e.sh                                 # 三节点 live e2e
 - `e2e_live.py`：三节点稳态（0 个 307 = 两端环一致的硬证据）、杀节点
   Fallback、复活回切、epoch 优雅降级、归队清缓存、滚动重启窗口内
   持续流量零失败。
+- `examples/e2e_crud.py`：单节点自管 server 子进程，跑 insert/select/update/
+  delete 往返 + 唯一冲突(409)/缺必填(400)/0 行(200) 映射断言（需先构建 server）。
+
+## 7. 示例与依赖
+
+- 最简 CRUD 用法见 `sdk/python/examples/crud_demo.py`：
+  ```bash
+  scripts/run_server.sh                                   # 启动单节点
+  python3 sdk/python/examples/crud_demo.py                # 跑一遍增删改查
+  ```
+- 依赖见 `sdk/python/requirements.txt`：运行时**零第三方依赖**（纯 stdlib），
+  与服务端「自研 Socket HTTP、不引入第三方 HTTP 库」的口径一致；
+  仅当显式注入基于 `requests` 的传输（v1.1 keep-alive 路线）时才需 `requests`。

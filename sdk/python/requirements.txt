@@ -1,0 +1,22 @@
+# CppPools Python SDK 依赖
+#
+# 运行时：零第三方依赖（仅 Python 3.8+ 标准库）。
+#   sdk/python/cpppools/ 全部模块只 import 标准库（urllib / socket / hashlib /
+#   threading / json / uuid 等），刻意不引入 requests / httpx 等 ——
+#   与项目「自研 Socket HTTP、不引入第三方 HTTP 库」的服务端口径一致，
+#   也让 SDK 可在最小化环境（容器 / 嵌入式 / 沙箱）直接 drop-in 使用。
+#
+# 因此本文件运行时依赖为空。下方仅列开发/测试可选用包，按需安装：
+#
+# 开发/测试（可选，均非必需）：
+#   - 测试用 unittest（标准库），无需 pytest。如偏好 pytest 运行：
+#         pytest>=7.0          # 仅作为测试运行器，断言仍用 unittest.TestCase
+#   - 性能压测脚本 scripts/loadtest_sdk.py 用 urllib，无需额外包。
+#
+# 注入自定义传输（可选）：构造 ClusterClient(http=...) 时可传入基于
+# requests 的传输以获得 keep-alive（v1.1 路线）：
+#         requests>=2.28       # 仅当显式注入 requests 传输时需要
+#
+# 安装示例：
+#   pip install -r requirements.txt          # 空（无运行时依赖）
+#   pip install pytest requests              # 可选开发/进阶传输

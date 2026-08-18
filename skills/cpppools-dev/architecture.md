@@ -94,7 +94,7 @@ accept（poll 200ms 唤醒，优雅停机检查点）
 
 | 层 | 入口 | 钉住什么 |
 |---|---|---|
-| C++ 单测 ×18 | `ctest --test-dir build` | 三池行为、校验管道全分支、conformance（裸后端+装饰器双跑，MySQL 复用基线）、黄金向量、决策矩阵五行、Rejoin 节流 |
+| C++ 单测 ×18（默认）/ ×20（`CPPPOOLS_USE_MYSQL=ON` 时 +2 MySQL 专项） | `ctest --test-dir build` | 三池行为、校验管道全分支、conformance（裸后端+装饰器双跑，MySQL 复用基线）、MySQL 自省口径专项 + CRUD 专项（环境变量驱动跳过）、黄金向量、决策矩阵五行、Rejoin 节流 |
 | SDK 单测 ×51 | `unittest discover -s sdk/python/tests` | 黄金向量跨语言、错误矩阵、路由/绕行/全黑/Rejoin/epoch/畸形拓扑 |
 | live e2e ×2 | `scripts/cluster_e2e.sh`、`scripts/sdk_e2e.sh` | 稳态 0 个 307 = 两端环一致；杀节点/归队/滚动重启全链路 |
 | 压测 | `scripts/loadtest_sdk.py` | 缓存对照、归队风暴观测（docs/benchmarks/ 归档） |
@@ -105,7 +105,26 @@ accept（poll 200ms 唤醒，优雅停机检查点）
 - SQLite：不支持 BLOB 列 / WITHOUT ROWID；`:memory:` 字面路径强制单槽；单写者模型。
 - 集群：缓存命中仍需借连接（pool_size 即并发上限）；故障窗口内替补写入的行，
   owner 归队后读不到（同键最终一致 ≤ TTL）；SDK 无连接复用。
-- MySQL：保留未做；接入需补唯一性自省口径专项（COLUMN_KEY='UNI' 与联合唯一/
-  前缀索引/多 NULL 的对应关系 —— 缓存放大了误标 unique 的后果）。
+- MySQL（`CPPPOOLS_USE_MYSQL` 编译启用，默认 OFF）：已实现连接/自省/CRUD。
+  自省口径是最大坑（缓存放大误标 unique 后果）：
+  - 按 `information_schema.statistics` 聚合判联合唯一，**绝不用 `column_key='UNI'`**
+    （联合唯一每列都标 UNI 会误标单列 unique）；
+  - 前缀唯一索引 `sub_part` 非空跳过（只强制前 N 字节，击穿「每操作至多一行」）；
+  - 生成列（`VIRTUAL`/`STORED`）/隐藏列（`INVISIBLE`）排除在 `ColumnInfo` 之外
+    （不进 Schema，SQL 生成器自动跳过，insert 全列 SQL 不给生成列绑值）；
+  - BLOB/JSON/BIT/空间类型拒绝该数据源（对齐 SQLite BLOB 亲和拒绝）；
+  - `data_type` 全类型穷举映射，未知类型保守拒绝（不默认当 TEXT）。
+  - `MysqlStmt` 带 `broken_` 连接失效标记（连接级错误置位，触发缓存重新 prepare）；
+    `MYSQL_BIND` buffer 驱动不拷贝，string 暂存在 `write_slots_` 覆盖 execute。
+  - `do_select` 用 `store_result` + TEXT 缓冲固定上限 `kMaxTextFetchBytes`（64KB，
+    **不按 `f->length` 预分配**——LONGTEXT 达 4GB 会 OOM）；超长值截断标记 →
+    read_column 报 "foreign data of wrong type"。所有 read_column 失败路径补
+    `rebind_reset`，避免 stmt 半消费态触发下次 execute "Commands out of sync"。
+  - `do_update` 隐式事务（`START TRANSACTION ... COMMIT`，`TxGuard` RAII 收尾）
+    防 MVCC REPEATABLE READ 下的丢失更新（与 SQLite 的关键差异）。
+  - 已知限制：`DECIMAL` 精度只到 double；表名大小写不规范化（跨平台需
+    `lower_case_table_names` 一致）；单 TEXT 值上限 64KB（超长报错，中间件只
+    搬运单值 TEXT）；测试连接信息来自环境变量，未配置则跳过。
+  - 设计口径见 `docs/superpowers/specs/2026-08-15-mysql-backend-design.md`。
 - v1.1 候选（压测证据见 docs/benchmarks/2026-08-14）：keep-alive（需双端改造）、
   热键预热（实测无风暴，继续搁置）。

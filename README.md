@@ -1,6 +1,6 @@
 # CppPools — 多数据源数据库中间件（三级池化 + 分布式集群）
 
-> C++17 / SQLite（MySQL 后端规划中）/ 自研 Socket HTTP / Python SDK。
+> C++17 / SQLite + MySQL 后端 / 自研 Socket HTTP / Python SDK。
 > 客户端发送通用 JSON CRUD 请求，服务端按表名透明路由到配置的数据源 ——
 > 三大池子（线程池 / 对象池 / 连接池）是它真实的运行时骨架。
 > 多节点部署时按一致性哈希把每个键路由到唯一 owner，带行级写穿透缓存。
@@ -17,7 +17,7 @@ SDK / curl
 │       → DbConnectionPool × 数据源数                                 │
 └───────────────────────────────────────────────────────────┘
   ▼
-SQLite（已实现） / MySQL（规划中）…… 每节点各自的数据源（真理之源）
+SQLite（已实现） / MySQL（已实现）…… 每节点各自的数据源（真理之源）
 ```
 
 三条主线：
@@ -73,6 +73,7 @@ CppPools/
 │   ├── db/
 │   │   ├── database_factory.cpp
 │   │   ├── sqlite_database.cpp             #   SQLite 后端（自省/stmt 缓存/WAL）
+│   │   ├── mysql_database.{h,cpp}           #   MySQL 后端（CPPPOOLS_USE_MYSQL 门控；自省/MysqlStmt/隐式事务）
 │   │   ├── statement_cache.h               #   私有：每连接 prepared statement 缓存
 │   │   ├── row_cache.h                     #   私有：行级缓存（分片锁/LRU/TTL/世代号/Singleflight）
 │   │   ├── caching_database.h              #   私有：缓存装饰器（写穿透双删失效）
@@ -89,6 +90,8 @@ CppPools/
 │
 ├── sdk/python/                             # Python SDK（零依赖，见 docs/api/sdk.md）
 │   ├── cpppools/                           #   hashing/ring/transport/errors/client
+│   ├── examples/                           #   crud_demo.py（最简增删改查）/ e2e_crud.py（单节点自管 server e2e）
+│   ├── requirements.txt                    #   运行时零依赖说明（纯 stdlib）
 │   └── tests/                              #   51 单测 + 三节点 live e2e
 │
 ├── test/                                   # 18 个 CTest 用例（见 §7）
@@ -247,6 +250,39 @@ accept 主循环（主线程）
 - `:memory:` 字面路径强制单槽（每 open 一个独立内存库的陷阱）；
   `file::memory:?cache=shared` 共享内存库支持多槽。
 
+### 3.4 MySQL 后端（`CPPPOOLS_USE_MYSQL` 编译启用）
+
+- **连接**：`mysql_real_connect` + `utf8mb4`；不自动重连
+  （`MYSQL_OPT_RECONNECT=false`）—— 探活失败交池销毁重建，与 SQLite 的
+  自愈模型同口径。连接级超时（connect 5s / read-write 10s）对齐 SQLite
+  `busy_timeout`「不让单次操作无限挂」的精神。
+- **自省**（`information_schema`）：`data_type` 全类型穷举映射
+  （int/year→integer，decimal/float→real，varchar/text/datetime/enum→text）；
+  BLOB/JSON/BIT/空间类型拒绝该数据源（对齐 SQLite BLOB 拒绝）。
+  **唯一性口径**是最大坑：按 `statistics` 聚合判联合，绝不用 `column_key='UNI'`
+  （联合唯一每列都标 UNI 会误标）；前缀索引 `sub_part` 非空跳过；生成列
+  （`VIRTUAL`/`STORED`）/隐藏列（`INVISIBLE`）排除在 `ColumnInfo` 之外。
+  autoincrement 仅显式 `AUTO_INCREMENT` 才算（无 SQLite rowid 魔法）。
+- **执行**：每表每操作固定 SQL + prepared statement 缓存（与 SQLite 同策略）。
+  `MysqlStmt` 带 `broken_` 连接失效标记：连接级错误（`CR_SERVER_LOST` 等）
+  置位，`valid()` 返回 `prepared_ok_ && !broken_`，触发缓存重新 prepare。
+  `MYSQL_BIND` buffer 驱动不拷贝，绑定的 string 暂存在 `write_slots_` 覆盖 execute。
+- **读侧缓冲与截断拒绝**：`do_select` 用 `mysql_stmt_store_result` 缓冲完整结果集
+  并让驱动回填每列截断标记；TEXT 列 fetch 缓冲固定上限 `kMaxTextFetchBytes`
+  （64KB，与缓存 `max_entry_bytes` 对齐，**不按 `f->length` 预分配** ——
+  LONGTEXT 声明长度达 4GB 会 OOM）。超出上限的值驱动置截断标记，
+  `read_column` 据此报 "foreign data of wrong type"（对齐 SQLite 读侧规范化）。
+- **`do_update` 隐式事务**（与 SQLite 的关键差异）：MySQL 默认 `REPEATABLE READ`
+  下读快照与写当前读是两个时间点视图，读改写窗口内被并发事务改了会用旧值
+  回填 → 丢失更新。`do_update` 内部 `START TRANSACTION ... COMMIT` 把读改写
+  收敛到事务内，`TxGuard` RAII 保证所有返回路径（0 行/成功/失败/异常）
+  COMMIT/ROLLBACK 不悬挂。
+- **状态码映射**：errno 1062（唯一冲突）→ 409；1048（NOT NULL）/3819、4092
+  （CHECK 违例）→ 400；其余 → 500。与 SQLite `map_constraint_error` 口径一致。
+- **已知限制**：`DECIMAL` 精度只到 double（`Value` 无高精度类型）；表名
+  大小写不规范化（跨平台部署需保持 `lower_case_table_names` 一致）；单 TEXT
+  值上限 64KB（超出报错，中间件只搬运单值 TEXT，超长值超出「单列单值」语义）。
+
 ---
 
 ## 4. 分布式集群与行级缓存（可选）
@@ -343,6 +379,7 @@ DB 读 QPS 降 99.8%、服务端读 p99 降 80%、写退化 ≤2.4%）。
 - C++17 编译器（GCC 7+ / Clang 6+ / MSVC 2017+ / MinGW-w64）
 - CMake 3.16+
 - SQLite3 开发库（macOS SDK / 主流 Linux 发行包自带）
+- MySQL 客户端库（**可选**，仅启用 MySQL 后端时需要；见 §6.2 的 `CPPPOOLS_USE_MYSQL`）
 - Python 3.8+（仅 SDK 与其测试需要，零第三方依赖）
 
 ### 6.2 构建与测试
@@ -359,6 +396,19 @@ python3 -m unittest discover -s sdk/python/tests   # SDK 单测，预期 51 全�
 ```
 
 产物：`build/bin/cpppools_server` 与 18 个测试二进制。
+
+**MySQL 后端**（可选，默认 OFF）：用 `-DCPPPOOLS_USE_MYSQL=ON` 启用，需
+MySQL 客户端库（`libmysql` / `mariadb-connector-c`，CMake 自动 `find_path` +
+`find_library`）。启用后额外编译两个测试（`test_mysql_introspection` /
+`test_mysql_crud`），二者连接信息来自环境变量
+`CPPPOOLS_TEST_MYSQL_HOST/PORT/USER/PASSWORD`，未配置则跳过（不进默认 CI）：
+
+```bash
+cmake -S . -B build -DCPPPOOLS_USE_MYSQL=ON
+cmake --build build -j
+CPPPOOLS_TEST_MYSQL_USER=root CPPPOOLS_TEST_MYSQL_PASSWORD=*** \
+  ctest --test-dir build -R mysql --output-on-failure
+```
 
 ### 6.3 启动并验证（单节点）
 
@@ -439,7 +489,9 @@ curl -s http://127.0.0.1:8080/api/v1/stats  # 看 db_timeout_requests 与 min_db
 | `test_config` | JSON 配置解析：缺字段、类型错、password_env、多 default 冲突、cluster/cache 段与不变量 I1 |
 | `test_schema_validator` | NVI 校验管道全拒绝分支（表/列/where 唯一键/NULL/类型/重复列）、工厂注册 |
 | `test_statement_cache` | 每连接 statement 缓存：命中/淘汰/计数 |
-| `test_database_conformance` | SQLite 后端一致性矩阵（自省/类型往返/冲突/读改写/脏数据受控）——裸后端与套缓存装饰器**双跑**；MySQL 后端的复用基线 |
+| `test_database_conformance` | SQLite 后端一致性矩阵（自省/类型往返/冲突/读改写/脏数据受控）——裸后端与套缓存装饰器**双跑**；MySQL 后端的复用基线（专项测试 `test_mysql_introspection` / `test_mysql_crud` 覆盖 MySQL 特有形态） |
+| `test_mysql_introspection` | （`CPPPOOLS_USE_MYSQL` 门控）MySQL 自省专项：联合唯一不标单列、前缀索引 `sub_part` 跳过、生成列排除、BLOB/JSON/BIT 拒绝、全类型映射；建临时库→断言→删库，环境变量驱动跳过 |
+| `test_mysql_crud` | （`CPPPOOLS_USE_MYSQL` 门控）MySQL CRUD 专项（14 断言）：往返/inserted_id/显式PK/唯一冲突(1062)/NOT NULL(1048)/REAL 收整数/投影/0行/读改写合并/改 where 列/DECIMAL 提升/**utf8mb4 中文+emoji 往返** |
 | `test_routing` | 多数据源：自动路由、歧义 409、显式消歧、跨源隔离、构建错误 |
 | `test_http_util` | 请求行解析（含截断防御）、Content-Length/通用头解析、路由三态匹配、报文组装 |
 | `test_http_server` | handle_client 端到端（socketpair）：对象池耗尽 503、DB 超时 503、请求体边界、X-Request-Id、优雅停机、计数器口径 |
@@ -469,7 +521,7 @@ ctest --test-dir build --output-on-failure
 
 | 方向 | 现有基础 |
 |---|---|
-| **MySQL 后端**（暂缓，保留） | 工厂注册表已留位：实现 `Database` 子类 + 注册一行；`test_database_conformance` 断言矩阵直接复用；另有唯一性自省口径专项待做（`COLUMN_KEY='UNI'` 与联合唯一/前缀索引的对应） |
+| **MySQL 后端**（已支持） | `Database` NVI 子类 `MysqlDatabase`：连接 + utf8mb4 + `mysql_ping` 探活；`information_schema` 自省（联合唯一聚合不标单列、前缀索引 `sub_part` 跳过、生成列/隐藏列排除、BLOB/JSON/BIT 拒绝该数据源）；prepared statement 缓存（含连接失效 `broken_` 标记）；`do_update` 隐式事务防 MVCC 丢失更新；`conformance` 断言复用基线（专项测试 `test_mysql_crud` / `test_mysql_introspection`，环境变量驱动跳过）。启用见 §6.2 `CPPPOOLS_USE_MYSQL` |
 | 集群 v1.1 | SDK keep-alive（requests 注入）、热键账本 + 归队预热（判据：归队后 miss 率/DB QPS 尖峰）、缓存前置到池外（命中免借连接，触发条件见 spec §4.1.2） |
 | Redis 共享缓存模式 | 同一缓存抽象换后端；该模式下环退化为负载均衡（spec §10 扩展位） |
 | 数据源级只读标记 | 配置加字段即可，写操作在路由层拒绝 |
@@ -490,6 +542,9 @@ ctest --test-dir build --output-on-failure
 - 接口无 DDL 能力：表结构由使用方预置，schema 变更后需重启服务。
 - SQLite：不支持 BLOB 列与 WITHOUT ROWID 表（启动期显式拒绝/已知边界）；
   `:memory:` 字面路径强制单槽；写并发受 SQLite 单写者模型限制（WAL 下多读单写）。
+- MySQL（`CPPPOOLS_USE_MYSQL` 启用）：`DECIMAL` 列精度只到 double（`Value` 无高精度
+  类型）；表名大小写不规范化（跨平台需保持 `lower_case_table_names` 一致）；
+  测试连接信息来自环境变量，未配置则跳过（不进默认 CI）。
 - `/api/v1/stats` 的跨池字段逐个读取，池内是一致快照、跨池不构成全局原子快照。
 - 连接探活失败后由 factory 重建；`:memory:` 数据源重建会得到空库（固有属性，仅影响该用法）。
 - 集群：缓存命中仍需借连接（`pool_size` 即并发上限，spec §4.1.2）；

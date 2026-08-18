@@ -74,6 +74,7 @@ add_library(cpppools STATIC
     src/db/database_factory.cpp
     src/db/db_connection_pool.cpp
     src/db/sqlite_database.cpp
+    src/db/mysql_database.cpp
     src/db/datasource_registry.cpp
     src/server/http_util.cpp
     src/server/api_response.cpp
@@ -153,7 +154,10 @@ if (CPPPOOLS_USE_MYSQL)
     message(STATUS "MySQL include: ${MYSQL_INCLUDE_DIR}")
     message(STATUS "MySQL library: ${MYSQL_LIBRARY}")
 
-    target_include_directories(cpppools PUBLIC ${MYSQL_INCLUDE_DIR})
+    # SYSTEM：MySQL 官方头含 old-style cast 等，按系统头处理抑制其告警，
+    # 避免污染项目 -Wall -Wextra 的零告警纪律。
+    # PRIVATE：仅 cpppools 库自身需要；测试不直接 #include <mysql.h>。
+    target_include_directories(cpppools SYSTEM PRIVATE ${MYSQL_INCLUDE_DIR})
     target_link_libraries(cpppools PUBLIC ${MYSQL_LIBRARY})
 
     if (WIN32)
@@ -220,6 +224,14 @@ cpppools_add_test(test_row_cache)
 cpppools_add_test(test_caching_database)
 cpppools_add_test(test_cache_metrics)
 cpppools_add_test(test_ownership)
+
+# MySQL 自省专项测试：仅在启用 MySQL 后端时编译运行。
+# 连接信息来自环境变量（CPPPOOLS_TEST_MYSQL_HOST/PORT/USER/PASSWORD），
+# 未配置则测试内自行跳过（spec §十五.3）。
+if (CPPPOOLS_USE_MYSQL)
+    cpppools_add_test(test_mysql_introspection)
+    cpppools_add_test(test_mysql_crud)
+endif()
 
 # =========================
 # 构建摘要
