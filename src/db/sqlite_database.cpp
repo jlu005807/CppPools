@@ -341,6 +341,7 @@ public:
         : Database(std::move(schema), std::move(name)), db_(db) {}
 
     ~SqliteDatabase() override {
+        cache_.clear();
         // cache_ 先于 db_ 析构（成员逆序）：所有 statement 先 finalize，
         // 再关连接 —— sqlite3_close 不会遇到未释放的句柄。
         if (db_ != nullptr) {
@@ -367,7 +368,9 @@ protected:
             return {DbStatus::kBackendError, ResultSet{}, stmt->error()};
         }
         stmt->rebind_reset();
-        stmt->bind_value(1, req.where.value);
+        if (stmt->bind_value(1, req.where.value) != SQLITE_OK) {
+            return {DbStatus::kBackendError, ResultSet{}, sqlite3_errmsg(db_)};
+        }
 
         ResultSet rs;
         const int rc = stmt->step();
@@ -491,7 +494,9 @@ protected:
             return {DbStatus::kBackendError, 0, stmt->error()};
         }
         stmt->rebind_reset();
-        stmt->bind_value(1, req.where.value);
+        if (stmt->bind_value(1, req.where.value) != SQLITE_OK) {
+            return {DbStatus::kBackendError, 0, sqlite3_errmsg(db_)};
+        }
         const int rc = stmt->step();
         if (rc != SQLITE_DONE) {
             std::string message;
@@ -506,6 +511,10 @@ private:
         std::unique_ptr<SqliteStmt>& holder = cache_.get_or_create(key, [this, &sql] {
             return std::make_unique<SqliteStmt>(db_, sql);
         });
+        // Recover from a cached invalid statement (e.g. schema changed after prepare).
+        if (holder != nullptr && !holder->valid()) {
+            holder = std::make_unique<SqliteStmt>(db_, sql);
+        }
         return holder.get();
     }
 

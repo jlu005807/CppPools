@@ -678,6 +678,7 @@ MysqlDatabase::MysqlDatabase(MYSQL* conn, Schema schema, std::string name)
     : Database(std::move(schema), std::move(name)), conn_(conn) {}
 
 MysqlDatabase::~MysqlDatabase() {
+    cache_.clear();
     // 成员逆序：连接在最后销构。阶段 3 补 StatementCache 后，
     // cache_ 必须先于 conn_ 析构（对齐 SqliteDatabase 的析构顺序约定）。
     if (conn_ != nullptr) {

@@ -583,6 +583,48 @@ static void test_foreign_data_read_is_controlled() {
     assert(contains(bad.message, "score"));
 }
 
+
+// Schema change after a prepare failure: cached invalid statement must be
+// recovered (re-prepared) when the schema is restored.
+static void test_schema_change_recovers_invalid_statement() {
+    if (g_with_cache) return;  // CachingDatabase wraps select, skip under cache
+
+    TempDb t = open_seeded_db("schema_change");
+
+    // Insert a row first so select has something to find.
+    InsertRequest ins{"users", {{"name", Value{std::string("alice")}}, {"age", Value{std::int64_t(30)}}}};
+    const auto ir = t.db->insert(ins);
+    assert(ir.status == DbStatus::kOk);
+
+    // First select: primes the statement cache with a valid prepared statement.
+    const auto r1 = t.db->select(SelectRequest{"users", {}, where_id(1)});
+    assert(r1.status == DbStatus::kOk);
+    assert(r1.value.rows.size() == 1);
+
+    // Drop the table via a raw connection: cached SELECT is now stale.
+    sqlite3* raw = nullptr;
+    assert(sqlite3_open(t.path.c_str(), &raw) == SQLITE_OK);
+    assert(sqlite3_exec(raw, "DROP TABLE users", nullptr, nullptr, nullptr) == SQLITE_OK);
+    assert(sqlite3_exec(raw,
+        "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER, score REAL, tag TEXT UNIQUE)",
+        nullptr, nullptr, nullptr) == SQLITE_OK);
+    assert(sqlite3_exec(raw,
+        "INSERT INTO users(id, name, age) VALUES(1, 'bob', 25)",
+        nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(raw);
+
+    // Select again: the cached statement referenced the dropped table.
+    // It should have been invalidated; the new select should re-prepare
+    // against the restored schema and return the new row.
+    const auto r2 = t.db->select(SelectRequest{"users", {}, where_id(1)});
+    assert(r2.status == DbStatus::kOk);
+    assert(r2.value.rows.size() == 1);
+    // Verify we got the new data (name = "bob"), not a stale cached error.
+    // Column index: id=0, name=1
+    assert(std::holds_alternative<std::string>(r2.value.rows[0][1]));
+    assert(std::get<std::string>(r2.value.rows[0][1]) == "bob");
+}
+
 }  // namespace
 
 // CRUD 语义子集：两遍跑同一批用例（裸后端 / 套装饰器，spec §9）。
@@ -607,6 +649,7 @@ static void run_all_cases() {
     test_rowid_alias_explicit_null_rejected_end_to_end();
     test_partial_unique_index_not_marked_unique();
     test_foreign_data_read_is_controlled();
+    test_schema_change_recovers_invalid_statement();
 }
 
 int main() {

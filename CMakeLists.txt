@@ -89,10 +89,8 @@ target_include_directories(cpppools
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 find_package(Threads REQUIRED)
-target_link_libraries(cpppools PUBLIC Threads::Threads)
-# SQLite 后端：系统库（macOS SDK / Linux 发行包均自带）。
-# PUBLIC：测试目标直接 #include <sqlite3.h> 造 fixture，也需要链接它。
-target_link_libraries(cpppools PUBLIC sqlite3)
+find_package(SQLite3 REQUIRED)
+target_link_libraries(cpppools PUBLIC Threads::Threads SQLite::SQLite3)
 
 # =========================
 # 第三方依赖：nlohmann/json（vendored 单头文件，见 third_party/README.md）
@@ -200,7 +198,10 @@ function(cpppools_add_test name)
     add_executable(${name} test/${name}.cpp)
     target_link_libraries(${name} PRIVATE cpppools)
     target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_compile_options(${name} PRIVATE $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UNDEBUG>)
+    target_compile_options(${name} PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/UNDEBUG>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UNDEBUG>
+    )
     cpppools_set_warnings(${name})
     cpppools_copy_mysql_dll(${name})
     add_test(NAME ${name} COMMAND $<TARGET_FILE:${name}>)

@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <string>
+#include <stdexcept>
 
 using cpppools::db::StatementCache;
 
@@ -67,9 +68,68 @@ static void test_hit_does_not_recreate() {
     assert(cache.misses() == 2);
 }
 
+
+static void test_factory_throw_does_not_leave_lru_or_capacity_corrupt() {
+    StatementCache<int> cache(2);
+    bool fail = true;
+    try {
+        cache.get_or_create("bad", [&]() -> int {
+            if (fail) throw std::runtime_error("prepare failed");
+            return 7;
+        });
+        assert(false && "factory must throw");
+    } catch (const std::runtime_error&) {
+    }
+    assert(cache.size() == 0);
+    fail = false;
+    assert(cache.get_or_create("good1", [] { return 9; }) == 9);
+    assert(cache.get_or_create("good2", [] { return 10; }) == 10);
+    assert(cache.size() == 2);
+
+    try {
+        cache.get_or_create("bad-full", []() -> int {
+            throw std::runtime_error("prepare failed while full");
+        });
+        assert(false && "factory must throw");
+    } catch (const std::runtime_error&) {
+    }
+    assert(cache.size() == 2);
+    assert(cache.get_or_create("good1", [] { return -1; }) == 9);
+    assert(cache.get_or_create("good2", [] { return -1; }) == 10);
+}
+
+
+struct DtorCounter {
+    int value;
+    static int alive;
+    DtorCounter(int v) : value(v) { ++alive; }
+    DtorCounter(const DtorCounter& o) : value(o.value) { ++alive; }
+    DtorCounter& operator=(const DtorCounter&) = delete;
+    ~DtorCounter() { --alive; }
+};
+int DtorCounter::alive = 0;
+
+static void test_clear_destroys_all_entries() {
+    DtorCounter::alive = 0;
+    {
+        StatementCache<DtorCounter> cache(4);
+        cache.get_or_create("a", [] { return DtorCounter(1); });
+        cache.get_or_create("b", [] { return DtorCounter(2); });
+        cache.get_or_create("c", [] { return DtorCounter(3); });
+        assert(cache.size() == 3);
+        assert(DtorCounter::alive == 3);
+        cache.clear();
+        assert(cache.size() == 0);
+        assert(DtorCounter::alive == 0);
+    }
+    assert(DtorCounter::alive == 0);
+}
+
 int main() {
     test_get_or_create_caches_and_hits();
     test_capacity_triggers_eviction();
     test_hit_does_not_recreate();
+    test_factory_throw_does_not_leave_lru_or_capacity_corrupt();
+    test_clear_destroys_all_entries();
     return 0;
 }

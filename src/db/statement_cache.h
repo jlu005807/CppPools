@@ -48,19 +48,34 @@ public:
             return it->second.stmt;
         }
         ++misses_;
+        // Construct the statement *before* publishing the LRU node or evicting.
+        // If the factory throws, the cache is left in its prior consistent state.
+        Stmt stmt = std::forward<Make>(make)();
         if (order_.size() >= capacity_) {
             evict_all();
         }
-        order_.push_front(key);
-        const auto inserted = cache_.emplace(
-            key, Entry{std::forward<Make>(make)(), order_.begin()});
-        return inserted.first->second.stmt;
+        auto order_it = order_.insert(order_.begin(), key);
+        try {
+            const auto inserted = cache_.emplace(
+                key, Entry{std::move(stmt), order_it});
+            return inserted.first->second.stmt;
+        } catch (...) {
+            order_.erase(order_it);
+            throw;
+        }
     }
 
     std::size_t size() const { return cache_.size(); }
 
     std::uint64_t hits() const { return hits_; }
     std::uint64_t misses() const { return misses_; }
+
+    // Destroy all cached statements. Called by backend destructors before
+    // closing the database connection, so finalize runs while the handle is live.
+    void clear() noexcept {
+        cache_.clear();
+        order_.clear();
+    }
 
 private:
     struct Entry {
