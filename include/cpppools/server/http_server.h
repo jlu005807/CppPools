@@ -16,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <unordered_set>
 
 namespace cpppools::server {
 
@@ -225,6 +226,14 @@ private:
 
     mutable std::mutex latency_mutex_;
     std::deque<double> api_latencies_ms_;
+
+    // Active socket tracking for graceful shutdown (Task 2).
+    mutable std::mutex active_sockets_mutex_;
+    std::unordered_set<std::intptr_t> active_sockets_;
+
+    void register_active_socket(std::intptr_t fd);
+    void unregister_active_socket(std::intptr_t fd);
+    void interrupt_active_sockets() noexcept;
 };
 
 }  // namespace cpppools::server

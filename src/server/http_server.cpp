@@ -107,6 +107,60 @@ constexpr int kSendFlags = 0;
 #endif
 
 // ScopeExit：作用域退出时执行收尾动作，异常路径同样生效。
+// ===== Platform helpers (Task 4) =====
+
+int last_socket_error() noexcept {
+#ifdef _WIN32
+    return WSAGetLastError();
+#else
+    return errno;
+#endif
+}
+
+bool socket_error_is_interrupted(int code) noexcept {
+#ifdef _WIN32
+    return code == WSAEINTR;
+#else
+    return code == EINTR;
+#endif
+}
+
+bool socket_error_is_would_block(int code) noexcept {
+#ifdef _WIN32
+    return code == WSAEWOULDBLOCK || code == WSAETIMEDOUT;
+#else
+    return code == EAGAIN || code == EWOULDBLOCK;
+#endif
+}
+
+// Set SO_RCVTIMEO or SO_SNDTIMEO in a cross-platform way.
+// On Windows the option value is a DWORD (milliseconds);
+// on POSIX it is a struct timeval.
+bool set_socket_timeout(SocketType fd, int option,
+                       std::chrono::milliseconds timeout) noexcept {
+#ifdef _WIN32
+    DWORD ms = static_cast<DWORD>(timeout.count());
+    return setsockopt(fd, SOL_SOCKET, option,
+                      reinterpret_cast<const char*>(&ms), sizeof(ms)) == 0;
+#else
+    struct timeval tv;
+    tv.tv_sec = static_cast<long>(timeout.count() / 1000);
+    tv.tv_usec = static_cast<long>((timeout.count() % 1000) * 1000);
+    return setsockopt(fd, SOL_SOCKET, option, &tv, sizeof(tv)) == 0;
+#endif
+}
+
+// Wait for a socket to become readable (for accept wakeup on Windows).
+bool wait_socket_readable(SocketType fd, std::chrono::milliseconds timeout) noexcept {
+    fd_set set;
+    FD_ZERO(&set);
+    FD_SET(fd, &set);
+    struct timeval tv;
+    tv.tv_sec = static_cast<long>(timeout.count() / 1000);
+    tv.tv_usec = static_cast<long>((timeout.count() % 1000) * 1000);
+    return select(static_cast<int>(fd + 1), &set, nullptr, nullptr, &tv) > 0;
+}
+
 template <typename F>
 class ScopeExit {
 public:
@@ -190,7 +244,8 @@ bool send_all(SocketType fd, const char* data, std::size_t total) noexcept {
     while (sent < total) {
         const SsizeType written = send(fd, data + sent, total - sent, kSendFlags);
         if (written < 0) {
-            if (errno == EINTR) {
+            const int err = last_socket_error();
+            if (socket_error_is_interrupted(err)) {
                 continue;
             }
             return false;
@@ -240,6 +295,32 @@ void send_overload_response(SocketType fd) noexcept {
 }
 
 }  // namespace
+
+void HttpServer::register_active_socket(std::intptr_t fd) {
+    std::lock_guard<std::mutex> lock(active_sockets_mutex_);
+    active_sockets_.insert(fd);
+}
+
+void HttpServer::unregister_active_socket(std::intptr_t fd) {
+    std::lock_guard<std::mutex> lock(active_sockets_mutex_);
+    active_sockets_.erase(fd);
+}
+
+void HttpServer::interrupt_active_sockets() noexcept {
+    std::vector<std::intptr_t> fds;
+    {
+        std::lock_guard<std::mutex> lock(active_sockets_mutex_);
+        fds.assign(active_sockets_.begin(), active_sockets_.end());
+    }
+    for (std::intptr_t fd : fds) {
+        const SocketType s = static_cast<SocketType>(fd);
+#ifdef _WIN32
+        shutdown(s, SD_BOTH);
+#else
+        shutdown(s, SHUT_RDWR);
+#endif
+    }
+}
 
 HttpServer::HttpServer(uint16_t port,
                        ThreadPool& thread_pool,
@@ -346,14 +427,15 @@ void HttpServer::start() {
         const SocketType client_fd =
             accept(server_fd, reinterpret_cast<sockaddr*>(&client_addr), &len);
         if (client_fd == kInvalidSocket) {
-            if (errno == EINTR) {
+            const int accept_err = last_socket_error();
+            if (socket_error_is_interrupted(accept_err)) {
                 continue;  // 被信号打断，重试
             }
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (socket_error_is_would_block(accept_err)) {
                 continue;  // accept 超时：正常唤醒点，回到循环头检查停机标志
             }
             // 其余错误（如 EMFILE fd 耗尽）：短暂让出 CPU，避免 100% 忙循环。
-            std::cerr << "[warn] accept failed: errno=" << errno << '\n';
+            std::cerr << "[warn] accept failed: errno=" << accept_err << '\n';
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
@@ -407,9 +489,17 @@ void HttpServer::start() {
         static_cast<long long>(active_requests_.load(std::memory_order_relaxed));
     const std::size_t queued_at_stop = thread_pool_.pending_tasks();
     const auto drain_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (active_requests_.load(std::memory_order_relaxed) > 0 &&
+    while ((active_requests_.load(std::memory_order_relaxed) > 0 ||
+            thread_pool_.pending_tasks() > 0) &&
            std::chrono::steady_clock::now() < drain_deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (active_requests_.load(std::memory_order_relaxed) > 0 ||
+        thread_pool_.pending_tasks() > 0) {
+        interrupt_active_sockets();
+        thread_pool_.shutdown_now();
+    } else {
+        thread_pool_.shutdown();
     }
     const long long remaining =
         static_cast<long long>(active_requests_.load(std::memory_order_relaxed));
@@ -421,6 +511,11 @@ void HttpServer::start() {
 void HttpServer::handle_client(std::intptr_t client_fd, std::uint64_t request_id) {
     // socket 交给 RAII 托管：无论正常返回还是抛异常，析构都会关闭它。
     SocketGuard guard(static_cast<SocketType>(client_fd));
+    register_active_socket(static_cast<std::intptr_t>(client_fd));
+    auto unregister = make_scope_exit([this, client_fd]() {
+        unregister_active_socket(static_cast<std::intptr_t>(client_fd));
+    });
+    (void)unregister;
 
     // 三级池化的第二级：从对象池借出接收缓冲与响应字符串，作用域结束自动归还。
     auto ctx = request_pool_.acquire();
@@ -467,22 +562,41 @@ void HttpServer::handle_client(std::intptr_t client_fd, std::uint64_t request_id
     // 否则优雅停机的"5s 排空上限"失真（被钉死的 worker 在 ThreadPool
     // 析构时仍被 join，进程无限挂起）。超时后 recv 返回错误，按"无数据"
     // 走下方的静默返回路径。
-    const struct timeval head_tv{30, 0};
-    setsockopt(guard.get(), SOL_SOCKET, SO_RCVTIMEO, &head_tv, sizeof(head_tv));
-    SsizeType n = 0;
-    do {
-        n = recv(guard.get(), ctx->buffer.data(), kRequestBufferBytes, 0);
-    } while (n < 0 && errno == EINTR);  // 被信号打断应重试，不算错误
-
-    if (n <= 0) {
+    // Bounded header read loop (Task 3): read until \r\n\r\n terminator
+    // or kRequestBufferBytes limit. Handles fragmented TCP delivery.
+    // First read has a 30s timeout (wait for initial bytes).
+    // Subsequent reads (no terminator yet) use a short 1s timeout so that
+    // a client that sends a complete request without the final \r\n\r\n
+    // (or sends it in the same packet) is not left waiting for 30s.
+    set_socket_timeout(guard.get(), SO_RCVTIMEO, std::chrono::seconds(30));
+    std::size_t received = 0;
+    std::size_t header_end_pos = std::string::npos;
+    while (received < kRequestBufferBytes) {
+        SsizeType n = 0;
+        do {
+            n = recv(guard.get(), ctx->buffer.data() + received,
+                     static_cast<int>(kRequestBufferBytes - received), 0);
+        } while (n < 0 && socket_error_is_interrupted(last_socket_error()));
+        if (n <= 0) {
+            break;
+        }
+        received += static_cast<std::size_t>(n);
+        std::string_view current(ctx->buffer.data(), received);
+        header_end_pos = current.find("\r\n\r\n");
+        if (header_end_pos != std::string_view::npos) {
+            break;
+        }
+        // After the first chunk, switch to a short timeout for subsequent reads.
+        // If no more data arrives within 1s, treat what we have as complete.
+        if (received > 0) {
+            set_socket_timeout(guard.get(), SO_RCVTIMEO, std::chrono::seconds(1));
+        }
+    }
+    if (received == 0) {
         return;
     }
-    const auto received = static_cast<std::size_t>(n);
-    // 读满缓冲意味着请求可能还有未读部分，请求行未必完整。
-    // 把这个事实传给路由层，由它区分 400（格式错）与 414（URL 过长）。
     const bool request_complete = received < kRequestBufferBytes;
     std::string_view request(ctx->buffer.data(), received);
-
     // 读体前先校验请求行：非法请求直接回错，不为它等 body。
     // 否则攻击者声明 Content-Length: 60000 却不发 body，能把一个 worker 永久钉死
     // （worker 数有限，几条这样的连接即可拒绝服务）。响应口径与 route_request
@@ -523,8 +637,7 @@ void HttpServer::handle_client(std::intptr_t client_fd, std::uint64_t request_id
         }
         // 读体超时：声明了 body 却不发（或发一半消失）的客户端不得钉死 worker。
         // 超时后 recv 返回 -1/EAGAIN，读体循环退出，body 按不完整交给路由层。
-        const struct timeval body_tv{5, 0};
-        setsockopt(guard.get(), SOL_SOCKET, SO_RCVTIMEO, &body_tv, sizeof(body_tv));
+        set_socket_timeout(guard.get(), SO_RCVTIMEO, std::chrono::seconds(5));
         const auto header_end = request.find("\r\n\r\n");
         const std::size_t body_offset = header_end + 4;  // find 成功是 find_content_length 的前提
         const std::size_t have = received > body_offset ? received - body_offset : 0;
@@ -534,7 +647,7 @@ void HttpServer::handle_client(std::intptr_t client_fd, std::uint64_t request_id
             SsizeType m = 0;
             do {
                 m = recv(guard.get(), chunk, sizeof(chunk), 0);
-            } while (m < 0 && errno == EINTR);
+            } while (m < 0 && socket_error_is_interrupted(last_socket_error()));
             if (m <= 0) {
                 break;  // 对端断开：body 不完整，路由层按既有语义处理
             }
@@ -566,6 +679,7 @@ void HttpServer::handle_client(std::intptr_t client_fd, std::uint64_t request_id
     append_http_response(resp, ctx->response);
 
     // 发送失败不影响计数（请求已被完整处理），guard 会关闭 socket。
+        set_socket_timeout(guard.get(), SO_SNDTIMEO, std::chrono::seconds(10));
     (void)send_all(guard.get(), ctx->response.data(), ctx->response.size());
 }
 

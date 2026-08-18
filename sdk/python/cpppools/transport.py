@@ -63,6 +63,22 @@ def _extract_message(body):
     return text[:200]
 
 
+def _read_body(response, url):
+    """Read response body safely; classify truncation as NodeUnavailable.
+
+    Both normal responses and HTTPError objects have a read() method.
+    If the body read fails (e.g. IncompleteRead when the node dies mid-response),
+    the error is classified as NodeUnavailable so the client can blacklist and
+    failover, rather than letting a raw exception escape the error matrix.
+    """
+    try:
+        return response.read()
+    except (urllib.error.URLError, socket.timeout, TimeoutError,
+            ConnectionError, http.client.HTTPException, OSError) as exc:
+        raise errors.NodeUnavailable(
+            "node response truncated: %s: %s" % (url, exc)) from None
+
+
 def request(method, url, payload=None, headers=None, opener=None,
             timeout=DEFAULT_TIMEOUT):
     """一次 HTTP 请求（GET/POST）。成功/307 返回 Response；其余按矩阵抛。
@@ -79,10 +95,10 @@ def request(method, url, payload=None, headers=None, opener=None,
         req.add_header(name, value)
     try:
         resp = opener.open(req, timeout=timeout)
-        body = resp.read()
+        body = _read_body(resp, url)
         return Response(resp.status, resp.headers.items(), body)
     except urllib.error.HTTPError as e:
-        body = e.read()
+        body = _read_body(e, url)
         resp_headers = e.headers.items() if e.headers is not None else []
         if e.code == 307:
             return Response(307, resp_headers, body)

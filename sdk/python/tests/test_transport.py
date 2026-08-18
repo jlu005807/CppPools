@@ -179,5 +179,56 @@ class TestRequestShape(unittest.TestCase):
         self.assertEqual(json.loads(req.data), {"a": 1})
 
 
+class TestTruncatedErrorBody(unittest.TestCase):
+    """Phase 5 Task 4: HTTPError whose read() raises must be NodeUnavailable."""
+
+    def test_httperror_incompleteread_is_node_unavailable(self):
+        import http.client as hc
+
+        def raise_truncated(req):
+            class _TruncatedHTTPError(urllib.error.HTTPError):
+                def read(self):
+                    raise hc.IncompleteRead(b"partial")
+            raise _TruncatedHTTPError(req.full_url, 503, "",
+                                     _Headers([]), io.BytesIO(b""))
+
+        with self.assertRaises(errors.NodeUnavailable) as ctx:
+            transport.post_json("http://n:1/api/v1/select", {},
+                                opener=FakeOpener(raise_truncated))
+        self.assertIn("truncated", str(ctx.exception).lower())
+
+    def test_normal_response_incompleteread_is_node_unavailable(self):
+        import http.client as hc
+
+        def truncated_ok(req):
+            return 200, [], b'{"ok":true}'
+
+        # Also verify a normal response whose read() raises is classified
+        def truncated_read(req):
+            class _TruncatedResponse:
+                status = 200
+                headers = _Headers([])
+
+                def read(self):
+                    raise hc.IncompleteRead(b"partial")
+            return _TruncatedResponse()
+
+        # The FakeOpener handler returns a tuple for normal responses,
+        # so we need a custom opener for this case.
+        class _CustomOpener:
+            def __init__(self):
+                self.requests = []
+
+            def open(self, request, timeout=None):
+                self.requests.append(request)
+                import http.client as hc
+                raise hc.IncompleteRead(b"partial")
+
+        with self.assertRaises(errors.NodeUnavailable):
+            transport.post_json("http://n:1/api/v1/select", {},
+                                opener=_CustomOpener())
+
+
+
 if __name__ == "__main__":
     unittest.main()

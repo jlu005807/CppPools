@@ -10,8 +10,10 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <thread>
+
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -342,6 +344,248 @@ static void test_graceful_stop_returns_from_start() {
     server_thread.join();  // 线程已结束，join 立即返回
 }
 
+// ===== Phase 4 Task 3: Fragmented header tests =====
+
+static void send_fragment(int fd, const char* data) {
+    const std::size_t len = std::strlen(data);
+    assert(send(fd, data, len, 0) == static_cast<ssize_t>(len));
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+}
+
+static void test_fragmented_header_reassembled() {
+    // Task 3: send request line and headers in multiple TCP segments.
+    // The server must reassemble them into a complete request before routing.
+    Fixture f(2, 4);
+    int fds[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+
+    std::thread server_thread([&f, fd = fds[0]] {
+        f.server.handle_client(static_cast<std::intptr_t>(fd), 1);
+    });
+
+    // Send header in fragments - no \r\n\r\n until the last fragment.
+    send_fragment(fds[1], "POST /health HT");
+    send_fragment(fds[1], "TP/1.1\r\nContent-Len");
+    send_fragment(fds[1], "gth: 5\r\n");
+    // No terminator yet - server should not respond.
+    {
+        struct timeval tv{0, 200 * 1000};
+        setsockopt(fds[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        char peek[64];
+        ssize_t early = recv(fds[1], peek, sizeof(peek), 0);
+        assert(early <= 0 && "no response before terminator");
+    }
+    // Send terminator + body.
+    send_fragment(fds[1], "\r\nabcde");
+
+    struct timeval tv{3, 0};
+    setsockopt(fds[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    std::string resp;
+    char buf[256];
+    ssize_t n;
+    while ((n = recv(fds[1], buf, sizeof(buf), 0)) > 0) {
+        resp.append(buf, static_cast<std::size_t>(n));
+    }
+    server_thread.join();
+    ::close(fds[1]);
+    assert(resp.find("405") != std::string::npos && "fragmented header must be reassembled and routed");
+}
+
+static void test_incomplete_header_timeout_does_not_hang() {
+    // Task 3: client sends partial header (no \r\n\r\n) and disappears.
+    // Server must not hang 30s; it should return a response within a few seconds
+    // (after the 1s subsequent-read timeout kicks in).
+    Fixture f(2, 4);
+    int fds[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+
+    auto start_time = std::chrono::steady_clock::now();
+    std::thread server_thread([&f, fd = fds[0]] {
+        f.server.handle_client(static_cast<std::intptr_t>(fd), 1);
+    });
+
+    // Send a valid request line but no terminator.
+    {
+        const std::string req_line = "GET /health HTTP/1.1\r\n";
+        assert(send(fds[1], req_line.data(), req_line.size(), 0) ==
+               static_cast<ssize_t>(req_line.size()));
+    }
+    // Do NOT send \r\n - let the server's 1s subsequent-read timeout fire.
+
+    struct timeval tv{5, 0};
+    setsockopt(fds[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    char buf[256];
+    ssize_t n = recv(fds[1], buf, sizeof(buf), 0);
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - start_time).count();
+    server_thread.join();
+    ::close(fds[1]);
+
+    // Server should respond (likely 400 or 414 for incomplete request).
+    assert(n > 0 && "server must respond to incomplete header, not hang silently");
+    assert(elapsed < 5 && "incomplete header must not wait 30s");
+}
+
+// ===== Phase 4 Task 2: Shutdown safety with queued/stalled requests =====
+
+static void test_queued_request_drained_on_shutdown() {
+    // Task 2: worker is held on an incomplete body; a second connection is queued;
+    // request_stop(); release the first request; start() must drain the queued one.
+    Fixture f(2, 4);
+    std::atomic<bool> stopped{false};
+
+    // Use a single worker so the first request blocks the pool.
+    std::thread server_thread([&f, &stopped] {
+        f.server.start();
+        stopped.store(true);
+    });
+
+    // Wait for bind.
+    uint16_t port = 0;
+    for (int i = 0; i < 200 && port == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        port = f.server.bound_port();
+    }
+    assert(port != 0);
+
+    // First connection: send header without body -> worker blocks reading body.
+    const int fd1 = socket(AF_INET, SOCK_STREAM, 0);
+    assert(fd1 >= 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    assert(connect(fd1, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+    const std::string hdr1 = "POST /health HTTP/1.1\r\nContent-Length: 5\r\n\r\n";
+    assert(send(fd1, hdr1.data(), hdr1.size(), 0) == static_cast<ssize_t>(hdr1.size()));
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+    // Second connection: queued behind the first.
+    const int fd2 = socket(AF_INET, SOCK_STREAM, 0);
+    assert(fd2 >= 0);
+    assert(connect(fd2, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+    const std::string hdr2 = "GET /health HTTP/1.1\r\n";
+    assert(send(fd2, hdr2.data(), hdr2.size(), 0) == static_cast<ssize_t>(hdr2.size()));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Stop: start() should not return while the worker is still busy.
+    f.server.request_stop();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    assert(!stopped.load() && "start() must not return while in-flight requests remain");
+
+    // Release the first request by sending the body.
+    assert(send(fd1, "abcde", 5, 0) == 5);
+
+    // start() should now drain and return.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!stopped.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    assert(stopped.load() && "start() must return after draining in-flight + queued work");
+
+    // Read responses from both connections.
+    struct timeval tv{2, 0};
+    setsockopt(fd1, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd2, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    char buf[256];
+    // fd1 got 405 (POST /health).
+    ssize_t n1 = recv(fd1, buf, sizeof(buf), 0);
+    assert(n1 > 0);
+    std::string resp1(buf, static_cast<std::size_t>(n1));
+    assert(resp1.find("405") != std::string::npos);
+    // fd2 got 200 (GET /health).
+    ssize_t n2 = recv(fd2, buf, sizeof(buf), 0);
+    assert(n2 > 0);
+    std::string resp2(buf, static_cast<std::size_t>(n2));
+    assert(resp2.find("200") != std::string::npos);
+
+    ::close(fd1);
+    ::close(fd2);
+    server_thread.join();
+}
+
+static void test_stalled_connection_forced_shutdown() {
+    // Task 2: peer never completes the request. After the 5s drain window,
+    // start() must force-interrupt the socket and return.
+    Fixture f(2, 4);
+    std::atomic<bool> stopped{false};
+
+    std::thread server_thread([&f, &stopped] {
+        f.server.start();
+        stopped.store(true);
+    });
+
+    uint16_t port = 0;
+    for (int i = 0; i < 200 && port == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        port = f.server.bound_port();
+    }
+    assert(port != 0);
+
+    // Connect and send header without body; never send the body.
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(fd >= 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    assert(connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+    const std::string hdr = "POST /health HTTP/1.1\r\nContent-Length: 5\r\n\r\n";
+    assert(send(fd, hdr.data(), hdr.size(), 0) == static_cast<ssize_t>(hdr.size()));
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+    // Request stop. The stalled connection should cause a forced shutdown.
+    f.server.request_stop();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (!stopped.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    assert(stopped.load() && "forced shutdown must return within 15s for stalled connection");
+
+    ::close(fd);
+    server_thread.join();
+}
+
+// ===== Phase 4 Task 4: Send deadline with non-reading peer =====
+
+static void test_send_deadline_with_non_reading_peer() {
+    // Task 4: request a response larger than the peer's receive buffer,
+    // and leave the peer unread. The handler must exit after the send deadline
+    // instead of blocking forever.
+    Fixture f(2, 4);
+    int fds[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+
+    // Shrink the peer's receive buffer so the send blocks quickly.
+    int rcvbuf = 1024;
+    setsockopt(fds[1], SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    // Also set the send buffer small on the server side.
+    int sndbuf = 1024;
+    setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
+    // Request /api/v1/stats which returns a large JSON body.
+    auto start_time = std::chrono::steady_clock::now();
+    std::thread server_thread([&f, fd = fds[0]] {
+        f.server.handle_client(static_cast<std::intptr_t>(fd), 1);
+    });
+
+    // Send the request.
+    const std::string req = "GET /api/v1/stats HTTP/1.1\r\n";
+    assert(send(fds[1], req.data(), req.size(), 0) == static_cast<ssize_t>(req.size()));
+
+    // Do NOT read the response. The server's send_all should time out after 10s.
+    // We wait for the server thread to finish, with a 15s upper bound.
+    server_thread.join();
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - start_time).count();
+
+    // Send deadline is 10s; allow some slack for CI.
+    assert(elapsed < 15 && "send deadline must prevent indefinite blocking");
+    assert(elapsed >= 1 && "should not return instantly with unread peer");
+
+    ::close(fds[1]);
+}
+
 static void test_graceful_stop_drains_inflight_request() {
     // 有在途请求时停机：start() 必须等在途跑完（排空）才返回，
     // 而不是立即返回把它丢弃 —— 排空分支的真实连接回归
@@ -414,5 +658,10 @@ int main() {
     test_request_id_header_echoed();
     test_graceful_stop_returns_from_start();
     test_graceful_stop_drains_inflight_request();
+    test_fragmented_header_reassembled();
+    test_incomplete_header_timeout_does_not_hang();
+    test_queued_request_drained_on_shutdown();
+    test_stalled_connection_forced_shutdown();
+    test_send_deadline_with_non_reading_peer();
     return 0;
 }

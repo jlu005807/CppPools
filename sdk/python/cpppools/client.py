@@ -203,13 +203,19 @@ class ClusterClient:
                                           is_fallback, retry_allowed)
             except errors.NodeUnavailable:
                 self._blacklist_node(node_id)
+                if not retry_allowed:
+                    raise
                 next_attempt = used_attempt + 1
                 continue
             try:
-                resp = self._follow_redirects(resp, payload)
+                resp = self._follow_redirects(resp, payload, is_fallback,
+                                             retry_allowed)
             except errors.NodeUnavailable:
                 # 重定向目标不可达：响应 307 的节点是活的，不得拉黑它；
                 # 只推进绕行重新选点（307 本身 = 环视图滞后，刷拓扑收敛）。
+                # 非幂等操作不得在 redirect 失败后换节点重发。
+                if not retry_allowed:
+                    raise
                 self._refresh_topology(startup=False)
                 next_attempt = used_attempt + 1
                 continue
@@ -254,17 +260,45 @@ class ClusterClient:
                 break  # 全部节点都试过且不可用
         return None, scan_limit
 
-    def _follow_redirects(self, resp, payload):
+    def _follow_redirects(self, resp, payload, is_fallback, retry_allowed):
         """307 跟随（§5.5：不计重试）：服务端权威纠偏环视图滞后。
-        跟随目标不可达时抛 NodeUnavailable，由主循环只绕行不拉黑。"""
+        跟随目标不可达时抛 NodeUnavailable，由主循环只绕行不拉黑。
+
+        is_fallback 由发起请求保守性决定，不得因 307 升级为 True
+        （Fallback 单调性：只能保持或降级，不能变激进）。
+        retry_allowed 透传给目标重试策略：非幂等操作的重定向目标同样不得重试。"""
         follows = 0
         while resp.status == 307:
             follows += 1
             if follows > 3 or not resp.location:
                 raise errors.ServerError("redirect loop or bad Location")
-            resp = self._http("POST", resp.location, payload,
-                              self._build_headers(is_fallback=True))
+            resp = self._send_url_with_retry(resp.location, payload,
+                                             is_fallback, retry_allowed)
         return resp
+
+    def _node_for_url(self, url):
+        """从 URL 反查 node_id（redirect target 在已知拓扑内时返回）。"""
+        for node_id, base in self._topology.nodes.items():
+            if url == base or url.startswith(base + "/"):
+                return node_id
+        return None
+
+    def _send_url_with_retry(self, url, payload, is_fallback, retry_allowed):
+        """对 redirect target 发送：已知节点用 retry/backoff；不可达时
+        只拉黑目标（不拉黑 307 响应者），然后上抛由主循环绕行。"""
+        target_id = self._node_for_url(url)
+        retries = 0
+        while True:
+            headers = self._build_headers(is_fallback=is_fallback)
+            try:
+                return self._http("POST", url, payload, headers)
+            except (errors.NodeUnavailable,) + _KNOWN_RETRYABLE:
+                if target_id is not None:
+                    self._blacklist_node(target_id)
+                if not retry_allowed or retries >= self._retry_max:
+                    raise
+                retries += 1
+                time.sleep(self._backoff_delay(retries))
 
     def _first_available(self, candidates, now):
         with self._lock:

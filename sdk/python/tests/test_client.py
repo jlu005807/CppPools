@@ -458,5 +458,193 @@ class TestRetryMatrix(unittest.TestCase):
         self.assertEqual(len(fc.requests_to("node-a", "/api/v1/select")), 3)
 
 
+class TestAutoIncrementNoFailover(unittest.TestCase):
+    """Phase 5 Task 1: auto-increment insert must not fail over after commit."""
+
+    def test_commit_then_disconnect_does_not_failover(self):
+        fc = FakeCluster(["node-a", "node-b"])
+        committed = []
+        calls = []
+
+        def fake_select(payload, headers):
+            return 200, [], b'{"rows":[],"row_count":0}'
+
+        def fake_insert_a(payload, headers):
+            committed.append(payload)
+            raise errors.NodeUnavailable("response lost after commit")
+
+        def fake_insert_b(payload, headers):
+            return 201, [], b'{"affected_rows":1,"inserted_id":9}'
+
+        fc.set_responder("node-a", "/api/v1/select", fake_select)
+        fc.set_responder("node-a", "/api/v1/insert", fake_insert_a)
+        fc.set_responder("node-b", "/api/v1/select", fake_select)
+        fc.set_responder("node-b", "/api/v1/insert", fake_insert_b)
+        client = fc.make_client()
+
+        with self.assertRaises(errors.NodeUnavailable):
+            client.insert("users", {"name": "x"})
+
+        # Exactly one insert was sent, and it went to node-a only.
+        inserts = [r for r in fc.log if r["path"] == "/api/v1/insert"]
+        self.assertEqual(len(inserts), 1, "auto-increment must not be retried")
+        self.assertEqual(inserts[0]["node"], "node-a")
+        self.assertEqual(len(committed), 1, "payload was committed once")
+        # No request reached node B.
+        b_inserts = [r for r in fc.log if r["node"] == "node-b" and r["path"] == "/api/v1/insert"]
+        self.assertEqual(len(b_inserts), 0, "must not fail over non-idempotent insert")
+
+    def test_explicit_key_insert_still_retries_on_failover(self):
+        fc = FakeCluster(["node-a", "node-b"])
+        state = {"n": 0}
+
+        def flaky(payload, headers):
+            state["n"] += 1
+            if state["n"] == 1:
+                raise errors.NodeUnavailable("node-a down")
+            return 201, [], b'{"affected_rows":1,"inserted_id":5}'
+
+        # Find a key owned by node-a
+        key = None
+        for k in range(100):
+            if fc.independent_owner(str(k)) == "node-a":
+                key = k
+                break
+        self.assertIsNotNone(key)
+
+        fc.set_responder("node-a", "/api/v1/insert", flaky)
+        fc.set_responder("node-b", "/api/v1/insert",
+                         lambda p, h: (201, [], b'{"affected_rows":1,"inserted_id":5}'))
+        client = fc.make_client()
+        resp = client.insert("users", {"id": key, "name": "a"})
+        self.assertEqual(resp["inserted_id"], 5)
+        # Explicit key = idempotent, so failover is allowed.
+        self.assertGreater(state["n"], 0)
+
+
+class TestRedirectFallbackMonotonicity(unittest.TestCase):
+    """Phase 5 Task 2: fallback hint must be preserved, not created, by 307."""
+
+    def _owned_key(self, fc, node):
+        for k in range(100):
+            if fc.independent_owner(str(k)) == node:
+                return k
+        raise AssertionError("no key found for %s" % node)
+
+    def test_normal_request_redirect_has_no_fallback(self):
+        fc = FakeCluster(["node-a", "node-b"])
+        follow_headers = {}
+
+        def redirect(payload, headers):
+            return 307, [("Location", "http://node-b:80/api/v1/select")], b'{}'
+
+        def capture_follow(payload, headers):
+            follow_headers.clear(); follow_headers.update(headers)
+            return 200, [], b'{"rows":[],"row_count":0}'
+
+        key = self._owned_key(fc, "node-a")
+        fc.set_responder("node-a", "/api/v1/select", redirect)
+        fc.set_responder("node-b", "/api/v1/select", capture_follow)
+        client = fc.make_client()
+        resp = client.select("users", {"column": "id", "value": key})
+        self.assertEqual(resp["row_count"], 0)
+        self.assertNotIn("X-CppPools-Fallback", follow_headers,
+                         "normal redirect must not gain fallback hint")
+
+    def test_fallback_request_redirect_preserves_fallback(self):
+        fc = FakeCluster(["node-a", "node-b", "node-c"])
+        follow_headers = {}
+
+        def redirect(payload, headers):
+            return 307, [("Location", "http://node-c:80/api/v1/select")], b'{}'
+
+        def capture_follow(payload, headers):
+            follow_headers.clear(); follow_headers.update(headers)
+            return 200, [], b'{"rows":[],"row_count":0}'
+
+        key = self._owned_key(fc, "node-a")
+        fc.set_responder("node-a", "/api/v1/select", redirect)
+        fc.set_responder("node-b", "/api/v1/select", redirect)
+        fc.set_responder("node-c", "/api/v1/select", capture_follow)
+        client = fc.make_client()
+        # Make node-a unavailable so we go through fallback to node-b first.
+        fc.set_down("node-a")
+        resp = client.select("users", {"column": "id", "value": key})
+        self.assertEqual(resp["row_count"], 0)
+        # The redirect follow should have preserved the fallback hint.
+        self.assertEqual(follow_headers.get("X-CppPools-Fallback"), "1",
+                         "fallback hint must be preserved across redirect")
+
+
+class TestRedirectTargetRetry(unittest.TestCase):
+    """Phase 5 Task 3: redirect targets get retry/backoff; target attribution."""
+
+    def _owned_key(self, fc, node):
+        for k in range(100):
+            if fc.independent_owner(str(k)) == node:
+                return k
+        raise AssertionError("no key found for %s" % node)
+
+    def test_redirect_target_503_then_success(self):
+        fc = FakeCluster(["node-a", "node-b"])
+        state = {"n": 0}
+
+        def redirect(payload, headers):
+            return 307, [("Location", "http://node-b:80/api/v1/select")], b'{}'
+
+        def flaky(payload, headers):
+            state["n"] += 1
+            if state["n"] == 1:
+                return 503, [], b'{"error":"busy"}'
+            return 200, [], b'{"rows":[],"row_count":0}'
+
+        key = self._owned_key(fc, "node-a")
+        fc.set_responder("node-a", "/api/v1/select", redirect)
+        fc.set_responder("node-b", "/api/v1/select", flaky)
+        client = fc.make_client()
+        resp = client.select("users", {"column": "id", "value": key})
+        self.assertEqual(resp["row_count"], 0)
+        self.assertGreaterEqual(state["n"], 2, "target should retry on 503")
+        # node-a (the 307 responder) must not be blacklisted.
+        self.assertNotIn("node-a", client.blacklisted_nodes())
+
+    def test_redirect_target_unreachable_blacklists_target_only(self):
+        fc = FakeCluster(["node-a", "node-b", "node-c"])
+
+        def redirect(payload, headers):
+            return 307, [("Location", "http://node-b:80/api/v1/select")], b'{}'
+
+        key = self._owned_key(fc, "node-a")
+        fc.set_responder("node-a", "/api/v1/select", redirect)
+        fc.set_down("node-b")
+        client = fc.make_client()
+        with self.assertRaises(errors.CppPoolsError):
+            client.select("users", {"column": "id", "value": key})
+        # node-b should be blacklisted (it's the unreachable target).
+        self.assertIn("node-b", client.blacklisted_nodes())
+        # node-a must not be blacklisted (it returned a valid 307).
+        self.assertNotIn("node-a", client.blacklisted_nodes())
+
+    def test_autoincrement_insert_redirected_to_unreachable_does_not_retry(self):
+        fc = FakeCluster(["node-a", "node-b"])
+
+        def redirect(payload, headers):
+            return 307, [("Location", "http://node-b:80/api/v1/insert")], b'{}'
+
+        fc.set_responder("node-a", "/api/v1/insert", redirect)
+        fc.set_down("node-b")
+        client = fc.make_client()
+        with self.assertRaises(errors.CppPoolsError):
+            client.insert("users", {"name": "auto"})
+        # Only one insert attempt to node-a (the 307).
+        inserts_a = [r for r in fc.log if r["node"] == "node-a" and r["path"] == "/api/v1/insert"]
+        self.assertEqual(len(inserts_a), 1)
+        # node-b should be blacklisted (unreachable target), node-a should not.
+        self.assertIn("node-b", client.blacklisted_nodes())
+        self.assertNotIn("node-a", client.blacklisted_nodes())
+
+
+
+
 if __name__ == "__main__":
     unittest.main()
