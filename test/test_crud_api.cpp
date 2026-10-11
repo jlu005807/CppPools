@@ -4,16 +4,21 @@
 // route_request 不碰 socket，纯函数式验证"请求文本→响应文本"。
 
 #include "cpppools/db/datasource_registry.h"
+#include "cpppools/db/database_factory.h"
 #include "cpppools/pool/object_pool.h"
 #include "cpppools/pool/thread_pool.h"
 #include "cpppools/server/http_server.h"
 #include "db/sqlite_database.h"
+#include "server/crud_api.h"
+#include "server/hash_ring.h"
+#include "server/ownership_router.h"
 
 #include <sqlite3.h>
 
 #include <cassert>
 #include <cstdio>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -21,6 +26,67 @@
 using namespace cpppools;
 
 namespace {
+
+struct ThrowingBackendState {
+    bool throw_next_select{false};
+    int select_calls{0};
+};
+
+ThrowingBackendState* g_throwing_backend_state = nullptr;
+
+class ThrowingDatabase final : public db::Database {
+public:
+    explicit ThrowingDatabase(ThrowingBackendState& state)
+        : db::Database(make_schema(), "main"), state_(state) {}
+
+    bool healthy() override { return true; }
+    std::string backend_type() const override { return "throwing"; }
+
+protected:
+    db::DbResult<db::ResultSet> do_select(const db::SelectRequest&) override {
+        ++state_.select_calls;
+        if (state_.throw_next_select) {
+            state_.throw_next_select = false;
+            throw std::runtime_error("controlled backend failure");
+        }
+        db::ResultSet rs;
+        rs.columns = {"id", "name"};
+        rs.rows.push_back({db::Value{std::int64_t{1}}, db::Value{std::string("cached")}});
+        return {db::DbStatus::kOk, std::move(rs), ""};
+    }
+
+    db::DbResult<db::InsertResult> do_insert(const db::InsertRequest&) override {
+        return {db::DbStatus::kOk, db::InsertResult{1, std::nullopt}, ""};
+    }
+    db::DbResult<db::RowCount> do_update(const db::UpdateRequest&) override {
+        return {db::DbStatus::kOk, 1, ""};
+    }
+    db::DbResult<db::RowCount> do_remove(const db::DeleteRequest&) override {
+        return {db::DbStatus::kOk, 1, ""};
+    }
+
+private:
+    static db::Schema make_schema() {
+        db::Schema schema;
+        db::TableInfo users;
+        users.name = "users";
+        users.columns = {
+            {"id", db::ValueKind::kInteger, false, true, true, false},
+            {"name", db::ValueKind::kText, false, false, false, false},
+        };
+        schema.add_table(std::move(users));
+        return schema;
+    }
+
+    ThrowingBackendState& state_;
+};
+
+db::DatabaseCreateResult make_throwing_database(const config::DataSourceConfig&) {
+    if (g_throwing_backend_state == nullptr) {
+        return {nullptr, "throwing backend state is not initialized"};
+    }
+    return {std::make_unique<ThrowingDatabase>(*g_throwing_backend_state), ""};
+}
 
 bool contains(const std::string& haystack, const std::string& needle) {
     return haystack.find(needle) != std::string::npos;
@@ -348,6 +414,68 @@ static void test_non_string_datasource_is_400() {
     assert(contains(resp.body, "datasource"));
 }
 
+// Ownership bypass must be scoped to the borrowed connection.  A backend
+// exception after the gate must not leave the pooled CachingDatabase in bypass
+// mode for the next request.
+static void test_bypass_is_reset_after_backend_exception() {
+    ThrowingBackendState state;
+    g_throwing_backend_state = &state;
+    assert(db::register_database_type("throwing", &make_throwing_database));
+
+    config::DataSourceConfig source;
+    source.name = "main";
+    source.type = "throwing";
+    source.pool_size = 1;
+    config::AppConfig::Cache cache_cfg;
+    cache_cfg.enabled = true;
+    auto built = db::DataSourceRegistry::build({source}, cache_cfg);
+    assert(built.registry != nullptr);
+    auto registry = std::move(built.registry);
+
+    server::ClusterView view;
+    view.nodes = {{"node-a", "127.0.0.1", 18080},
+                  {"node-b", "127.0.0.1", 18081}};
+    server::HashRing ring;
+    ring.add_node("node-a", view.vnodes_per_node);
+    ring.add_node("node-b", view.vnodes_per_node);
+    view.node_id = ring.owner(server::hash_ring::query_key(
+        "main", "users", "id", "1", 0));
+    server::OwnershipRouter router(view);
+
+    const std::string body =
+        R"({"table":"users","datasource":"main",)"
+        R"("where":{"column":"id","value":1}})";
+    server::CrudApiContext ctx{*registry, body, std::chrono::milliseconds(100),
+                               false, "", &router};
+
+    const auto first = server::handle_select(ctx);
+    assert(first.status_code == 200);
+    assert(state.select_calls == 1);
+
+    // A stale epoch keeps this node local but disables cache reads/fills.
+    ctx.epoch = "stale";
+    state.throw_next_select = true;
+    bool threw = false;
+    try {
+        (void)server::handle_select(ctx);
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    assert(threw);
+    assert(state.select_calls == 2);
+
+    // If bypass leaked through the pool, this request would hit the backend
+    // again.  Correct cleanup lets it serve the cached row without a call.
+    ctx.epoch.clear();
+    const auto after = server::handle_select(ctx);
+    assert(after.status_code == 200);
+    assert(state.select_calls == 2);
+
+    registry.reset();
+    g_throwing_backend_state = nullptr;
+    assert(db::unregister_database_type("throwing"));
+}
+
 // ---------------------------------------------------------------------------
 // /api/v1/schema：自省快照（不暴露后端 type）
 // ---------------------------------------------------------------------------
@@ -393,6 +521,7 @@ int main() {
     test_missing_notnull_column_is_400();
     test_invalid_utf8_text_is_replaced_not_500();
     test_non_string_datasource_is_400();
+    test_bypass_is_reset_after_backend_exception();
     test_schema_endpoint();
     return 0;
 }

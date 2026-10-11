@@ -259,6 +259,31 @@ struct GateOutcome {
     bool epoch_mismatch{false};
 };
 
+// Ownership bypass belongs to one borrowed Database instance, not to the
+// request's normal-return path.  The guard restores it before DbConnGuard
+// returns the connection to the pool, including exception unwinding.
+class CacheBypassGuard {
+public:
+    CacheBypassGuard(Database& db, bool active) : db_(&db), active_(active) {}
+    ~CacheBypassGuard() noexcept {
+        if (active_) {
+            try {
+                db_->set_cache_bypass(false);
+            } catch (...) {
+                // Reset is cleanup; it must not replace the request's
+                // original exception or terminate stack unwinding.
+            }
+        }
+    }
+
+    CacheBypassGuard(const CacheBypassGuard&) = delete;
+    CacheBypassGuard& operator=(const CacheBypassGuard&) = delete;
+
+private:
+    Database* db_;
+    bool active_;
+};
+
 // 服务端权威自判：用已借连接查 schema 定路由键 → decide。
 // 返回非空 = 直接回 307；否则继续本地执行（门控结果写入 *out）。
 // 只对"唯一列且非 REAL"的键门控：非唯一列留给本地校验管道回 400
@@ -351,11 +376,9 @@ ApiResponse handle_select(const CrudApiContext& ctx) {
                                                    "/api/v1/select", &gate)) {
         return *redirect;
     }
-    // 统一收口：bypass 复位（归还前）+ epoch 回显（§5.4）。
+    CacheBypassGuard bypass_guard(*guard.get(), gate.bypass);
+    // 统一收口：epoch 回显（§5.4）；bypass 由作用域守卫负责复位。
     auto finalize = [&](ApiResponse r) {
-        if (gate.bypass) {
-            guard.get()->set_cache_bypass(false);
-        }
         if (gate.epoch_mismatch) {
             r.extra_headers.emplace_back("X-CppPools-Epoch",
                                          std::to_string(ctx.router->self_epoch()));
@@ -440,10 +463,8 @@ ApiResponse handle_insert(const CrudApiContext& ctx) {
             }
         }
     }
+    CacheBypassGuard bypass_guard(*guard.get(), gate.bypass);
     auto finalize = [&](ApiResponse r) {
-        if (gate.bypass) {
-            guard.get()->set_cache_bypass(false);
-        }
         if (gate.epoch_mismatch) {
             r.extra_headers.emplace_back("X-CppPools-Epoch",
                                          std::to_string(ctx.router->self_epoch()));
@@ -503,10 +524,8 @@ ApiResponse handle_update(const CrudApiContext& ctx) {
                                                    "/api/v1/update", &gate)) {
         return *redirect;
     }
+    CacheBypassGuard bypass_guard(*guard.get(), gate.bypass);
     auto finalize = [&](ApiResponse r) {
-        if (gate.bypass) {
-            guard.get()->set_cache_bypass(false);
-        }
         if (gate.epoch_mismatch) {
             r.extra_headers.emplace_back("X-CppPools-Epoch",
                                          std::to_string(ctx.router->self_epoch()));
@@ -553,10 +572,8 @@ ApiResponse handle_delete(const CrudApiContext& ctx) {
                                                    "/api/v1/delete", &gate)) {
         return *redirect;
     }
+    CacheBypassGuard bypass_guard(*guard.get(), gate.bypass);
     auto finalize = [&](ApiResponse r) {
-        if (gate.bypass) {
-            guard.get()->set_cache_bypass(false);
-        }
         if (gate.epoch_mismatch) {
             r.extra_headers.emplace_back("X-CppPools-Epoch",
                                          std::to_string(ctx.router->self_epoch()));
