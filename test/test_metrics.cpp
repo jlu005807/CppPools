@@ -9,6 +9,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cassert>
+#include <map>
 #include <set>
 #include <sstream>
 #include <string>
@@ -59,7 +60,9 @@ struct Fixture {
         cfg.type = "sqlite";
         cfg.sqlite_path = db_path;
         cfg.pool_size = 8;
-        auto result = db::DataSourceRegistry::build({cfg});
+        config::AppConfig::Cache cache_cfg;
+        cache_cfg.enabled = true;
+        auto result = db::DataSourceRegistry::build({cfg}, cache_cfg);
         assert(result.registry != nullptr);
         registry = std::move(result.registry);
         return *registry;
@@ -149,6 +152,35 @@ static void test_metrics_help_type_precede_samples() {
         }
     }
     assert(!typed.empty());
+}
+
+static void test_metrics_declares_each_family_once() {
+    Fixture f;
+    const server::ApiResponse resp = f.get("/metrics");
+    assert(resp.status_code == 200);
+
+    std::map<std::string, int> help_count;
+    std::map<std::string, int> type_count;
+    std::istringstream in(resp.body);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.rfind("# HELP ", 0) == 0) {
+            const auto end = line.find(' ', 7);
+            ++help_count[line.substr(7, end - 7)];
+        } else if (line.rfind("# TYPE ", 0) == 0) {
+            const auto end = line.find(' ', 7);
+            ++type_count[line.substr(7, end - 7)];
+        }
+    }
+    assert(!help_count.empty());
+    for (const auto& [name, count] : help_count) {
+        assert(count == 1 && "each Prometheus family must have one HELP line");
+        assert(type_count[name] == 1 && "each Prometheus family must have one TYPE line");
+    }
+    for (const auto& [name, count] : type_count) {
+        assert(count == 1 && "each Prometheus family must have one TYPE line");
+        assert(help_count[name] == 1 && "each TYPE must have one HELP line");
+    }
 }
 
 static void test_metrics_task_exception_help_warns_detached_only() {
@@ -244,6 +276,7 @@ int main() {
     test_metrics_has_pool_labels();
     test_metrics_old_names_removed();
     test_metrics_help_type_precede_samples();
+    test_metrics_declares_each_family_once();
     test_metrics_task_exception_help_warns_detached_only();
     test_stats_json_has_new_fields();
     test_get_config_has_capacities();

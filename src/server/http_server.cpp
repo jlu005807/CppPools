@@ -929,6 +929,12 @@ ApiResponse HttpServer::handle_metrics() const {
             << "cpppools_db_pool_rebuild_failed_total" << db_label << " " << dps.rebuild_failed_total << "\n";
     }
 
+    // cache_bypass_total has samples from both the row-cache and ownership
+    // sections below.  Declare the Prometheus family once before either
+    // section emits samples; HELP/TYPE must never be duplicated.
+    out << "# HELP cpppools_cache_bypass_total Local processing that bypassed cache, by reason.\n"
+        << "# TYPE cpppools_cache_bypass_total counter\n";
+
     // ===== 行级缓存（每数据源一行，pool 标签 = 数据源名）=====
     const auto cache_list = registry_.caches();
     if (!cache_list.empty()) {
@@ -946,8 +952,6 @@ ApiResponse HttpServer::handle_metrics() const {
             << "# TYPE cpppools_cache_invalidations_total counter\n"
             << "# HELP cpppools_cache_singleflight_merged_total Concurrent misses merged by singleflight.\n"
             << "# TYPE cpppools_cache_singleflight_merged_total counter\n"
-            << "# HELP cpppools_cache_bypass_total Entries skipped, by reason (spec §8.1; 期1 仅 too_large).\n"
-            << "# TYPE cpppools_cache_bypass_total counter\n"
             << "# HELP cpppools_cache_backfill_dropped_total Backfills dropped by generation CAS (spec §4.3.1).\n"
             << "# TYPE cpppools_cache_backfill_dropped_total counter\n"
             << "# HELP cpppools_cache_flush_total Full cache flushes, by reason (spec §5.2 rule B).\n"
@@ -977,9 +981,7 @@ ApiResponse HttpServer::handle_metrics() const {
         const OwnershipRouter::Stats rs = router_->stats();
         out << "# HELP cpppools_redirects_total 307 redirects issued to the key owner.\n"
             << "# TYPE cpppools_redirects_total counter\n"
-            << "cpppools_redirects_total " << rs.redirects << "\n"
-            << "# HELP cpppools_cache_bypass_total Local processing that bypassed cache (cluster-level reasons; too_large is cache-level, above).\n"
-            << "# TYPE cpppools_cache_bypass_total counter\n";
+            << "cpppools_redirects_total " << rs.redirects << "\n";
         for (const auto& [pool, n] : rs.bypass_not_owner) {
             out << "cpppools_cache_bypass_total{pool=\"" << prometheus_label_escape(pool)
                 << "\",reason=\"not_owner\"} " << n << "\n";
