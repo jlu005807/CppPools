@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace cpppools::db {
@@ -69,6 +71,12 @@ public:
     bool read_column(std::size_t i, const TableInfo& table, Value* out);
 
 private:
+    // MariaDB 10.x exposes MYSQL_BIND::is_null/error as my_bool* while
+    // newer MySQL headers use bool*. Derive the pointee type from the
+    // client header so the same source builds against either ABI.
+    using MysqlBindBool = std::remove_pointer_t<
+        decltype(std::declval<MYSQL_BIND>().is_null)>;
+
     // 写侧参数槽：每个参数一个槽，MYSQL_BIND.buffer 指向其中对应成员。
     // 用 vector + reserve 保证地址稳定（不 realloc）。
     struct WriteSlot {
@@ -76,7 +84,7 @@ private:
         double dv{0.0};
         std::string sv;
         unsigned long length{0};
-        bool is_null{false};
+        MysqlBindBool is_null{false};
     };
     std::vector<WriteSlot> write_slots_;
     std::vector<MYSQL_BIND> write_binds_;
@@ -87,10 +95,10 @@ private:
         double dv{0.0};
         std::vector<char> raw;   // text buffer, pre-allocated per column max length
         unsigned long length{0};
-        bool is_null{false};
-        bool error{false};
+        MysqlBindBool is_null{false};
+        MysqlBindBool error{false};
         bool is_unsigned{false};
-    };;
+    };
     std::vector<ReadSlot> read_slots_;
     std::vector<MYSQL_BIND> read_binds_;
 

@@ -153,10 +153,10 @@ bool introspect_columns(MYSQL* conn, const std::string& table, TableInfo* out,
                         std::string* error) {
     // 查询本表的列。table_schema 由 make_mysql_database 传入，这里用 SELECT DATABASE()
     // 取当前连接的默认库 —— 与 mysql_real_connect 指定的库一致，避免再传 schema 参数。
-    char esc_table[2 * table.size() + 1];
-    const unsigned long esc_len = mysql_real_escape_string_quote(
-        conn, esc_table, table.c_str(), static_cast<unsigned long>(table.size()), '\'');
-    const std::string escaped_table(esc_table, esc_len);
+    std::vector<char> esc_table(table.size() * 2 + 1);
+    const unsigned long esc_len = mysql_real_escape_string(
+        conn, esc_table.data(), table.c_str(), static_cast<unsigned long>(table.size()));
+    const std::string escaped_table(esc_table.data(), esc_len);
     const std::string sql =
         "SELECT column_name, data_type, is_nullable, column_key, extra "
         "FROM information_schema.columns "
@@ -228,11 +228,11 @@ bool introspect_columns(MYSQL* conn, const std::string& table, TableInfo* out,
 // - 普通索引（non_unique=1）：忽略。
 // 用 statistics 聚合判联合，绝不用 columns.column_key='UNI'（会误标联合唯一）。
 bool introspect_unique_indexes(MYSQL* conn, TableInfo* table, std::string* error) {
-    char esc_tbl[2 * table->name.size() + 1];
-    const unsigned long esc_len2 = mysql_real_escape_string_quote(
-        conn, esc_tbl, table->name.c_str(),
-        static_cast<unsigned long>(table->name.size()), '\'');
-    const std::string escaped_tbl(esc_tbl, esc_len2);
+    std::vector<char> esc_tbl(table->name.size() * 2 + 1);
+    const unsigned long esc_len2 = mysql_real_escape_string(
+        conn, esc_tbl.data(), table->name.c_str(),
+        static_cast<unsigned long>(table->name.size()));
+    const std::string escaped_tbl(esc_tbl.data(), esc_len2);
     const std::string sql =
         "SELECT index_name, column_name, sub_part, non_unique "
         "FROM information_schema.statistics "
@@ -970,7 +970,10 @@ DbResult<RowCount> MysqlDatabase::do_update(const UpdateRequest& req) {
         return {DbStatus::kBackendError, 0, lock_stmt->error()};
     }
     ResultSet lock_rs;
-    lock_rs.columns = table->columns;
+    lock_rs.columns.reserve(table->columns.size());
+    for (const auto& column : table->columns) {
+        lock_rs.columns.push_back(column.name);
+    }
     if (table->columns.size() == 0) {
         // no columns? treat as empty
     }

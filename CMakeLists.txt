@@ -233,6 +233,11 @@ cpppools_add_test(test_ownership)
 if (CPPPOOLS_USE_MYSQL)
     cpppools_add_test(test_mysql_introspection)
     cpppools_add_test(test_mysql_crud)
+    # These tests intentionally exercise the real client API.  Keep the
+    # client headers private to the tests instead of leaking them through the
+    # public cpppools target interface.
+    target_include_directories(test_mysql_introspection SYSTEM PRIVATE ${MYSQL_INCLUDE_DIR})
+    target_include_directories(test_mysql_crud SYSTEM PRIVATE ${MYSQL_INCLUDE_DIR})
 endif()
 
 # =========================
