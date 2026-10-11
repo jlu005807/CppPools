@@ -7,6 +7,7 @@
 #include "sqlite_pool_fixture.h"
 
 #include <cassert>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -586,6 +587,54 @@ static void test_send_deadline_with_non_reading_peer() {
     ::close(fds[1]);
 }
 
+static void test_send_deadline_is_total_under_slow_reader() {
+    // A peer that drains one byte at a time can keep each individual blocking
+    // send below SO_SNDTIMEO while still exhausting a worker for far longer.
+    // The response must obey one wall-clock deadline for the whole send loop.
+    Fixture f(2, 4);
+    int fds[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    int sndbuf = 128;
+    assert(setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) == 0);
+    int rcvbuf = 128;
+    assert(setsockopt(fds[1], SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) == 0);
+
+    std::atomic<bool> server_done{false};
+    const auto start_time = std::chrono::steady_clock::now();
+    std::thread server_thread([&f, &server_done, fd = fds[0]] {
+        f.server.handle_client(static_cast<std::intptr_t>(fd), 1);
+        server_done.store(true, std::memory_order_release);
+    });
+    std::thread slow_reader([&server_done, fd = fds[1]] {
+        char byte;
+        while (!server_done.load(std::memory_order_acquire)) {
+            const ssize_t n = recv(fd, &byte, 1, 0);
+            if (n <= 0) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    });
+
+    const std::string req = "GET /metrics HTTP/1.1\r\n";
+    assert(send(fds[1], req.data(), req.size(), 0) == static_cast<ssize_t>(req.size()));
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(12);
+    while (!server_done.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - start_time).count();
+    if (!server_done.load(std::memory_order_acquire)) {
+        ::close(fds[1]);
+    }
+    server_thread.join();
+    slow_reader.join();
+    assert(server_done.load(std::memory_order_acquire));
+    assert(elapsed < 12 && "send loop must obey a total deadline under slow reads");
+}
+
 static void test_graceful_stop_drains_inflight_request() {
     // 有在途请求时停机：start() 必须等在途跑完（排空）才返回，
     // 而不是立即返回把它丢弃 —— 排空分支的真实连接回归
@@ -663,5 +712,6 @@ int main() {
     test_queued_request_drained_on_shutdown();
     test_stalled_connection_forced_shutdown();
     test_send_deadline_with_non_reading_peer();
+    test_send_deadline_is_total_under_slow_reader();
     return 0;
 }

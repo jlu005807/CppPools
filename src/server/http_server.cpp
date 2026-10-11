@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <iomanip>
@@ -30,6 +31,7 @@ static constexpr SocketType kInvalidSocket = INVALID_SOCKET;
 using SsizeType = int;
 #else
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -150,6 +152,38 @@ bool set_socket_timeout(SocketType fd, int option,
 #endif
 }
 
+bool set_socket_nonblocking(SocketType fd) noexcept {
+#ifdef _WIN32
+    u_long mode = 1;
+    return ioctlsocket(fd, FIONBIO, &mode) == 0;
+#else
+    const int flags = fcntl(fd, F_GETFL, 0);
+    return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+#endif
+}
+
+bool wait_socket_writable(SocketType fd, std::chrono::milliseconds timeout) noexcept {
+    if (timeout <= std::chrono::milliseconds::zero()) {
+        return false;
+    }
+#ifdef _WIN32
+    fd_set set;
+    FD_ZERO(&set);
+    FD_SET(fd, &set);
+    struct timeval tv;
+    tv.tv_sec = static_cast<long>(timeout.count() / 1000);
+    tv.tv_usec = static_cast<long>((timeout.count() % 1000) * 1000);
+    return select(static_cast<int>(fd + 1), nullptr, &set, nullptr, &tv) > 0;
+#else
+    struct pollfd pfd{};
+    pfd.fd = fd;
+    pfd.events = POLLOUT;
+    const auto count = std::min<std::int64_t>(timeout.count(), INT_MAX);
+    return poll(&pfd, 1, static_cast<int>(count)) > 0 &&
+           (pfd.revents & (POLLOUT | POLLERR | POLLHUP)) != 0;
+#endif
+}
+
 // Wait for a socket to become readable (for accept wakeup on Windows).
 bool wait_socket_readable(SocketType fd, std::chrono::milliseconds timeout) noexcept {
     fd_set set;
@@ -237,15 +271,30 @@ bool is_api_route(RouteId id) {
 // - written == 0 → 罕见但必须防：不防就是死循环，而且恰好发生在过载这种最糟时刻。
 //
 // 用 kSendFlags（Linux 上是 MSG_NOSIGNAL）避免 SIGPIPE 直接终止进程。
-// 响应均为百字节级，新连接的发送缓冲必然容得下，因此在阻塞 socket 上
-// 也不会真的卡住调用方。**若未来响应体变大，这个前提需要重新评估。**
+// 非阻塞 + 可写等待确保慢速对端不能通过不断制造短写重置整次操作的预算。
 bool send_all(SocketType fd, const char* data, std::size_t total) noexcept {
+    constexpr auto kSendDeadline = std::chrono::seconds(10);
+    if (!set_socket_nonblocking(fd)) {
+        return false;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + kSendDeadline;
     std::size_t sent = 0;
     while (sent < total) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
         const SsizeType written = send(fd, data + sent, total - sent, kSendFlags);
         if (written < 0) {
             const int err = last_socket_error();
             if (socket_error_is_interrupted(err)) {
+                continue;
+            }
+            if (socket_error_is_would_block(err)) {
+                const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - std::chrono::steady_clock::now());
+                if (!wait_socket_writable(fd, remaining)) {
+                    return false;
+                }
                 continue;
             }
             return false;
