@@ -71,21 +71,25 @@ protected:
             // leader 未缓存（0 行 / 错误 / 被失效丢弃）：自己回源。
             return inner_->select(req);
         }
-        // leader：先记世代 → 回源 → 锁内原子 CAS 回填或丢弃。
-        const std::uint64_t seq0 = cache_->generation(key);
+        // leader：join_flight 已原子捕获世代和 flight 身份；回源后按同一
+        // token 完成，不能再单独读取 generation（否则同分片其他键失效
+        // 可能让旧 leader 误触碰新 flight）。
+        const std::uint64_t seq0 = flight.generation;
+        const std::uint64_t flight_id = flight.flight_id;
         // RAII 守卫：回源/转换路径若抛异常，兜底兑现 promise 并摘 flight，
         // 否则等待者的 future->get() 永久阻塞（占住 worker 与池槽位）。
         struct LeaderGuard {
             RowCache* cache;
             RowCacheKey key;
             std::uint64_t gen;
+            std::uint64_t flight_id;
             bool finished{false};
             ~LeaderGuard() {
                 if (!finished) {
-                    cache->finish_flight(key, std::nullopt, gen);
+                    cache->finish_flight(key, std::nullopt, gen, flight_id);
                 }
             }
-        } guard{cache_.get(), key, seq0};
+        } guard{cache_.get(), key, seq0, flight_id};
 
         // Always read the full row so later requests for other columns get real values.
         // Record the read-start time so TTL begins at source-read initiation.
@@ -97,9 +101,9 @@ protected:
             RowData row = to_row_data(result);
             // 世代比对在 finish_flight 的临界区内与写入原子完成；
             // 被拦下的回填由 RowCache 计 backfill_dropped（§8.1 导出）。
-            cache_->finish_flight(key, std::move(row), seq0, read_started);
+            cache_->finish_flight(key, std::move(row), seq0, flight_id, read_started);
         } else {
-            cache_->finish_flight(key, std::nullopt, seq0, read_started);
+            cache_->finish_flight(key, std::nullopt, seq0, flight_id, read_started);
         }
         guard.finished = true;
         if (result.status == DbStatus::kOk && !result.value.rows.empty()) {

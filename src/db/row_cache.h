@@ -96,6 +96,8 @@ public:
     struct Flight {
         std::shared_ptr<std::shared_future<std::optional<RowData>>> future;
         bool leader{false};
+        std::uint64_t flight_id{0};
+        std::uint64_t generation{0};
     };
 
     explicit RowCache(RowCacheConfig cfg)
@@ -204,6 +206,7 @@ public:
             f.future = std::make_shared<std::shared_future<std::optional<RowData>>>(
                 ready->get_future().share());
             f.leader = false;
+            f.generation = shard.generation;
             return f;
         }
         const auto fit = shard.flights.find(k);
@@ -212,16 +215,22 @@ public:
             Flight f;
             f.future = fit->second.future;
             f.leader = false;
+            f.flight_id = fit->second.flight_id;
+            f.generation = fit->second.generation;
             return f;
         }
         auto promise = std::make_shared<std::promise<std::optional<RowData>>>();
         auto shared = std::make_shared<std::shared_future<std::optional<RowData>>>(
             promise->get_future().share());
-        shard.flights.emplace(k, Shard::FlightEntry{promise, shared, shard.generation});
+        const std::uint64_t flight_id = ++shard.next_flight_id;
+        shard.flights.emplace(k, Shard::FlightEntry{
+            promise, shared, shard.generation, flight_id});
         ++shard.stats.misses;
         Flight f;
         f.future = shared;
         f.leader = true;
+        f.flight_id = flight_id;
+        f.generation = shard.generation;
         return f;
     }
 
@@ -233,28 +242,47 @@ public:
     bool finish_flight(const RowCacheKey& key, std::optional<RowData> result,
                        std::uint64_t expected_generation,
                        std::chrono::steady_clock::time_point cached_at = std::chrono::steady_clock::now()) {
+        return finish_flight(key, std::move(result), expected_generation, 0, cached_at);
+    }
+
+    // 身份化完成：生产 leader 必须携带 join_flight 返回的 flight_id，
+    // 防止迟到旧 leader 摘除已经替换的新 flight。
+    bool finish_flight(const RowCacheKey& key, std::optional<RowData> result,
+                       std::uint64_t expected_generation,
+                       std::uint64_t flight_id,
+                       std::chrono::steady_clock::time_point cached_at = std::chrono::steady_clock::now()) {
         const std::string k = key.encode();
         Shard& shard = shard_of(k);
         std::shared_ptr<std::promise<std::optional<RowData>>> promise;
         bool stored = false;
+        bool stale = false;
         {
             std::lock_guard<std::mutex> lock(shard.mu);
             const auto fit = shard.flights.find(k);
-            if (fit != shard.flights.end() &&
-                fit->second.generation == expected_generation) {
+            if (flight_id != 0) {
+                if (fit == shard.flights.end() || fit->second.flight_id != flight_id) {
+                    stale = true;
+                } else {
+                    promise = fit->second.promise;
+                    stale = fit->second.generation != expected_generation;
+                    shard.flights.erase(fit);
+                }
+            } else if (fit != shard.flights.end()) {
                 promise = fit->second.promise;
+                stale = fit->second.generation != expected_generation;
                 shard.flights.erase(fit);
             }
             if (result.has_value()) {
-                if (shard.generation == expected_generation) {
+                if (!stale && shard.generation == expected_generation) {
                     stored = put_locked(shard, k, *result, cached_at);
                 } else {
+                    stale = true;
                     ++shard.stats.backfill_dropped;
                 }
             }
         }
         if (promise) {
-            promise->set_value(std::move(result));
+            promise->set_value(stale ? std::nullopt : std::move(result));
         }
         return stored;
     }
@@ -313,7 +341,9 @@ private:
             std::shared_ptr<std::promise<std::optional<RowData>>> promise;
             std::shared_ptr<std::shared_future<std::optional<RowData>>> future;
             std::uint64_t generation{0};
+            std::uint64_t flight_id{0};
         };
+        std::uint64_t next_flight_id{0};
         mutable std::unordered_map<std::string, FlightEntry> flights;
         ShardStats stats;
     };

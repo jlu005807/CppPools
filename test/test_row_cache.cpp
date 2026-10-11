@@ -7,6 +7,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <future>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -195,8 +196,9 @@ static void test_singleflight_only_one_leader() {
     assert(leader_slots.size() == 1 && "同键并发必须只有一个 leader");
 
     // leader 完成回填 → 等待者拿到同一结果。
-    const std::uint64_t gen0 = cache.generation(key);
-    cache.finish_flight(key, make_row(1, "alice"), gen0);
+    const std::uint64_t gen0 = flights[leader_slots[0]].generation;
+    cache.finish_flight(key, make_row(1, "alice"), gen0,
+                        flights[leader_slots[0]].flight_id);
     for (std::size_t i = 0; i < kWaiters; ++i) {
         const auto result = flights[i].future->get();
         assert(result.has_value());
@@ -217,6 +219,36 @@ static void test_singleflight_releases_key_after_finish() {
     assert(!f.leader);
     assert(f.future->wait_for(std::chrono::seconds(0)) == std::future_status::ready);
     assert(f.future->get().has_value());
+}
+
+// 失效同一分片的另一个键时，不能让旧 flight 因世代变化而遗留：
+// 旧 follower 必须被兑现为空结果，下一次请求必须能建立新 leader。
+static void test_other_key_invalidation_retires_old_flight() {
+    auto cfg = fast_ttl_config();
+    cfg.shard_count = 1;
+    RowCache cache(cfg);
+    const auto key_a = key_of("users", 1);
+    const auto key_b = key_of("users", 2);
+
+    const RowCache::Flight leader = cache.join_flight(key_a);
+    const RowCache::Flight follower = cache.join_flight(key_a);
+    assert(leader.leader);
+    assert(!follower.leader);
+    cache.invalidate(key_b);
+    const std::uint64_t expected_generation = cache.generation(key_a);
+    assert(!cache.finish_flight(key_a, make_row(1, "stale"), expected_generation,
+                                leader.flight_id));
+
+    assert(follower.future->wait_for(std::chrono::milliseconds(100)) ==
+           std::future_status::ready);
+    assert(!follower.future->get().has_value());
+
+    const RowCache::Flight replacement = cache.join_flight(key_a);
+    assert(replacement.leader);
+    assert(cache.finish_flight(key_a, make_row(1, "fresh"),
+                               replacement.generation, replacement.flight_id));
+    assert(replacement.future->get().has_value());
+    assert(std::get<std::string>((*replacement.future->get())[1].second) == "fresh");
 }
 
 // 世代号拦下回填（spec §4.3.1 / §9）：不用 sleep 赌竞态 —— 时序完全由
@@ -284,13 +316,13 @@ static void test_invalidate_retires_old_flight_with_nullopt() {
     RowCache::Flight fresh = cache.join_flight(key);
     assert(fresh.leader);
 
-    cache.finish_flight(key, make_row(1, "stale"), 0);
+    cache.finish_flight(key, make_row(1, "stale"), 0, old.flight_id);
 
     const auto old_result = old.future->get();
     assert(!old_result.has_value() && "retired waiter must not receive stale data");
 
     const std::uint64_t fresh_gen = cache.generation(key);
-    cache.finish_flight(key, make_row(1, "fresh"), fresh_gen);
+    cache.finish_flight(key, make_row(1, "fresh"), fresh_gen, fresh.flight_id);
 
     const auto fresh_result = fresh.future->get();
     assert(fresh_result.has_value());
@@ -314,14 +346,14 @@ static void test_clear_retires_inflight_with_nullopt() {
     const auto old_result = old.future->get();
     assert(!old_result.has_value() && "clear must retire in-flight with nullopt");
 
-    const bool stored = cache.finish_flight(key, make_row(1, "stale"), 0);
+    const bool stored = cache.finish_flight(key, make_row(1, "stale"), 0, old.flight_id);
     assert(!stored && "stale backfill after clear must not enter cache");
     assert(!cache.get(key).has_value() && "cache must be empty after clear+drop");
 
     RowCache::Flight fresh = cache.join_flight(key);
     assert(fresh.leader);
     const std::uint64_t fresh_gen = cache.generation(key);
-    cache.finish_flight(key, make_row(1, "fresh"), fresh_gen);
+    cache.finish_flight(key, make_row(1, "fresh"), fresh_gen, fresh.flight_id);
     const auto fresh_result = fresh.future->get();
     assert(fresh_result.has_value());
     assert(std::get<std::string>((*fresh_result)[1].second) == "fresh");
@@ -357,8 +389,9 @@ static void test_concurrent_misses_counted_once() {
     assert(cache.stats().singleflight_merged == static_cast<std::uint64_t>(N - 1) &&
            "N-1 followers merged");
 
-    const std::uint64_t gen = cache.generation(key);
-    cache.finish_flight(key, make_row(1, "alice"), gen);
+    const std::uint64_t gen = flights[leader_slots[0]].generation;
+    cache.finish_flight(key, make_row(1, "alice"), gen,
+                        flights[leader_slots[0]].flight_id);
 
     for (std::size_t i = 0; i < static_cast<std::size_t>(N); ++i) {
         const auto result = flights[i].future->get();
@@ -381,6 +414,7 @@ int main() {
     test_invalidate_removes_and_bumps_generation();
     test_singleflight_only_one_leader();
     test_singleflight_releases_key_after_finish();
+    test_other_key_invalidation_retires_old_flight();
     test_backfill_after_invalidation_is_dropped();
     test_clear_removes_all_and_counts_flush();
     test_invalidate_retires_old_flight_with_nullopt();
