@@ -582,7 +582,7 @@ bool MysqlStmt::bind_result() {
                 b.buffer_length = sizeof(long long);
                 // Read UNSIGNED_FLAG to know if the column is unsigned.
                 s.is_unsigned = (f->flags & UNSIGNED_FLAG) != 0;
-                b.is_unsigned = static_cast<my_bool>(s.is_unsigned);
+                b.is_unsigned = s.is_unsigned;
                 break;
             case MYSQL_TYPE_FLOAT:
             case MYSQL_TYPE_DOUBLE:

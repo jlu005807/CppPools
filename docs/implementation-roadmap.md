@@ -73,13 +73,13 @@ S0.1 是构建门槛；S0.2 与 S0.3 属于缓存正确性，建议连续完成�
 
 | 阶段 | 提交 | 实际证据 | 状态 |
 |---|---|---|---|
-| S0.1 | `b4e893f` | MariaDB 客户端头/库临时隔离目录下，`CPPPOOLS_USE_MYSQL=ON` 构建、链接成功；ON CTest 20 个目标均登记并通过，两个 MySQL 集成用例因未设置 `CPPPOOLS_TEST_MYSQL_USER` 明确 SKIP | 代码通过；真实数据库验收待账号 |
+| S0.1 | `b4e893f` 及 Windows 兼容补丁 | WSL/MariaDB ON 构建、链接成功；本机 Windows MySQL Server 8.0.11 + 官方 Connector include/lib 下，MySQL 后端与两个专项测试均构建、链接成功。`test_mysql_introspection`、`test_mysql_crud` 连接真实本机服务并通过，测试库前缀 `cpppools_intro_test_`/`cpppools_crud_test_` 已确认清理 | 通过；Windows 全套 CTest 仍受 `test_http_server.cpp` 使用 POSIX 头文件阻断，不属于 S0.1 MySQL 专项 |
 | S0.2 | `ff1ebe4` | `test_other_key_invalidation_retires_old_flight` 先 RED 后 GREEN；OFF CTest 18/18、ON CTest 20/20 | 通过 |
 | S0.3 | `44536b6` | 可控 throwing backend 先证明 bypass 泄漏，再用 RAII guard 修复；OFF/ON 全量回归通过 | 通过 |
 | S0.4 | `07a3999` | 缓存启用的重复 HELP/TYPE 测试先 RED 后 GREEN；OFF/ON 全量回归通过 | 通过 |
 | S0.5 | `b401ba1`, `1222945` | 非读端和每 50ms 读 1 字节端两类发送测试；过载响应 header/body 共享同一绝对 deadline；非 HTTP 测试 17/17，`test_http_server` 独立运行退出码 0；ON 同样完成构建，HTTP 专项退出码 0 | 通过 |
 
-S0 的剩余验收阻断只有真实 MySQL 服务账号：配置 `CPPPOOLS_TEST_MYSQL_HOST/PORT/USER/PASSWORD` 后，必须重新运行 `test_mysql_introspection` 和 `test_mysql_crud`，并把输出和退出码记录到阶段证据；在此之前不进入 S1。
+S0 的 MySQL 专项已在本机真实服务完成验收。Windows 原生整套 CTest 不能全通过：`test_http_server.cpp` 直接包含 POSIX `arpa/inet.h`/socket 头，导致该目标不能在 MinGW 原生构建；OFF 与 WSL ON 全量回归通过，两个 MySQL 专项在 Windows 原生构建中实际通过。此平台限制须保留为证据，不把缺失目标或 MySQL 测试结果混为一谈。
 
 ## 3. 真正的依赖与可调整的先后
 
