@@ -77,7 +77,7 @@ S0.1 是构建门槛；S0.2 与 S0.3 属于缓存正确性，建议连续完成�
 | S0.2 | `ff1ebe4` | `test_other_key_invalidation_retires_old_flight` 先 RED 后 GREEN；OFF CTest 18/18、ON CTest 20/20 | 通过 |
 | S0.3 | `44536b6` | 可控 throwing backend 先证明 bypass 泄漏，再用 RAII guard 修复；OFF/ON 全量回归通过 | 通过 |
 | S0.4 | `07a3999` | 缓存启用的重复 HELP/TYPE 测试先 RED 后 GREEN；OFF/ON 全量回归通过 | 通过 |
-| S0.5 | `b401ba1` | 非读端和每 50ms 读 1 字节端两类发送测试；非 HTTP 测试 17/17，`test_http_server` 独立运行退出码 0；ON 同样完成构建，HTTP 专项退出码 0 | 通过 |
+| S0.5 | `b401ba1`, `1222945` | 非读端和每 50ms 读 1 字节端两类发送测试；过载响应 header/body 共享同一绝对 deadline；非 HTTP 测试 17/17，`test_http_server` 独立运行退出码 0；ON 同样完成构建，HTTP 专项退出码 0 | 通过 |
 
 S0 的剩余验收阻断只有真实 MySQL 服务账号：配置 `CPPPOOLS_TEST_MYSQL_HOST/PORT/USER/PASSWORD` 后，必须重新运行 `test_mysql_introspection` 和 `test_mysql_crud`，并把输出和退出码记录到阶段证据；在此之前不进入 S1。
 
