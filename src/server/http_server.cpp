@@ -272,12 +272,11 @@ bool is_api_route(RouteId id) {
 //
 // 用 kSendFlags（Linux 上是 MSG_NOSIGNAL）避免 SIGPIPE 直接终止进程。
 // 非阻塞 + 可写等待确保慢速对端不能通过不断制造短写重置整次操作的预算。
-bool send_all(SocketType fd, const char* data, std::size_t total) noexcept {
-    constexpr auto kSendDeadline = std::chrono::seconds(10);
+bool send_all_until(SocketType fd, const char* data, std::size_t total,
+                    std::chrono::steady_clock::time_point deadline) noexcept {
     if (!set_socket_nonblocking(fd)) {
         return false;
     }
-    const auto deadline = std::chrono::steady_clock::now() + kSendDeadline;
     std::size_t sent = 0;
     while (sent < total) {
         if (std::chrono::steady_clock::now() >= deadline) {
@@ -305,6 +304,11 @@ bool send_all(SocketType fd, const char* data, std::size_t total) noexcept {
         sent += static_cast<std::size_t>(written);
     }
     return true;
+}
+
+bool send_all(SocketType fd, const char* data, std::size_t total) noexcept {
+    return send_all_until(fd, data, total,
+                          std::chrono::steady_clock::now() + std::chrono::seconds(10));
 }
 
 // 在 accept 循环里直接写一个最小 503，用于线程池队列已满的背压场景。
@@ -338,8 +342,9 @@ void send_overload_response(SocketType fd) noexcept {
     static_assert(sizeof(kBody) - 1 == 49, "改 kBody 后必须同步 kHead 的 Content-Length");
 
     // 写失败一律忽略：客户端可能已经走了，而此处本就是降级路径。
-    if (send_all(fd, kHead, sizeof(kHead) - 1)) {
-        (void)send_all(fd, kBody, sizeof(kBody) - 1);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    if (send_all_until(fd, kHead, sizeof(kHead) - 1, deadline)) {
+        (void)send_all_until(fd, kBody, sizeof(kBody) - 1, deadline);
     }
 }
 
