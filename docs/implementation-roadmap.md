@@ -33,7 +33,7 @@
 |---|---|---|---|---|
 | S0 基线与五项高优修复 | 历史加固残余项、缓存P0、HTTP生命周期Task 4 | 先完成基线证据和五个只读评审问题：MySQL ON 编译阻断、Singleflight 竞态、bypass 异常复位、Prometheus 重复声明、HTTP 慢速发送总期限 | 目标平台上的基线/定向测试真实运行；五项均有 RED→GREEN 证据；默认内存/静态集群契约不变 | 代码修复完成；MySQL真实账号验收待环境 |
 | S1 远程CLI | CLI阶段0–2 | parser、严格JSON/输出/错误映射、health、四个CRUD，源码`python -m cpppools`入口 | 无网络help/version；远程命令复用SDK；成功写不因CLI重新执行；真实HTTP CRUD | 阶段0–2已完成；本机生命周期/打包仍待S2 |
-| S2 本机CLI与基础打包 | CLI阶段3–5 | POSIX/Windows控制、ready/stopped、start/stop/status、pyproject、cpl入口与包安装 | 目标平台真实进程控制；停止超时不假报成功；源码树外wheel/sdist可安装 | 待执行 |
+| S2 本机CLI与基础打包 | CLI阶段3–5 | POSIX/Windows控制、ready/stopped、start/stop/status、pyproject、cpl入口与包安装 | 目标平台真实进程控制；停止超时不假报成功；源码树外wheel/sdist可安装 | 阶段3 POSIX已完成；阶段4 Windows控制与阶段5打包待执行 |
 | S3 共享缓存与Redis基础 | 缓存P1–P2、P3的transport子任务 | 稳定RowCache协调入口、flight_id/token/异常复位；配置/codec；唯一可选hiredis构建和私有有界transport | 原内存语义不变；flight身份竞态关闭；OFF无依赖、ON能链接；transport确实受总期限/响应大小限制 | 待执行 |
 | S4 本地Redis缓存交付 | 缓存P3剩余部分、P4–P7 | 显式实例→故障冷内存→恢复资格/自启→静态集群验证；运维和性能证据 | SQL成功不因缓存故障变成重试；旧namespace不复活；专用实例归属、停止和支持平台明确 | 待执行 |
 | S5 发现控制面与服务端 | 发现P0–P2 | discovery配置、共享状态/脚本、注册租约、runtime snapshot、HTTP诊断；先cache-off | 新ID可在固定fallback列表外加入；expired lease可重新登记；empty/outage/blocked区别正确；请求线程不访问发现Redis | 待执行 |
@@ -91,7 +91,13 @@ S1 远程 CLI 的 parser、严格输入/health 以及 CRUD SDK 适配已按 RED�
 | S1.1 输入、输出与 health | `ee7e956` | CLI command 定向测试 13/13；SDK 全量回归 81/81（live smoke 默认明确 skip）；临时 SQLite + 真实 `cpppools_server` health 返回 200 | 通过 |
 | S1.2 CRUD SDK 适配 | `d7b339c` | CRUD 定向测试 19 项（含 4 项明确 live skip）通过；SDK 全量回归 87 项（4 skip）；`CPL_RUN_E2E=1` 真实 HTTP 单节点 insert/select/update/delete 往返通过 | 通过 |
 
-S1.2 的 CLI 只负责参数解析、完整 payload 64 KiB 预检、输出和错误码；拓扑、307、epoch、fallback、重试全部由 `ClusterClient` 执行。畸形成功响应映射为 `protocol_error`/退出码 5，且不会由 CLI 重发；无键 insert 不新增重试。S2 本机生命周期与打包、S3–S7 Redis/发现功能仍未实现。
+S1.2 的 CLI 只负责参数解析、完整 payload 64 KiB 预检、输出和错误码；拓扑、307、epoch、fallback、重试全部由 `ClusterClient` 执行。畸形成功响应映射为 `protocol_error`/退出码 5，且不会由 CLI 重发；无键 insert 不新增重试。S2 阶段 3 已落地 POSIX 本机生命周期，阶段 4/5、S3–S7 Redis/发现功能仍未实现。
+
+### 2.4 S2 阶段 3（POSIX 本机生命周期）实施证据（2026-10-13）
+
+新增 `sdk/python/cpppools/local_node.py`，并将 `start/status/stop` 接入 CLI。该阶段使用现有 `cpppools_server --config`，以真实 `/health` 作为 running 证据；状态采用原子 JSON 替换，实例目录使用 POSIX 非阻塞锁，停止前核验 `/proc` 可执行文件身份，Linux zombie 不计为存活。普通停止使用 `SIGTERM`，超时返回 7，无法核验身份返回 8，损坏/缺失状态返回 10。
+
+验证证据：`test_local_node.py` 单元及生命周期测试、CLI dispatch 测试通过；全量 SDK 测试 96 项通过、6 项环境跳过；使用 `build-s0-off-wsl/bin/cpppools_server` 的真实进程完成 start → status → stop，两个 live 用例通过（`-W error`）。阶段 4 的认证控制文件/Windows listener 以及阶段 5 的 `pyproject`/wheel/sdist 尚未实现，不能将本阶段证据外推为完整 S2 或 v1 发布门槛。
 
 ## 3. 真正的依赖与可调整的先后
 

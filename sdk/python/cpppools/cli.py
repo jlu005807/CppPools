@@ -24,6 +24,7 @@ MAX_INPUT_BYTES = 65536
 # initialise a ClusterClient or perform topology/network work.  Tests and
 # embedders may replace this binding with a compatible client implementation.
 ClusterClient = None
+LocalNodeManager = None
 
 
 class InputError(ValueError):
@@ -52,6 +53,27 @@ def _get_cluster_client():
         from .client import ClusterClient as client_type
         ClusterClient = client_type
     return ClusterClient
+
+
+def _get_local_manager():
+    global LocalNodeManager
+    if LocalNodeManager is None:
+        from .local_node import LocalNodeManager as manager_type
+        LocalNodeManager = manager_type
+    return LocalNodeManager
+
+
+def _default_state_root():
+    if os.name == "nt":
+        return os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+                            "CppPools", "cpl", "instances")
+    return os.path.join(os.environ.get("XDG_STATE_HOME",
+                                      os.path.expanduser("~/.local/state")),
+                        "cpl", "instances")
+
+
+def _local_manager(args):
+    return _get_local_manager()(args.state_dir or _default_state_root(), args.name)
 
 
 class _StoreOnce(argparse.Action):
@@ -462,6 +484,36 @@ def run_crud(args):
     return 0
 
 
+def _print_local_result(result, output):
+    if output == "json":
+        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+        return
+    print("%s %s endpoint=%s pid=%s" %
+          (result.get("state", "unknown"), result.get("name", ""),
+           result.get("endpoint") or "-", result.get("pid") or "-"))
+
+
+def _run_local(args, operation):
+    try:
+        manager = _local_manager(args)
+        if operation == "status":
+            result = manager.status()
+        elif operation == "start":
+            result = manager.start(config=args.config, binary=args.binary,
+                                   workdir=args.workdir, log_file=args.log_file,
+                                   timeout=args.timeout, foreground=args.foreground)
+        else:
+            result = manager.stop(timeout=args.timeout, force=args.force)
+        _print_local_result(result, args.output)
+        return 0
+    except Exception as exc:
+        code = getattr(exc, "code", 6)
+        kind = getattr(exc, "kind", "start_error" if operation == "start"
+                        else "local_state_error")
+        _write_runtime_error(kind, exc, code)
+        return code
+
+
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -494,6 +546,8 @@ def main(argv=None):
         except InputError as exc:
             print(str(exc), file=sys.stderr)
             return 2
+    if command in {"start", "stop", "status"}:
+        return _run_local(args, command)
     print("command %s is not implemented in this stage" % command,
           file=sys.stderr)
     return 6

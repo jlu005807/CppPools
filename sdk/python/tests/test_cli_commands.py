@@ -14,7 +14,7 @@ import unittest
 import urllib.request
 from unittest import mock
 
-from cpppools import cli, errors, transport
+from cpppools import cli, errors, local_node, transport
 
 
 class TestStrictJsonInputs(unittest.TestCase):
@@ -413,6 +413,75 @@ class TestCrudCommands(unittest.TestCase):
                 self.assertEqual(out, "")
                 self.assertIn("input", err)
         self.assertFalse(any(call[0] == "init" for call in self.StubClient.calls))
+
+
+class TestLocalCommands(unittest.TestCase):
+    class StubManager:
+        calls = []
+
+        def __init__(self, state_root, name):
+            self.state_root = state_root
+            self.name = name
+            type(self).calls.append(("init", state_root, name))
+
+        def start(self, **kwargs):
+            type(self).calls.append(("start", kwargs))
+            return {"name": self.name, "state": "running", "pid": 123,
+                    "endpoint": "http://127.0.0.1:8080", "launch_id": "l1",
+                    "log_file": "server.log", "already_running": False}
+
+        def status(self):
+            type(self).calls.append(("status",))
+            return {"name": self.name, "state": "stopped", "pid": None,
+                    "process_alive": False, "identity_verified": False}
+
+        def stop(self, **kwargs):
+            type(self).calls.append(("stop", kwargs))
+            return {"name": self.name, "state": "stopped", "pid": 123,
+                    "exit_kind": "graceful", "last_exit_code": None}
+
+    def setUp(self):
+        self.StubManager.calls = []
+
+    def invoke(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(cli, "LocalNodeManager", self.StubManager,
+                               create=True):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = cli.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_status_start_stop_dispatch_to_local_manager(self):
+        code, out, err = self.invoke(["status", "-n", "dev", "-R", "/tmp/state",
+                                      "-o", "json"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["state"], "stopped")
+        code, out, err = self.invoke(["start", "-n", "dev", "-R", "/tmp/state",
+                                      "-c", "/tmp/config.json", "-b", "/tmp/server",
+                                      "-t", "2", "-o", "json"])
+        self.assertEqual(code, 0, err)
+        start = [call for call in self.StubManager.calls if call[0] == "start"][-1]
+        self.assertEqual(start[1]["config"], "/tmp/config.json")
+        self.assertEqual(start[1]["binary"], "/tmp/server")
+        self.assertEqual(start[1]["timeout"], 2.0)
+        code, out, err = self.invoke(["stop", "-n", "dev", "-R", "/tmp/state",
+                                      "-t", "1", "-o", "json"])
+        self.assertEqual(code, 0, err)
+        stop = [call for call in self.StubManager.calls if call[0] == "stop"][-1]
+        self.assertEqual(stop[1], {"timeout": 1.0, "force": False})
+
+    def test_local_manager_error_is_structured(self):
+        class BrokenManager(self.StubManager):
+            def status(self):
+                raise local_node.LocalStateError("state is corrupt")
+
+        with mock.patch.object(cli, "LocalNodeManager", BrokenManager, create=True):
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = cli.main(["status", "-o", "json"])
+        self.assertEqual(code, 10)
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(json.loads(err.getvalue())["kind"], "local_state_error")
 
 
 @unittest.skipUnless(os.environ.get("CPL_RUN_E2E") == "1" and

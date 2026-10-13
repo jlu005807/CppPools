@@ -77,12 +77,12 @@ class TestCliParser(unittest.TestCase):
         self.assertEqual(version_exit.exception.code, 0)
         self.assertIn("0+dev", version_out.getvalue())
 
-    def test_local_management_command_is_not_implemented_yet(self):
+    def test_local_management_missing_state_is_local_error(self):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             code = cli.main(["status"])
-        self.assertEqual(code, 6)
-        self.assertIn("not implemented", err.getvalue())
+        self.assertEqual(code, 10)
+        self.assertIn("local_state_error", err.getvalue())
 
     def test_module_entrypoint_propagates_exit_code(self):
         env = os.environ.copy()
@@ -92,8 +92,8 @@ class TestCliParser(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, "-m", "cpppools", "status"],
             env=env, text=True, capture_output=True, check=False)
-        self.assertEqual(result.returncode, 6)
-        self.assertIn("not implemented", result.stderr)
+        self.assertEqual(result.returncode, 10)
+        self.assertIn("local_state_error", result.stderr)
 
 
 if __name__ == "__main__":
