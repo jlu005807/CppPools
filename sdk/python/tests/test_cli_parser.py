@@ -77,10 +77,10 @@ class TestCliParser(unittest.TestCase):
         self.assertEqual(version_exit.exception.code, 0)
         self.assertIn("0+dev", version_out.getvalue())
 
-    def test_unimplemented_stage_zero_command_returns_stable_error(self):
+    def test_local_management_command_is_not_implemented_yet(self):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            code = cli.main(["health"])
+            code = cli.main(["status"])
         self.assertEqual(code, 6)
         self.assertIn("not implemented", err.getvalue())
 
@@ -90,7 +90,7 @@ class TestCliParser(unittest.TestCase):
             [os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
              env.get("PYTHONPATH", "")])
         result = subprocess.run(
-            [sys.executable, "-m", "cpppools", "health"],
+            [sys.executable, "-m", "cpppools", "status"],
             env=env, text=True, capture_output=True, check=False)
         self.assertEqual(result.returncode, 6)
         self.assertIn("not implemented", result.stderr)

@@ -1,24 +1,40 @@
 """The ``cpl`` command-line contract.
 
-Stage 0 deliberately contains only parsing and dispatch scaffolding.  Remote
-health/CRUD adapters are added in later stages; importing this module must not
-construct an SDK client or perform network I/O.
+The parser, strict JSON input helpers, and remote health probe are implemented
+in the initial CLI stages. CRUD adapters and local process management are added
+in later stages. Importing this module never constructs an SDK client or does
+network I/O.
 """
 
 import argparse
+import json
+import math
+import os
 import sys
+import time
+import urllib.parse
+import urllib.request
+
+from . import errors, transport
 
 
 VERSION = "0+dev"
+MAX_INPUT_BYTES = 65536
+
+
+class InputError(ValueError):
+    pass
 
 
 class _StoreOnce(argparse.Action):
     """Reject repeated scalar options instead of silently taking the last."""
 
     def __call__(self, parser, namespace, values, option_string=None):
-        if getattr(namespace, self.dest, None) is not None:
+        marker = "__cli_set_" + self.dest
+        if getattr(namespace, marker, False):
             raise argparse.ArgumentError(self, "option may only be specified once")
         setattr(namespace, self.dest, values)
+        setattr(namespace, marker, True)
 
 
 def _parser(*args, **kwargs):
@@ -127,6 +143,146 @@ def build_parser():
     return parser
 
 
+def _reject_constant(value):
+    raise InputError("non-finite JSON number: %s" % value)
+
+
+def _parse_int(value):
+    number = int(value)
+    if number < -(1 << 63) or number > (1 << 63) - 1:
+        raise InputError("integer is outside signed int64 range")
+    return number
+
+
+def _parse_float(value):
+    number = float(value)
+    if not math.isfinite(number):
+        raise InputError("non-finite JSON number")
+    return number
+
+
+def _pairs_no_duplicates(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise InputError("duplicate JSON key: %s" % key)
+        result[key] = value
+    return result
+
+
+def _load_json_bytes(data):
+    if len(data) > MAX_INPUT_BYTES:
+        raise InputError("JSON input exceeds 65536 bytes")
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise InputError("JSON input is not valid UTF-8: %s" % exc) from None
+    try:
+        return json.loads(text, object_pairs_hook=_pairs_no_duplicates,
+                          parse_constant=_reject_constant,
+                          parse_int=_parse_int, parse_float=_parse_float)
+    except InputError:
+        raise
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise InputError("invalid JSON: %s" % exc) from None
+
+
+def parse_json_source(source, stdin=None):
+    if source == "-":
+        stream = stdin if stdin is not None else getattr(sys.stdin, "buffer", sys.stdin)
+        data = stream.read(MAX_INPUT_BYTES + 1)
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+    elif source.startswith("@"):
+        try:
+            with open(source[1:], "rb") as handle:
+                data = handle.read(MAX_INPUT_BYTES + 1)
+        except OSError as exc:
+            raise InputError("cannot read JSON file: %s" % exc) from None
+    else:
+        data = source.encode("utf-8")
+    return _load_json_bytes(data)
+
+
+def health_urls(args):
+    urls = args.urls
+    if not urls:
+        urls = [os.environ.get("CPL_URL", "http://127.0.0.1:8080")]
+    for url in urls:
+        try:
+            parsed = urllib.parse.urlsplit(url)
+            hostname = parsed.hostname
+            port = parsed.port
+        except ValueError:
+            raise InputError("invalid URL origin: %s" % url) from None
+        if (parsed.scheme not in ("http", "https") or not hostname or
+                any(character.isspace() for character in hostname) or
+                parsed.username is not None or parsed.password is not None or
+                parsed.path not in ("", "/") or parsed.query or parsed.fragment or
+                (port is not None and not 1 <= port <= 65535)):
+            raise InputError("invalid URL origin: %s" % url)
+    return [url.rstrip("/") for url in urls]
+
+
+def validate_health_args(args):
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        raise InputError("timeout must be a finite positive number")
+    return health_urls(args)
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _health_opener():
+    return urllib.request.build_opener(_NoRedirectHandler())
+
+
+def run_health(args):
+    results = []
+    for base in validate_health_args(args):
+        started = time.monotonic()
+        item = {"url": base, "ok": False, "http_status": None,
+                "body": None, "elapsed_ms": 0.0, "error": None}
+        try:
+            response = transport.request("GET", base + "/health",
+                                         opener=_health_opener(),
+                                         timeout=args.timeout)
+            item["http_status"] = response.status
+            item["body"] = response.body.decode("utf-8", "replace")
+            item["ok"] = response.status == 200
+            if not item["ok"]:
+                item["error"] = "HTTP %d" % response.status
+        except errors.CppPoolsError as exc:
+            item["error"] = str(exc)
+            item["http_status"] = getattr(exc, "status", None)
+        finally:
+            item["elapsed_ms"] = round((time.monotonic() - started) * 1000, 3)
+        results.append(item)
+    if args.output == "json":
+        print(json.dumps({"results": results}, ensure_ascii=False,
+                         separators=(",", ":")))
+    else:
+        for item in results:
+            state = "OK" if item["ok"] else "FAIL"
+            print("%s %s %s" % (state, item["url"],
+                                item["body"] or item["error"] or ""))
+    for item in results:
+        if not item["ok"]:
+            print("health probe failed for %s: %s" %
+                  (item["url"], item["error"] or "non-200 response"),
+                  file=sys.stderr)
+    if any(item["ok"] for item in results) and all(item["ok"] for item in results):
+        return 0
+    if any(item["error"] and item["http_status"] is None for item in results):
+        return 3
+    if any(item["http_status"] is not None and item["http_status"] >= 500
+           for item in results):
+        return 5
+    return 4
+
+
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -147,6 +303,12 @@ def main(argv=None):
         command = "delete"
     else:
         command = args.command
+    if command == "health":
+        try:
+            return run_health(args)
+        except InputError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
     print("command %s is not implemented in this stage" % command,
           file=sys.stderr)
     return 6
