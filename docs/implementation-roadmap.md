@@ -97,7 +97,7 @@ S1.2 的 CLI 只负责参数解析、完整 payload 64 KiB 预检、输出和错
 
 新增 `sdk/python/cpppools/local_node.py`，并将 `start/status/stop` 接入 CLI。该阶段使用现有 `cpppools_server --config`，以真实 `/health` 作为 running 证据；状态采用原子 JSON 替换，实例目录使用 POSIX 非阻塞锁，停止前核验 `/proc` 可执行文件身份，Linux zombie 不计为存活。普通停止使用 `SIGTERM`，超时返回 7，无法核验身份返回 8，损坏/缺失状态返回 10。
 
-验证证据：`test_local_node.py` 单元及生命周期测试、CLI dispatch 测试通过；全量 SDK 测试 96 项通过、6 项环境跳过；使用 `build-s0-off-wsl/bin/cpppools_server` 的真实进程完成 start → status → stop，两个 live 用例通过（`-W error`）。阶段 4 的认证控制文件/Windows listener 以及阶段 5 的 `pyproject`/wheel/sdist 尚未实现，不能将本阶段证据外推为完整 S2 或 v1 发布门槛。
+验证证据：`test_local_node.py` 单元及生命周期测试、CLI dispatch 测试通过；全量 SDK 测试 97 项通过、6 项环境跳过；使用 `build-s0-off-wsl/bin/cpppools_server` 的真实进程完成 start → status → stop，两个 live 用例通过（`-W error`）。阶段 4 的认证控制文件/Windows listener 以及阶段 5 的 `pyproject`/wheel/sdist 尚未实现，不能将本阶段证据外推为完整 S2 或 v1 发布门槛。
 
 ## 3. 真正的依赖与可调整的先后
 

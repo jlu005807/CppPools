@@ -11,6 +11,7 @@ import json
 import os
 import re
 import signal
+import shutil
 import subprocess
 import tempfile
 import time
@@ -210,6 +211,19 @@ class LocalNodeManager:
             raise LocalStateError("server config has invalid port")
         return port
 
+    def resolve_binary(self, binary=None):
+        candidate = binary or "cpppools_server"
+        if os.path.isabs(candidate) or os.path.dirname(candidate):
+            resolved = os.path.abspath(os.path.expanduser(candidate))
+        else:
+            resolved = shutil.which(candidate)
+        if not resolved:
+            raise LocalNodeError("server binary is not executable: %s" % candidate)
+        resolved = os.path.realpath(resolved)
+        if not os.path.isfile(resolved) or not os.access(resolved, os.X_OK):
+            raise LocalNodeError("server binary is not executable: %s" % resolved)
+        return resolved
+
     def _health(self, endpoint, timeout):
         try:
             with urllib.request.urlopen(endpoint + "/health", timeout=timeout) as response:
@@ -233,9 +247,7 @@ class LocalNodeManager:
         config = os.path.abspath(os.path.expanduser(config))
         if not os.path.isfile(config):
             raise LocalNodeError("config file does not exist: %s" % config)
-        binary = os.path.abspath(binary or "cpppools_server")
-        if not os.path.isfile(binary) or not os.access(binary, os.X_OK):
-            raise LocalNodeError("server binary is not executable: %s" % binary)
+        binary = self.resolve_binary(binary)
         workdir = os.path.abspath(os.path.expanduser(workdir or os.getcwd()))
         port = self._config(config)
         endpoint = "http://127.0.0.1:%d" % port

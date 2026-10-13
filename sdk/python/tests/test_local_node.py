@@ -13,6 +13,20 @@ from cpppools import local_node
 
 
 class TestLocalNodeState(unittest.TestCase):
+    def test_binary_without_path_is_resolved_from_path(self):
+        with tempfile.TemporaryDirectory() as root:
+            binary = os.path.join(root, "cpppools_server")
+            with open(binary, "w", encoding="ascii") as handle:
+                handle.write("#!/bin/sh\n")
+            os.chmod(binary, 0o755)
+            manager = local_node.LocalNodeManager(root, "demo")
+            old_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = root + os.pathsep + old_path
+            try:
+                self.assertEqual(manager.resolve_binary(None), os.path.realpath(binary))
+            finally:
+                os.environ["PATH"] = old_path
+
     def test_atomic_state_round_trip_and_status_detects_dead_process(self):
         with tempfile.TemporaryDirectory() as root:
             manager = local_node.LocalNodeManager(root, "demo")
