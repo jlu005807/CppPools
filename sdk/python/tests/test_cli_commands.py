@@ -264,5 +264,235 @@ class TestLiveCppPoolsHealth(unittest.TestCase):
         request.assert_not_called()
 
 
+class TestCrudCommands(unittest.TestCase):
+    class StubClient:
+        calls = []
+        results = {}
+        failures = {}
+
+        def __init__(self, seeds, read_timeout=None):
+            self.seeds = seeds
+            self.read_timeout = read_timeout
+            type(self).calls.append(("init", list(seeds), read_timeout))
+
+        def _call(self, name, *args, **kwargs):
+            type(self).calls.append((name, args, kwargs))
+            failure = type(self).failures.get(name)
+            if failure is not None:
+                raise failure
+            result = type(self).results.get(name)
+            return result() if callable(result) else result
+
+        def select(self, *args, **kwargs):
+            return self._call("select", *args, **kwargs)
+
+        def insert(self, *args, **kwargs):
+            return self._call("insert", *args, **kwargs)
+
+        def update(self, *args, **kwargs):
+            return self._call("update", *args, **kwargs)
+
+        def delete(self, *args, **kwargs):
+            return self._call("delete", *args, **kwargs)
+
+    def setUp(self):
+        self.StubClient.calls = []
+        self.StubClient.results = {}
+        self.StubClient.failures = {}
+
+    def invoke(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(cli, "ClusterClient", self.StubClient, create=True):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = cli.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_crud_commands_map_payloads_and_timeout_to_sdk(self):
+        self.StubClient.results = {
+            "select": {"datasource": "main", "columns": ["id"],
+                       "rows": [[7]], "row_count": 1},
+            "insert": {"datasource": "main", "affected_rows": 1,
+                       "inserted_id": 7},
+            "update": {"datasource": "main", "affected_rows": 0},
+            "delete": {"datasource": "main", "affected_rows": 0},
+        }
+        commands = [
+            (["get", "users", "-w", '{"column":"id","value":7}',
+              "-C", "id", "-d", "main", "-u", "http://seed", "-t", "1.25"],
+             "select", ("users", {"column": "id", "value": 7}, ["id"], "main")),
+            (["add", "users", "-D", '{"id":7,"name":"n"}',
+              "-d", "main", "-u", "http://seed"],
+             "insert", ("users", {"id": 7, "name": "n"}, "main")),
+            (["set", "users", "-w", '{"column":"id","value":7}',
+              "-D", '{"name":"n2"}', "-u", "http://seed"],
+             "update", ("users", {"name": "n2"},
+                         {"column": "id", "value": 7}, None)),
+            (["del", "users", "-w", '{"column":"id","value":7}',
+              "-d", "main", "-u", "http://seed"],
+             "delete", ("users", {"column": "id", "value": 7}, "main")),
+        ]
+        for argv, method, expected in commands:
+            with self.subTest(argv=argv):
+                code, out, err = self.invoke(argv)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(err, "")
+                self.assertTrue(out.strip())
+                call = [item for item in self.StubClient.calls
+                        if item[0] == method][-1]
+                if method == "select":
+                    self.assertEqual(call[1], expected[:2])
+                    self.assertEqual(call[2], {"columns": expected[2],
+                                                "datasource": expected[3]})
+                elif method == "update":
+                    self.assertEqual(call[1], expected[:3])
+                    self.assertEqual(call[2], {"datasource": expected[3]})
+                else:
+                    self.assertEqual(call[1], expected[:2])
+                    self.assertEqual(call[2], {"datasource": expected[2]})
+        init_calls = [item for item in self.StubClient.calls if item[0] == "init"]
+        self.assertEqual(init_calls[0], ("init", ["http://seed"], 1.25))
+
+    def test_zero_rows_are_success_and_json_is_raw_result(self):
+        self.StubClient.results = {
+            "select": {"datasource": "main", "columns": ["id"],
+                       "rows": [], "row_count": 0},
+            "update": {"datasource": "main", "affected_rows": 0},
+        }
+        for argv in (
+            ["select", "users", "-w", '{"column":"id","value":9}', "-o", "json"],
+            ["update", "users", "-w", '{"column":"id","value":9}',
+             "-D", '{"name":"x"}', "-o", "json"],
+        ):
+            code, out, err = self.invoke(argv)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(err, "")
+            self.assertEqual(json.loads(out), self.StubClient.results[
+                "select" if argv[0] == "select" else "update"])
+
+    def test_sdk_errors_map_to_stable_exit_codes(self):
+        cases = [
+            (errors.NodeUnavailable("offline"), 3, "node_unavailable"),
+            (errors.TopologyError("bad topology"), 3, "topology_error"),
+            (errors.ClientError("bad", 400), 4, "client_error"),
+            (errors.ConflictError("conflict", 409), 4, "client_error"),
+            (errors.UnavailableError("busy", 503), 5, "server_error"),
+            (errors.ServerError("down", 500), 5, "server_error"),
+        ]
+        for exception, code_expected, kind in cases:
+            with self.subTest(exception=type(exception).__name__):
+                self.StubClient.failures = {"delete": exception}
+                code, out, err = self.invoke([
+                    "delete", "users", "-w", '{"column":"id","value":1}',
+                    "-o", "json"])
+                self.assertEqual(code, code_expected)
+                self.assertEqual(out, "")
+                document = json.loads(err)
+                self.assertEqual(document["kind"], kind)
+                self.assertEqual(document["exit_code"], code_expected)
+
+    def test_malformed_success_is_protocol_error_without_retry(self):
+        self.StubClient.results = {"insert": {"affected_rows": 1}}
+        code, out, err = self.invoke([
+            "insert", "users", "-D", '{"id":1}', "-o", "json"])
+        self.assertEqual(code, 5)
+        self.assertEqual(out, "")
+        self.assertEqual(json.loads(err)["kind"], "protocol_error")
+        self.assertEqual(len([c for c in self.StubClient.calls if c[0] == "insert"]), 1)
+
+    def test_invalid_crud_json_and_nested_values_do_not_construct_sdk(self):
+        cases = [
+            ["select", "users", "-w", "{}"],
+            ["insert", "users", "-D", '{"id":{"nested":1}}'],
+            ["update", "users", "-w", '{"column":"id","value":1}',
+             "-D", "{}"],
+        ]
+        for argv in cases:
+            with self.subTest(argv=argv):
+                code, out, err = self.invoke(argv)
+                self.assertEqual(code, 2)
+                self.assertEqual(out, "")
+                self.assertIn("input", err)
+        self.assertFalse(any(call[0] == "init" for call in self.StubClient.calls))
+
+
+@unittest.skipUnless(os.environ.get("CPL_RUN_E2E") == "1" and
+                     os.environ.get("CPL_TEST_SERVER"),
+                     "set CPL_RUN_E2E=1 and CPL_TEST_SERVER for live CRUD smoke")
+class TestLiveCppPoolsCrud(unittest.TestCase):
+    def test_cli_crud_round_trip_against_real_server(self):
+        with tempfile.TemporaryDirectory(prefix="cpppools_cli_crud_") as temp_dir:
+            db_path = os.path.join(temp_dir, "crud.db")
+            conn = sqlite3.connect(db_path)
+            conn.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            conn.close()
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                port = sock.getsockname()[1]
+            config_path = os.path.join(temp_dir, "server.json")
+            with open(config_path, "w", encoding="utf-8") as handle:
+                json.dump({
+                    "server": {"port": port, "worker_threads": 1},
+                    "datasources": [{
+                        "name": "main", "type": "sqlite", "default": True,
+                        "pool_size": 1, "sqlite": {"path": db_path},
+                    }],
+                }, handle)
+            server = subprocess.Popen(
+                [os.environ["CPL_TEST_SERVER"], "--config", config_path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                url = "http://127.0.0.1:%d" % port
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    if server.poll() is not None:
+                        self.fail("CppPools server exited before CRUD was ready")
+                    try:
+                        with urllib.request.urlopen(url + "/health", timeout=0.2) as response:
+                            if response.status == 200:
+                                break
+                    except Exception:
+                        time.sleep(0.05)
+                else:
+                    self.fail("CppPools server did not become ready")
+
+                env = os.environ.copy()
+                env["PYTHONPATH"] = os.path.abspath(
+                    os.path.join(os.path.dirname(__file__), ".."))
+
+                def invoke(arguments):
+                    return subprocess.run(
+                        [sys.executable, "-m", "cpppools"] + arguments,
+                        env=env, text=True, capture_output=True,
+                        timeout=5, check=False)
+
+                inserted = invoke(["add", "users", "-D", '{"id":41,"name":"alice"}',
+                                   "-u", url, "-o", "json"])
+                self.assertEqual(inserted.returncode, 0, inserted.stderr)
+                self.assertEqual(json.loads(inserted.stdout)["affected_rows"], 1)
+
+                selected = invoke(["get", "users", "-w", '{"column":"id","value":41}',
+                                   "-u", url, "-o", "json"])
+                self.assertEqual(selected.returncode, 0, selected.stderr)
+                self.assertEqual(json.loads(selected.stdout)["rows"], [[41, "alice"]])
+
+                updated = invoke(["set", "users", "-w", '{"column":"id","value":41}',
+                                  "-D", '{"name":"bob"}', "-u", url, "-o", "json"])
+                self.assertEqual(updated.returncode, 0, updated.stderr)
+                self.assertEqual(json.loads(updated.stdout)["affected_rows"], 1)
+
+                deleted = invoke(["del", "users", "-w", '{"column":"id","value":41}',
+                                  "-u", url, "-o", "json"])
+                self.assertEqual(deleted.returncode, 0, deleted.stderr)
+                self.assertEqual(json.loads(deleted.stdout)["affected_rows"], 1)
+            finally:
+                if server.poll() is None:
+                    server.terminate()
+                    try:
+                        server.wait(timeout=8)
+                    except subprocess.TimeoutExpired:
+                        server.kill()
+                        server.wait(timeout=3)
+
+
 if __name__ == "__main__":
     unittest.main()

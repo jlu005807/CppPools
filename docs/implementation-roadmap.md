@@ -32,7 +32,7 @@
 | 全局阶段 | 对应原方案 | 具体交付 | 进入下一步的门槛 | 当前状态 |
 |---|---|---|---|---|
 | S0 基线与五项高优修复 | 历史加固残余项、缓存P0、HTTP生命周期Task 4 | 先完成基线证据和五个只读评审问题：MySQL ON 编译阻断、Singleflight 竞态、bypass 异常复位、Prometheus 重复声明、HTTP 慢速发送总期限 | 目标平台上的基线/定向测试真实运行；五项均有 RED→GREEN 证据；默认内存/静态集群契约不变 | 代码修复完成；MySQL真实账号验收待环境 |
-| S1 远程CLI | CLI阶段0–2 | parser、严格JSON/输出/错误映射、health、四个CRUD，源码`python -m cpppools`入口 | 无网络help/version；远程命令复用SDK；成功写不因CLI重新执行；真实HTTP CRUD | 待执行 |
+| S1 远程CLI | CLI阶段0–2 | parser、严格JSON/输出/错误映射、health、四个CRUD，源码`python -m cpppools`入口 | 无网络help/version；远程命令复用SDK；成功写不因CLI重新执行；真实HTTP CRUD | 阶段0–2已完成；本机生命周期/打包仍待S2 |
 | S2 本机CLI与基础打包 | CLI阶段3–5 | POSIX/Windows控制、ready/stopped、start/stop/status、pyproject、cpl入口与包安装 | 目标平台真实进程控制；停止超时不假报成功；源码树外wheel/sdist可安装 | 待执行 |
 | S3 共享缓存与Redis基础 | 缓存P1–P2、P3的transport子任务 | 稳定RowCache协调入口、flight_id/token/异常复位；配置/codec；唯一可选hiredis构建和私有有界transport | 原内存语义不变；flight身份竞态关闭；OFF无依赖、ON能链接；transport确实受总期限/响应大小限制 | 待执行 |
 | S4 本地Redis缓存交付 | 缓存P3剩余部分、P4–P7 | 显式实例→故障冷内存→恢复资格/自启→静态集群验证；运维和性能证据 | SQL成功不因缓存故障变成重试；旧namespace不复活；专用实例归属、停止和支持平台明确 | 待执行 |
@@ -80,6 +80,18 @@ S0.1 是构建门槛；S0.2 与 S0.3 属于缓存正确性，建议连续完成�
 | S0.5 | `b401ba1`, `1222945` | 非读端和每 50ms 读 1 字节端两类发送测试；过载响应 header/body 共享同一绝对 deadline；非 HTTP 测试 17/17，`test_http_server` 独立运行退出码 0；ON 同样完成构建，HTTP 专项退出码 0 | 通过 |
 
 S0 的 MySQL 专项已在本机真实服务完成验收。Windows 原生整套 CTest 不能全通过：`test_http_server.cpp` 直接包含 POSIX `arpa/inet.h`/socket 头，导致该目标不能在 MinGW 原生构建；OFF 与 WSL ON 全量回归通过，两个 MySQL 专项在 Windows 原生构建中实际通过。此平台限制须保留为证据，不把缺失目标或 MySQL 测试结果混为一谈。
+
+### 2.3 S1 阶段 0–2 实施证据（2026-10-13）
+
+S1 远程 CLI 的 parser、严格输入/health 以及 CRUD SDK 适配已按 RED→GREEN 分阶段完成：
+
+| 阶段 | 提交 | 实际证据 | 状态 |
+|---|---|---|---|
+| S1.0 parser 骨架 | `218ece4` | `test_cli_parser.py` 定向测试 8/8；`python -m cpppools --help/--version` 不构造 SDK | 通过 |
+| S1.1 输入、输出与 health | `ee7e956` | CLI command 定向测试 13/13；SDK 全量回归 81/81（live smoke 默认明确 skip）；临时 SQLite + 真实 `cpppools_server` health 返回 200 | 通过 |
+| S1.2 CRUD SDK 适配 | `d7b339c` | CRUD 定向测试 19 项（含 4 项明确 live skip）通过；SDK 全量回归 87 项（4 skip）；`CPL_RUN_E2E=1` 真实 HTTP 单节点 insert/select/update/delete 往返通过 | 通过 |
+
+S1.2 的 CLI 只负责参数解析、完整 payload 64 KiB 预检、输出和错误码；拓扑、307、epoch、fallback、重试全部由 `ClusterClient` 执行。畸形成功响应映射为 `protocol_error`/退出码 5，且不会由 CLI 重发；无键 insert 不新增重试。S2 本机生命周期与打包、S3–S7 Redis/发现功能仍未实现。
 
 ## 3. 真正的依赖与可调整的先后
 
@@ -175,6 +187,6 @@ RowCache仍是每数据源共享协调器。缓存方案先落地 `(backend_epoc
 
 已将三份新方案作为实际待实现主线，历史已落地方案归入基线核验；统一了阶段编号引用、共享模块归属、两个Redis故障策略、token与namespace、schema、动态扩容、SDK发送门控、打包及停机。专题文档的方案入口均链接回本路线，历史加固索引注明当前执行入口。
 
-本轮只编写和对齐文档，不运行产品测试、不创建实现模块；S0–S7全部保持“待执行”。在没有实现/平台证据之前，不给工期或完成百分比。
+S1阶段2已完成实现并取得定向、全量SDK及真实HTTP CRUD证据；S2–S7仍待执行。后续阶段仍须按同样的RED→GREEN、真实进程和平台验收门槛推进，不把本阶段证据外推为本机生命周期、Redis或动态发现已完成。
 
 两位独立读者已复核实施顺序、控制面关键修订和跨方案契约，未发现影响实施的剩余依赖循环或路线冲突。文档核验覆盖本路线、三个专题和历史加固索引：相对文件链接可解析，Markdown围栏成对，现有JSON示例可解析；这不是产品测试或阶段完成证据。

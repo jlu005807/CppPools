@@ -20,10 +20,38 @@ from . import errors, transport
 
 VERSION = "0+dev"
 MAX_INPUT_BYTES = 65536
+# Kept as a lazy binding: importing the CLI (including ``--help``) must not
+# initialise a ClusterClient or perform topology/network work.  Tests and
+# embedders may replace this binding with a compatible client implementation.
+ClusterClient = None
 
 
 class InputError(ValueError):
     pass
+
+
+class ProtocolError(ValueError):
+    """A successful HTTP response did not satisfy the CRUD response shape."""
+
+
+def _error_document(kind, message, exit_code, status=None):
+    return {"kind": kind, "message": str(message), "exit_code": exit_code,
+            "http_status": status}
+
+
+def _write_runtime_error(kind, exc, exit_code):
+    print(json.dumps(_error_document(kind, str(exc), exit_code,
+                                     getattr(exc, "status", None)),
+                     ensure_ascii=False, separators=(",", ":")),
+          file=sys.stderr)
+
+
+def _get_cluster_client():
+    global ClusterClient
+    if ClusterClient is None:
+        from .client import ClusterClient as client_type
+        ClusterClient = client_type
+    return ClusterClient
 
 
 class _StoreOnce(argparse.Action):
@@ -283,6 +311,157 @@ def run_health(args):
     return 4
 
 
+def _is_scalar(value):
+    return value is None or isinstance(value, (str, int, float, bool))
+
+
+def _parse_where(source):
+    value = parse_json_source(source)
+    if (not isinstance(value, dict) or set(value) != {"column", "value"}
+            or not isinstance(value["column"], str)
+            or not value["column"].strip()
+            or value["value"] is None
+            or not _is_scalar(value["value"])):
+        raise InputError("input where must contain a non-empty column and scalar value")
+    return value
+
+
+def _parse_values(source, label):
+    value = parse_json_source(source)
+    if not isinstance(value, dict) or not value:
+        raise InputError("input %s must be a non-empty JSON object" % label)
+    for key, item in value.items():
+        if not isinstance(key, str) or not key.strip() or not _is_scalar(item):
+            raise InputError("input %s must contain only scalar column values" % label)
+    return value
+
+
+def _validate_crud_args(args):
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        raise InputError("timeout must be a finite positive number")
+    if not isinstance(args.table, str) or not args.table.strip():
+        raise InputError("input table must not be empty")
+    if args.datasource is not None and not args.datasource.strip():
+        raise InputError("input datasource must not be empty")
+    seeds = health_urls(args)
+    if args.command in ("select", "update", "delete"):
+        where = _parse_where(args.where)
+    else:
+        where = None
+    if args.command in ("insert", "update"):
+        values = _parse_values(args.data, "data")
+    else:
+        values = None
+    columns = args.columns if args.command == "select" else None
+    if columns is not None and any(not isinstance(c, str) or not c.strip()
+                                   for c in columns):
+        raise InputError("input columns must be non-empty strings")
+    if args.command == "select" and columns is not None and not columns:
+        raise InputError("input columns must not be empty")
+    if args.command == "select":
+        payload = {"table": args.table, "where": where}
+        if columns is not None:
+            payload["columns"] = columns
+    elif args.command == "insert":
+        payload = {"table": args.table, "values": values}
+    elif args.command == "update":
+        payload = {"table": args.table, "set": values, "where": where}
+    else:
+        payload = {"table": args.table, "where": where}
+    if args.datasource:
+        payload["datasource"] = args.datasource
+    # Match transport.request's serializer, including its default escaping
+    # and separators.  A 64 KiB body is accepted; one byte more is not.
+    if len(json.dumps(payload).encode("utf-8")) > MAX_INPUT_BYTES:
+        raise InputError("request payload exceeds 65536 bytes")
+    return seeds, where, values, columns, payload
+
+
+def _validate_crud_result(command, result):
+    if not isinstance(result, dict):
+        raise ProtocolError("CRUD response must be a JSON object")
+    if command == "select":
+        rows = result.get("rows")
+        columns = result.get("columns")
+        count = result.get("row_count")
+        if (not isinstance(rows, list) or not isinstance(columns, list)
+                or isinstance(count, bool) or not isinstance(count, int)
+                or count < 0 or count != len(rows)
+                or any(not isinstance(c, str) for c in columns)
+                or any(not isinstance(row, list) or len(row) != len(columns)
+                       for row in rows)):
+            raise ProtocolError("select response has invalid rows/columns shape")
+        return result
+    affected = result.get("affected_rows")
+    if isinstance(affected, bool) or not isinstance(affected, int) or affected < 0:
+        raise ProtocolError("CRUD response has invalid affected_rows")
+    if command == "insert" and "inserted_id" not in result:
+        raise ProtocolError("insert response is missing inserted_id")
+    return result
+
+
+def _print_crud_result(command, result, output):
+    if output == "json":
+        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+        return
+    if command == "select":
+        print("\t".join(result["columns"]))
+        for row in result["rows"]:
+            print("\t".join("" if value is None else str(value) for value in row))
+    elif command == "insert":
+        print("affected_rows=%s\tinserted_id=%s" %
+              (result["affected_rows"], result.get("inserted_id")))
+    else:
+        print("affected_rows=%s" % result["affected_rows"])
+
+
+def run_crud(args):
+    seeds, where, values, columns, _payload = _validate_crud_args(args)
+    try:
+        client = _get_cluster_client()(seeds, read_timeout=args.timeout)
+        if args.command == "select":
+            result = client.select(args.table, where, columns=columns,
+                                   datasource=args.datasource)
+        elif args.command == "insert":
+            result = client.insert(args.table, values,
+                                   datasource=args.datasource)
+        elif args.command == "update":
+            result = client.update(args.table, values, where,
+                                   datasource=args.datasource)
+        else:
+            result = client.delete(args.table, where,
+                                   datasource=args.datasource)
+        result = _validate_crud_result(args.command, result)
+    except ProtocolError as exc:
+        _write_runtime_error("protocol_error", exc, 5)
+        return 5
+    except (ValueError, TypeError, KeyError, AttributeError, IndexError) as exc:
+        # JSON decoding and response-shape failures are not safe to retry: a
+        # write may already have committed before its response was truncated.
+        _write_runtime_error("protocol_error", exc, 5)
+        return 5
+    except errors.NodeUnavailable as exc:
+        _write_runtime_error("node_unavailable", exc, 3)
+        return 3
+    except errors.TopologyError as exc:
+        _write_runtime_error("topology_error", exc, 3)
+        return 3
+    except errors.AllNodesBlacklistedError as exc:
+        _write_runtime_error("node_unavailable", exc, 3)
+        return 3
+    except errors.ConflictError as exc:
+        _write_runtime_error("client_error", exc, 4)
+        return 4
+    except errors.ClientError as exc:
+        _write_runtime_error("client_error", exc, 4)
+        return 4
+    except errors.ServerError as exc:
+        _write_runtime_error("server_error", exc, 5)
+        return 5
+    _print_crud_result(args.command, result, args.output)
+    return 0
+
+
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -306,6 +485,12 @@ def main(argv=None):
     if command == "health":
         try:
             return run_health(args)
+        except InputError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+    if command in {"select", "insert", "update", "delete"}:
+        try:
+            return run_crud(args)
         except InputError as exc:
             print(str(exc), file=sys.stderr)
             return 2
