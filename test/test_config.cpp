@@ -195,6 +195,32 @@ static void test_server_defaults_apply() {
     std::remove(path.c_str());
 }
 
+static void test_cache_redis_defaults_and_validation() {
+    const std::string path = write_tmp_config(R"({
+      "cache": {"enabled": true, "backend": "auto",
+                "redis": {"host": "localhost", "port": 6380,
+                          "timeout_ms": 25, "max_reply_bytes": 4096}},
+      "datasources": [ { "name": "x", "type": "sqlite", "sqlite": { "path": "a.db" } } ]
+    })", "cfg_redis.json");
+    const auto result = load_config(path);
+    assert(result.ok);
+    assert(result.config.cache.backend == "auto");
+    assert(result.config.cache.redis_host == "localhost");
+    assert(result.config.cache.redis_port == 6380);
+    assert(result.config.cache.redis_timeout_ms == 25);
+    assert(result.config.cache.redis_max_reply_bytes == 4096);
+    std::remove(path.c_str());
+
+    const std::string bad = write_tmp_config(R"({
+      "cache": {"backend": "bogus"},
+      "datasources": [ { "name": "x", "type": "sqlite", "sqlite": { "path": "a.db" } } ]
+    })", "cfg_redis_bad.json");
+    const auto invalid = load_config(bad);
+    assert(!invalid.ok);
+    assert(invalid.error.find("cache.backend") != std::string::npos);
+    std::remove(bad.c_str());
+}
+
 static void test_resolve_config_path_precedence() {
     // 显式参数 > 环境变量 > 默认路径。
     const char* argv_with_flag[] = {"cpppools_server", "--config", "custom.json"};
@@ -457,6 +483,7 @@ int main() {
     test_mysql_password_env_unset_fails();
     test_multiple_defaults_fail();
     test_server_defaults_apply();
+    test_cache_redis_defaults_and_validation();
     test_resolve_config_path_precedence();
     test_resolve_config_path_missing_arg_throws();
     test_zero_pool_size_fails();

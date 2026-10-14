@@ -51,6 +51,11 @@ struct AppConfig {
     };
     struct Cache {
         bool enabled{false};
+        std::string backend{"memory"}; // memory | redis | auto
+        std::string redis_host{"127.0.0.1"};
+        int redis_port{6379};
+        long long redis_timeout_ms{100};
+        std::size_t redis_max_reply_bytes{1024 * 1024};
         std::size_t max_entries{100000};
         std::size_t max_bytes{static_cast<std::size_t>(256) * 1024 * 1024};
         std::size_t max_entry_bytes{65536};

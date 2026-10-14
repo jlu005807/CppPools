@@ -27,6 +27,7 @@ enable_testing()
 # OFF: mock 后端（零外部依赖，供开发与测试使用）
 # ON : 编译 MySQL 分支并链接 MySQL 客户端库（生产定位）
 option(CPPPOOLS_USE_MYSQL "Enable real MySQL-backed DB pool" OFF)
+option(CPPPOOLS_USE_REDIS "Enable Redis cache transport" OFF)
 
 # =========================
 # 编译告警
@@ -84,6 +85,14 @@ add_library(cpppools STATIC
     src/server/hash_ring.cpp
     src/server/ownership_router.cpp
 )
+if (CPPPOOLS_USE_REDIS)
+    find_path(HIREDIS_INCLUDE_DIR NAMES hiredis/hiredis.h REQUIRED)
+    find_library(HIREDIS_LIBRARY NAMES hiredis REQUIRED)
+    target_sources(cpppools PRIVATE src/cache/redis_transport.cpp)
+    target_compile_definitions(cpppools PUBLIC CPPPOOLS_USE_REDIS=1)
+    target_include_directories(cpppools SYSTEM PRIVATE ${HIREDIS_INCLUDE_DIR})
+    target_link_libraries(cpppools PUBLIC ${HIREDIS_LIBRARY})
+endif()
 target_include_directories(cpppools
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -226,6 +235,9 @@ cpppools_add_test(test_row_cache)
 cpppools_add_test(test_caching_database)
 cpppools_add_test(test_cache_metrics)
 cpppools_add_test(test_ownership)
+if (CPPPOOLS_USE_REDIS)
+    cpppools_add_test(test_redis_transport)
+endif()
 
 # MySQL 自省专项测试：仅在启用 MySQL 后端时编译运行。
 # 连接信息来自环境变量（CPPPOOLS_TEST_MYSQL_HOST/PORT/USER/PASSWORD），

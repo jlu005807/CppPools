@@ -34,7 +34,7 @@
 | S0 基线与五项高优修复 | 历史加固残余项、缓存P0、HTTP生命周期Task 4 | 先完成基线证据和五个只读评审问题：MySQL ON 编译阻断、Singleflight 竞态、bypass 异常复位、Prometheus 重复声明、HTTP 慢速发送总期限 | 目标平台上的基线/定向测试真实运行；五项均有 RED→GREEN 证据；默认内存/静态集群契约不变 | 代码修复完成；MySQL真实账号验收待环境 |
 | S1 远程CLI | CLI阶段0–2 | parser、严格JSON/输出/错误映射、health、四个CRUD，源码`python -m cpppools`入口 | 无网络help/version；远程命令复用SDK；成功写不因CLI重新执行；真实HTTP CRUD | 阶段0–2已完成；本机生命周期/打包仍待S2 |
 | S2 本机CLI与基础打包 | CLI阶段3–5 | POSIX/Windows控制、ready/stopped、start/stop/status、pyproject、cpl入口与包安装 | 目标平台真实进程控制；停止超时不假报成功；源码树外wheel/sdist可安装 | 阶段3 POSIX、阶段4控制文件闭环、阶段5基础打包已完成；Windows专项仍待执行 |
-| S3 共享缓存与Redis基础 | 缓存P1–P2、P3的transport子任务 | 稳定RowCache协调入口、flight_id/token/异常复位；配置/codec；唯一可选hiredis构建和私有有界transport | 原内存语义不变；flight身份竞态关闭；OFF无依赖、ON能链接；transport确实受总期限/响应大小限制 | 待执行 |
+| S3 共享缓存与Redis基础 | 缓存P1–P2、P3的transport子任务 | 稳定RowCache协调入口、flight_id/token/异常复位；配置/codec；唯一可选hiredis构建和私有有界transport | 原内存语义不变；flight身份竞态关闭；OFF无依赖、ON能链接；transport确实受总期限/响应大小限制 | 配置校验、OFF构建开关和有界PING transport已完成；hiredis/真实Redis及RowCache接入待执行 |
 | S4 本地Redis缓存交付 | 缓存P3剩余部分、P4–P7 | 显式实例→故障冷内存→恢复资格/自启→静态集群验证；运维和性能证据 | SQL成功不因缓存故障变成重试；旧namespace不复活；专用实例归属、停止和支持平台明确 | 待执行 |
 | S5 发现控制面与服务端 | 发现P0–P2 | discovery配置、共享状态/脚本、注册租约、runtime snapshot、HTTP诊断；先cache-off | 新ID可在固定fallback列表外加入；expired lease可重新登记；empty/outage/blocked区别正确；请求线程不访问发现Redis | 待执行 |
 | S6 动态路由与SDK | 发现P3–P4 | topology gate与两种缓存后端集成、请求版本、hold-down、from_redis、schema快照、close | 旧请求不能回填；Fallback始终旁路；一次操作不混身份；blocked/close后不发新尝试；动态cold restart不暖复用 | 待执行 |

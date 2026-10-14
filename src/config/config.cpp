@@ -290,6 +290,29 @@ ConfigLoadResult load_config(const std::string& path) {
             const std::string ctx = "cache.";
             auto& cache = cfg.cache;
             cache.enabled = get_num<bool>(*it, "enabled", false, ctx);
+            if (const auto backend_it = it->find("backend"); backend_it != it->end()) {
+                if (!backend_it->is_string()) return fail("cache.backend must be a string");
+                cache.backend = backend_it->get<std::string>();
+                if (cache.backend != "memory" && cache.backend != "redis" &&
+                    cache.backend != "auto") {
+                    return fail("cache.backend must be memory, redis, or auto");
+                }
+            }
+            if (const auto redis_it = it->find("redis"); redis_it != it->end()) {
+                if (!redis_it->is_object()) return fail("cache.redis must be an object");
+                cache.redis_host = get_str(*redis_it, "host", "127.0.0.1", "cache.redis.");
+                cache.redis_port = get_num<int>(*redis_it, "port", 6379, "cache.redis.");
+                if (cache.redis_port < 1 || cache.redis_port > 65535) {
+                    return fail("cache.redis.port must be between 1 and 65535");
+                }
+                cache.redis_timeout_ms = get_num<long long>(*redis_it, "timeout_ms", 100,
+                                                             "cache.redis.");
+                if (cache.redis_timeout_ms <= 0) return fail("cache.redis.timeout_ms must be > 0");
+                const auto max_reply = get_num<long long>(*redis_it, "max_reply_bytes",
+                                                          1024LL * 1024, "cache.redis.");
+                if (max_reply <= 0) return fail("cache.redis.max_reply_bytes must be > 0");
+                cache.redis_max_reply_bytes = static_cast<std::size_t>(max_reply);
+            }
             const long long max_entries = get_num<long long>(*it, "max_entries", 100000, ctx);
             if (max_entries <= 0) {
                 return fail("cache.max_entries must be > 0");
