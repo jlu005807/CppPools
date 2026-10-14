@@ -85,6 +85,10 @@ struct HttpServerConfig {
     std::size_t latency_window_size{1024};
     // 集群视图（缺省 = 单节点模式）。
     ClusterView cluster_view;
+    // Optional local control channel. Empty means legacy signal-only mode.
+    std::string control_dir;
+    std::string control_launch_id;
+    std::string control_token;
 };
 
 // HttpServer：单节点三级池化 API 服务的 HTTP 接入层。
@@ -234,6 +238,8 @@ private:
     void register_active_socket(std::intptr_t fd);
     void unregister_active_socket(std::intptr_t fd);
     void interrupt_active_sockets() noexcept;
+    bool control_stop_requested() const;
+    void publish_control_marker(const char* name) const;
 };
 
 }  // namespace cpppools::server

@@ -127,6 +127,9 @@ class TestLiveLocalNode(unittest.TestCase):
                                     workdir=root, timeout=10)
             self.assertEqual(running["state"], "running")
             self.assertTrue(running["process_alive"])
+            control_dir = running["control_dir"]
+            self.assertTrue(os.path.isfile(os.path.join(control_dir, "control.meta")))
+            self.assertTrue(os.path.isfile(os.path.join(control_dir, "control.token")))
             status = manager.status()
             self.assertTrue(status["identity_verified"])
             stopped = manager.stop(timeout=10)
@@ -169,6 +172,33 @@ class TestLiveLocalNode(unittest.TestCase):
                           "-o", "json")
             self.assertEqual(stopped.returncode, 0, stopped.stderr)
             self.assertEqual(json.loads(stopped.stdout)["state"], "stopped")
+
+    def test_invalid_control_token_does_not_stop_process(self):
+        with tempfile.TemporaryDirectory(prefix="cpppools_control_auth_") as root:
+            db_path = os.path.join(root, "node.db")
+            conn = sqlite3.connect(db_path)
+            conn.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            conn.close()
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                port = sock.getsockname()[1]
+            config = os.path.join(root, "server.json")
+            with open(config, "w", encoding="utf-8") as handle:
+                json.dump({"server": {"port": port, "worker_threads": 1},
+                           "datasources": [{"name": "main", "type": "sqlite",
+                                            "default": True, "pool_size": 1,
+                                            "sqlite": {"path": db_path}}]}, handle)
+            manager = local_node.LocalNodeManager(os.path.join(root, "state"), "demo")
+            running = manager.start(config, binary=os.environ["CPL_TEST_SERVER"],
+                                    workdir=root, timeout=10)
+            token_path = os.path.join(running["control_dir"], "control.token")
+            with open(token_path, "w", encoding="ascii") as handle:
+                handle.write("wrong-token")
+            try:
+                with self.assertRaises(local_node.StopTimeout):
+                    manager.stop(timeout=0.4)
+            finally:
+                manager.stop(timeout=5, force=True)
 
 
 if __name__ == "__main__":

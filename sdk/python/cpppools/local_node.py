@@ -11,6 +11,7 @@ import json
 import os
 import re
 import signal
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -231,12 +232,14 @@ class LocalNodeManager:
         except (OSError, urllib.error.URLError, ValueError):
             return False
 
-    def _base_state(self, launch_id, config, binary, workdir, endpoint, log_file):
+    def _base_state(self, launch_id, config, binary, workdir, endpoint, log_file,
+                    control_dir):
         return {
             "protocol_version": 1, "state_revision": 1, "name": self.name,
             "launch_id": launch_id, "pid": None, "process_start_time": None,
             "binary": binary, "config": config, "workdir": workdir,
             "endpoint": endpoint, "log_file": log_file, "state": "starting",
+            "control_dir": control_dir,
             "exit_kind": None, "last_exit_code": None, "updated_at": _now(),
         }
 
@@ -266,11 +269,19 @@ class LocalNodeManager:
             launch_dir = os.path.join(self.instance_dir, "launches", launch_id)
             os.makedirs(launch_dir, exist_ok=True)
             log_file = os.path.abspath(log_file or os.path.join(self.instance_dir, "server.log"))
-            state = self._base_state(launch_id, config, binary, workdir, endpoint, log_file)
+            state = self._base_state(launch_id, config, binary, workdir, endpoint, log_file,
+                                     launch_dir)
             self.write_state(state)
+            with open(os.path.join(launch_dir, "control.meta"), "w", encoding="utf-8") as handle:
+                handle.write("protocol_version=1\nlaunch_id=%s\n" % launch_id)
+            with open(os.path.join(launch_dir, "control.token"), "w", encoding="ascii") as handle:
+                handle.write(secrets.token_hex(32))
+            if os.name == "posix":
+                os.chmod(os.path.join(launch_dir, "control.token"), 0o600)
         log = open(log_file, "ab")
         try:
-            process = subprocess.Popen([binary, "--config", config], cwd=workdir,
+            process = subprocess.Popen([binary, "--config", config,
+                                        "--control-dir", launch_dir], cwd=workdir,
                                        stdout=log, stderr=subprocess.STDOUT,
                                        start_new_session=True)
             self._process = process
@@ -294,7 +305,9 @@ class LocalNodeManager:
                 self.write_state(state)
                 log.close()
                 raise LocalNodeError("server exited before health became ready")
-            if self._health(endpoint, min(0.2, max(deadline - time.monotonic(), 0.01))):
+            ready_marker = os.path.isfile(os.path.join(launch_dir, "ready"))
+            if ready_marker and self._health(endpoint,
+                                             min(0.2, max(deadline - time.monotonic(), 0.01))):
                 ready = True
                 break
             time.sleep(0.05)
@@ -349,10 +362,28 @@ class LocalNodeManager:
             state.update(state="stopping", state_revision=state.get("state_revision", 0) + 1,
                          updated_at=_now())
             self.write_state(state)
-        try:
-            os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
-        except OSError as exc:
-            raise IdentityError("failed to signal verified process: %s" % exc) from None
+        control_dir = state.get("control_dir")
+        request_sent = False
+        if not force and control_dir:
+            try:
+                with open(os.path.join(control_dir, "control.token"), "r",
+                          encoding="ascii") as handle:
+                    token = handle.read().strip()
+                launch_id = state.get("launch_id", "")
+                temporary = os.path.join(control_dir, ".stop.request.tmp")
+                with open(temporary, "w", encoding="ascii") as handle:
+                    handle.write("launch_id=%s\ntoken=%s\n" % (launch_id, token))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, os.path.join(control_dir, "stop.request"))
+                request_sent = True
+            except OSError:
+                request_sent = False
+        if not request_sent:
+            try:
+                os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
+            except OSError as exc:
+                raise IdentityError("failed to signal verified process: %s" % exc) from None
         deadline = time.monotonic() + max(float(timeout), 0.01)
         while time.monotonic() < deadline:
             if not _pid_alive(pid):
@@ -366,6 +397,12 @@ class LocalNodeManager:
                              updated_at=_now())
                 with self._exclusive():
                     self.write_state(state)
+                if control_dir:
+                    for filename in ("control.token", "stop.request"):
+                        try:
+                            os.unlink(os.path.join(control_dir, filename))
+                        except FileNotFoundError:
+                            pass
                 return self._status_for(state)
             time.sleep(0.05)
         raise StopTimeout("server did not stop before timeout")

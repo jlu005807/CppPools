@@ -16,6 +16,8 @@
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
+#include <fstream>
+#include <filesystem>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -65,6 +67,20 @@ void close_socket(SocketType s) {
 #else
     close(s);
 #endif
+}
+
+std::string read_trimmed_file(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::in | std::ios::binary);
+    if (!in) {
+        return {};
+    }
+    std::string value((std::istreambuf_iterator<char>(in)),
+                      std::istreambuf_iterator<char>());
+    while (!value.empty() && (value.back() == '\n' || value.back() == '\r' ||
+                              value.back() == ' ' || value.back() == '\t')) {
+        value.pop_back();
+    }
+    return value;
 }
 
 // SocketGuard：把 socket 的关闭绑定到栈对象上。
@@ -398,6 +414,31 @@ HttpServer::HttpServer(uint16_t port,
 
 HttpServer::~HttpServer() = default;
 
+bool HttpServer::control_stop_requested() const {
+    if (config_.control_dir.empty() || config_.control_launch_id.empty() ||
+        config_.control_token.empty()) {
+        return false;
+    }
+    const std::filesystem::path request =
+        std::filesystem::path(config_.control_dir) / "stop.request";
+    const std::string content = read_trimmed_file(request);
+    const std::string expected = "launch_id=" + config_.control_launch_id +
+                                 "\ntoken=" + config_.control_token;
+    return content == expected;
+}
+
+void HttpServer::publish_control_marker(const char* name) const {
+    if (config_.control_dir.empty()) {
+        return;
+    }
+    std::ofstream out(std::filesystem::path(config_.control_dir) / name,
+                      std::ios::out | std::ios::trunc);
+    if (out) {
+        out << "launch_id=" << config_.control_launch_id << "\n";
+        out.flush();
+    }
+}
+
 void HttpServer::start() {
 #ifdef _WIN32
     // Windows 下必须先初始化 WinSock，才能调用 socket/bind/listen。
@@ -440,6 +481,16 @@ void HttpServer::start() {
         throw std::runtime_error("listen failed");
     }
 
+#ifdef _WIN32
+    // Non-blocking accept gives the control-file channel the same bounded
+    // 200ms polling interval as the POSIX poll loop.
+    u_long nonblocking = 1;
+    if (ioctlsocket(server_fd, FIONBIO, &nonblocking) != 0) {
+        throw std::runtime_error("failed to make listener non-blocking");
+    }
+#endif
+    publish_control_marker("ready");
+
     // 优雅停机的唤醒机制：POSIX 用 poll(200ms) 包住 accept —— 实测 macOS 的
     // SO_RCVTIMEO 不影响 accept（会无限阻塞，探针实证）。
     // Windows 分支的 accept 无超时唤醒，停机需等下一个连接到达，
@@ -462,6 +513,11 @@ void HttpServer::start() {
     // 每次 accept 成功后，把客户端处理逻辑投递到线程池，确保主循环持续响应新连接。
     // 这就是三级池化的入口：accept 主循环只做调度，真正的 I/O + 计算都在 worker 线程上。
     while (!stopping_.load(std::memory_order_relaxed)) {
+        if (control_stop_requested()) {
+            publish_control_marker("stopping");
+            request_stop();
+            break;
+        }
 #ifndef _WIN32
         // poll 等待新连接（200ms 超时）：超时即回到循环头检查停机标志。
         struct pollfd pfd;
@@ -471,6 +527,9 @@ void HttpServer::start() {
         if (poll(&pfd, 1, 200) <= 0) {
             continue;  // 超时或错误：回到循环头检查停机标志
         }
+#endif
+#ifdef _WIN32
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
 #endif
         sockaddr_in client_addr{};
 #ifdef _WIN32

@@ -15,6 +15,8 @@
 #include <csignal>
 #include <cstdlib>
 #include <iostream>
+#include <fstream>
+#include <filesystem>
 #include <memory>
 #include <string>
 #ifdef _WIN32
@@ -87,6 +89,55 @@ HttpServerConfig build_server_config_from_env() {
     return cfg;
 }
 
+std::string argument_value(int argc, char** argv, const char* option) {
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == option) {
+            if (i + 1 >= argc || argv[i + 1][0] == '\0') {
+                throw std::invalid_argument(std::string(option) + " requires a path argument");
+            }
+            return argv[i + 1];
+        }
+    }
+    return {};
+}
+
+std::string read_control_file(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::in | std::ios::binary);
+    if (!in) {
+        return {};
+    }
+    std::string value((std::istreambuf_iterator<char>(in)),
+                      std::istreambuf_iterator<char>());
+    while (!value.empty() && (value.back() == '\n' || value.back() == '\r' ||
+                              value.back() == ' ' || value.back() == '\t')) {
+        value.pop_back();
+    }
+    return value;
+}
+
+std::string control_meta_launch_id(const std::string& meta) {
+    const std::string prefix = "launch_id=";
+    const auto pos = meta.find(prefix);
+    if (pos == std::string::npos) {
+        return {};
+    }
+    const auto begin = pos + prefix.size();
+    const auto end = meta.find('\n', begin);
+    return meta.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+}
+
+void write_control_marker(const std::string& dir, const char* name,
+                          const std::string& launch_id) {
+    if (dir.empty()) {
+        return;
+    }
+    std::ofstream out(std::filesystem::path(dir) / name,
+                      std::ios::out | std::ios::trunc);
+    if (out) {
+        out << "launch_id=" << launch_id << '\n';
+    }
+}
+
 // 请求上下文对象池的**下限**容量。
 //
 // 取 128：每个 RequestContext 持一个 4KB 接收缓冲，启动期预分配约 512KB。
@@ -126,8 +177,23 @@ int main(int argc, char** argv) {
     const config::AppConfig& app_cfg = cfg_result.config;
     const int port = app_cfg.server.port;
     const int worker_count = static_cast<int>(app_cfg.server.worker_threads);
+    std::string control_dir_arg;
+    std::string control_launch_id;
 
     try {
+        control_dir_arg = argument_value(argc, argv, "--control-dir");
+        std::string control_token;
+        if (!control_dir_arg.empty()) {
+            control_launch_id = control_meta_launch_id(
+                read_control_file(std::filesystem::path(control_dir_arg) / "control.meta"));
+            control_token = read_control_file(
+                std::filesystem::path(control_dir_arg) / "control.token");
+            if (control_launch_id.empty() || control_token.empty()) {
+                std::cerr << "control error: missing or malformed control.meta/control.token"
+                          << std::endl;
+                return 1;
+            }
+        }
         // 初始化“三大池子 + HTTP 服务”。
         // 池子对象由 main 统一管理生命周期，服务内部只持引用。
         // 声明顺序即销毁逆序：server 最先销毁，所以池子必定比它活得久。
@@ -204,6 +270,12 @@ int main(int argc, char** argv) {
         }
         server_cfg.cluster_view.cache_ttl_ms = app_cfg.cache.ttl_ms;
         server_cfg.cluster_view.blacklist_ttl_ms = app_cfg.cache.blacklist_ttl_ms;
+        server_cfg.control_dir = control_dir_arg;
+        server_cfg.control_launch_id = control_launch_id;
+        if (!control_dir_arg.empty()) {
+            server_cfg.control_token = read_control_file(
+                std::filesystem::path(control_dir_arg) / "control.token");
+        }
 
         // 启动 HTTP 服务（阻塞运行）。
         // 其余启动信息由 HttpServer::start() 统一打印，避免重复输出。
@@ -221,6 +293,7 @@ int main(int argc, char** argv) {
         g_stop_server.store(&server, std::memory_order_relaxed);
         StopBridge stop_bridge;
         server.start();
+        write_control_marker(control_dir_arg, "stopped", control_launch_id);
     } catch (const std::exception& ex) {
         std::cerr << "server failed: " << ex.what() << std::endl;
         return 1;
