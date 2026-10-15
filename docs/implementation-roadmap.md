@@ -1,17 +1,17 @@
 # 未完成方案实现顺序与对齐清单
 
-> 日期：2026-10-11；修订：R4；核对基线：Git HEAD `6c554dd`。
-> 状态：实施路线已重新对齐；S0 的五项高优修复和下列新增功能阶段均未执行。源码与提交记录用于判断已有能力，不替代本次运行验证。
+> 日期：2026-10-14；修订：R9；初始排期基线：`6c554dd`；本轮验收 HEAD：`a8acc5b` 加当前未提交修复。
+> 状态：S0/S1 已实现，S2/S3 部分实现，S4–S7 待执行。F1–F8 原范围证据保留；新增 F9–F11 已修复并通过 Linux/WSL Python live 复验。A01 缺少真实 MySQL SQL mode 证据，A02 缺少 Windows 慢读期限证据；S2 平台与发行矩阵仍未完成。详见 [整体评审与设计补充](completed-stages-overall-review-2026-10-14.md)。
 > 用途：统一现有方案的先后、依赖和交叉契约；具体配置、命令、测试仍以对应专题文档为准。
 
 ## 1. 当前有哪些真正未完成的方案
 
-当前新增功能主要有三项，但不能直接从功能方案开始。只读代码评审发现的五个高优先级问题必须先完成并取得回归证据；之后才按 **CLI → 节点本地 Redis 行缓存 → Redis 动态发现及其 CLI 扩展** 推进。
+当前新增功能主要有三项，按 **S0 已有问题修复 → CLI → 节点本地 Redis 行缓存 → Redis 动态发现及其 CLI 扩展** 推进。S0 五项修复及 S1、S2 基础能力已有提交和回归证据；本轮发现的实际回归及验收缺口先关闭，再继续交付后续功能。
 
 | 方案 | 当前状态与源码依据 | 本轮安排 |
 |---|---|---|
-| [cpl CLI](cpl-cli-design.md) | 设计完成；尚无cli.py、__main__.py、本机control-dir协议和Python打包元数据 | 先交付远程命令，再本地生命周期与安装包 |
-| [节点本地 Redis 行缓存](redis-cache-design.md) | 设计完成；现有RowCache/CachingDatabase仍为内存实现，尚无Redis客户端/RowStore/恢复/自启能力 | 在静态集群上完成后端和故障行为，再接动态拓扑 |
+| [cpl CLI](cpl-cli-design.md) | 远程命令、Linux 本机管理、控制文件及基础打包已实现；输入错误、并发/停机与 F9–F11 在 Linux/WSL 已修复并复验；平台与发布门槛仍开放 | 补真实环境证据及平台/发行交付，详细阶段进度见 CLI §6.1 |
+| [节点本地 Redis 行缓存](redis-cache-design.md) | S3 配置与有界 transport 基础已提交；RowCache/CachingDatabase仍为内存实现，Redis 后端/恢复/自启未实现 | 在静态集群上完成后端和故障行为，再接动态拓扑 |
 | [Redis 动态服务发现](redis-discovery-design.md) | 设计完成并补充本轮对齐；现有配置、OwnershipRouter和SDK仍使用静态节点/HTTP seed | 最后增加注册租约、运行时视图、SDK provider和discovery命令 |
 
 `docs/superpowers/` 中有部分旧文档仍标“待评审”“待实施”，或者任务未勾选，不能据此把所有内容重新列为未开发。
@@ -20,7 +20,7 @@
 |---|---|
 | [后端CRUD API](superpowers/specs/2026-08-06-cpp-crud-api-design.md)、[DB中间件](superpowers/specs/2026-08-06-db-middleware-design.md)、[三池加固](superpowers/specs/2026-08-06-pool-hardening-design.md)及其分期计划 | 当前已有通用CRUD、DataSourceRegistry、SQLite后端、NVI和三池实现/对应测试文件；作为已有底座，按当前API核验，不重新实现旧score API |
 | [静态集群与内存缓存](superpowers/specs/2026-08-11-cluster-cache-design.md)及ownership/SDK/failover分期计划 | `eef0a5f`、`2c432b2`已交付核心模块；现有hash、owner/307、缓存和Python SDK作为回归基线 |
-| [MySQL后端](superpowers/specs/2026-08-15-mysql-backend-design.md) | `c64f57c`已有实现，后续硬化提交也修改了MySQL；不作为全新后端项目。当前源码仍有需要ON构建确认的类型问题，归入S0 |
+| [MySQL后端](superpowers/specs/2026-08-15-mysql-backend-design.md) | `c64f57c`已有实现；F1 兼容修复及 MariaDB/Windows MySQL 构建通过；A01 默认/NBE SESSION 自省和 CRUD 因缺测试账号未验收 |
 | [代码加固及六个子计划](superpowers/plans/2026-08-17-code-hardening-index.md) | `6d747f2`、`9d0d8a8`、`899e96e`、`e37bdca`、`6c554dd`对应阶段性实现；保留残余缺陷和未验证平台的核验，不从第一个任务全部重跑开发 |
 
 历史“实现已落地”与“所有平台验收完成”是两件事。当前盘点只确认源码和提交存在；MySQL、Windows/macOS、sanitizer、真实Redis及e2e的通过情况，在实施时按实际环境留证据。
@@ -31,9 +31,9 @@
 
 | 全局阶段 | 对应原方案 | 具体交付 | 进入下一步的门槛 | 当前状态 |
 |---|---|---|---|---|
-| S0 基线与五项高优修复 | 历史加固残余项、缓存P0、HTTP生命周期Task 4 | 先完成基线证据和五个只读评审问题：MySQL ON 编译阻断、Singleflight 竞态、bypass 异常复位、Prometheus 重复声明、HTTP 慢速发送总期限 | 目标平台上的基线/定向测试真实运行；五项均有 RED→GREEN 证据；默认内存/静态集群契约不变 | 代码修复完成；MySQL真实账号验收待环境 |
-| S1 远程CLI | CLI阶段0–2 | parser、严格JSON/输出/错误映射、health、四个CRUD，源码`python -m cpppools`入口 | 无网络help/version；远程命令复用SDK；成功写不因CLI重新执行；真实HTTP CRUD | 阶段0–2已完成；本机生命周期/打包仍待S2 |
-| S2 本机CLI与基础打包 | CLI阶段3–5 | POSIX/Windows控制、ready/stopped、start/stop/status、pyproject、cpl入口与包安装 | 目标平台真实进程控制；停止超时不假报成功；源码树外wheel/sdist可安装 | 阶段3 POSIX、阶段4控制文件闭环、阶段5基础打包已完成；Windows专项仍待执行 |
+| S0 基线与五项高优修复 | 历史加固残余项、缓存P0、HTTP生命周期Task 4 | 先完成基线证据和五个只读评审问题：MySQL ON 编译阻断、Singleflight 竞态、bypass 异常复位、Prometheus 重复声明、HTTP 慢速发送总期限 | 目标平台上的基线/定向测试真实运行；五项均有 RED→GREEN 证据；默认内存/静态集群契约不变 | 五项修复及 Linux 回归通过；F1 兼容实现已构建，A01 的 SQL mode 端到端验收仍待测试账号；Windows 慢读期限仍待可证明背压的环境 |
+| S1 远程CLI | CLI阶段0–2 | parser、严格JSON/输出/错误映射、health、四个CRUD，源码`python -m cpppools`入口 | 无网络help/version；远程命令复用SDK；成功写不因CLI重新执行；真实HTTP CRUD | A06/A07 已修复并通过 WSL 全量回归；真实 HTTP CRUD 通过 |
+| S2 本机CLI与基础打包 | CLI阶段3–5 | POSIX/Windows控制、ready/stopped、start/stop/status、pyproject、cpl入口与包安装 | 目标平台真实进程控制；停止超时不假报成功；源码树外wheel/sdist可安装 | A03–A08 与 R01–R03 在 Linux/WSL 修复复验通过；A02 Windows 慢读期限、真实终端中断/前台就绪输出、Windows/macOS 本机管理与发行矩阵仍开放 |
 | S3 共享缓存与Redis基础 | 缓存P1–P2、P3的transport子任务 | 稳定RowCache协调入口、flight_id/token/异常复位；配置/codec；唯一可选hiredis构建和私有有界transport | 原内存语义不变；flight身份竞态关闭；OFF无依赖、ON能链接；transport确实受总期限/响应大小限制 | 配置校验、OFF构建开关和有界PING transport已完成；hiredis/真实Redis及RowCache接入待执行 |
 | S4 本地Redis缓存交付 | 缓存P3剩余部分、P4–P7 | 显式实例→故障冷内存→恢复资格/自启→静态集群验证；运维和性能证据 | SQL成功不因缓存故障变成重试；旧namespace不复活；专用实例归属、停止和支持平台明确 | 待执行 |
 | S5 发现控制面与服务端 | 发现P0–P2 | discovery配置、共享状态/脚本、注册租约、runtime snapshot、HTTP诊断；先cache-off | 新ID可在固定fallback列表外加入；expired lease可重新登记；empty/outage/blocked区别正确；请求线程不访问发现Redis | 待执行 |
@@ -89,15 +89,36 @@ S1 远程 CLI 的 parser、严格输入/health 以及 CRUD SDK 适配已按 RED�
 |---|---|---|---|
 | S1.0 parser 骨架 | `218ece4` | `test_cli_parser.py` 定向测试 8/8；`python -m cpppools --help/--version` 不构造 SDK | 通过 |
 | S1.1 输入、输出与 health | `ee7e956` | CLI command 定向测试 13/13；SDK 全量回归 81/81（live smoke 默认明确 skip）；临时 SQLite + 真实 `cpppools_server` health 返回 200 | 通过 |
-| S1.2 CRUD SDK 适配 | `d7b339c` | CRUD 定向测试 19 项（含 4 项明确 live skip）通过；SDK 全量回归 87 项（4 skip）；`CPL_RUN_E2E=1` 真实 HTTP 单节点 insert/select/update/delete 往返通过 | 通过 |
+| S1.2 CRUD SDK 适配 | `a5ce72e`（当前分支阶段提交） | CRUD 定向测试 19 项（含 4 项明确 live skip）通过；SDK 全量回归 87 项（4 skip）；`CPL_RUN_E2E=1` 真实 HTTP 单节点 insert/select/update/delete 往返通过 | 正常流程通过；输入错误验收见第 2.5 节 |
 
-S1.2 的 CLI 只负责参数解析、完整 payload 64 KiB 预检、输出和错误码；拓扑、307、epoch、fallback、重试全部由 `ClusterClient` 执行。畸形成功响应映射为 `protocol_error`/退出码 5，且不会由 CLI 重发；无键 insert 不新增重试。S2 阶段 3 已落地 POSIX 本机生命周期，阶段 4/5、S3–S7 Redis/发现功能仍未实现。
+S1.2 的 CLI 只负责参数解析、完整 payload 64 KiB 预检、输出和错误码；拓扑、307、epoch、fallback、重试全部由 `ClusterClient` 执行。畸形成功响应映射为 `protocol_error`/退出码 5，且不会由 CLI 重发；无键 insert 不新增重试。上述为阶段实施记录，当前完成范围与剩余项以第 2 节状态表和第 2.5 节审查结果为准。
 
 ### 2.4 S2 阶段 3（POSIX 本机生命周期）实施证据（2026-10-13）
 
 新增 `sdk/python/cpppools/local_node.py`，并将 `start/status/stop` 接入 CLI。该阶段使用现有 `cpppools_server --config`，以真实 `/health` 作为 running 证据；状态采用原子 JSON 替换，实例目录使用 POSIX 非阻塞锁，停止前核验 `/proc` 可执行文件身份，Linux zombie 不计为存活。普通停止使用 `SIGTERM`，超时返回 7，无法核验身份返回 8，损坏/缺失状态返回 10。
 
-验证证据：`test_local_node.py` 单元及生命周期测试、CLI dispatch 测试通过；全量 SDK 测试 100 项通过、7 项环境跳过；使用 `build-s0-off-wsl/bin/cpppools_server` 的真实进程完成 start → status → stop，三个 live 用例通过（`-W error`）。阶段 4 控制文件闭环已完成：正确 token 停止、错误 token 拒绝和 ready marker 均有真实进程测试；阶段 5 基础 `pyproject`、`cpl` console script 和源码树外 venv 安装 smoke 已通过。Windows 原生控制通道/ACL 与完整 wheel/sdist 发布矩阵仍未完成，不能将本阶段证据外推为完整跨平台 v1 门槛。
+验证证据：`test_local_node.py` 单元及生命周期测试、CLI dispatch 测试通过；默认全量 SDK 共 100 项，其中 7 项环境跳过；真实进程完成 start → status → stop，三个 live 用例通过（`-W error`）。正确 token 停止、错误 token 拒绝和 ready marker 存在性均有真实进程测试；基础 `pyproject`、`cpl` console script 和源码树外 venv 安装 smoke 已通过。这些证明 Linux 顺序操作与基础入口可用；本轮独立审查发现并发状态和停机协议尚未完成，不能据此标记阶段 3–5 整体通过。
+
+### 2.5 S0–S2 独立审查与重新验收（2026-10-14）
+
+完整证据、代码位置、复现及关闭条件见 [S0–S2 审查与验收报告](completed-stages-acceptance-2026-10-14.md)。原 F8 复验：Linux OFF/OFF CTest 20/20；MariaDB ON 基础 CTest 20/20；Python 全量 167 项中 165 通过、2 项 Windows 专属用例按平台跳过。后续 F9–F11 定向测试 92 项中 79 通过、13 项按平台/live 条件跳过；Python 全量 live 最新为 171 项中 169 通过、2 项 Windows 专属用例跳过。Windows 原生服务和控制专项构建通过，`test_local_control` 1/1、socket live 8 项通过；慢读期限因无法证明远端背压而跳过。MySQL 自省/CRUD 因未设置测试账号跳过。历史 RED 与原正常功能证据保留。
+
+A03–A08 原范围已有针对性 GREEN 与组合回归证据。整体复审新增的 R01 前台异常清理、R02 普通续停补发、R03 并发命令结果归属已由 F9–F11 修复并通过 Linux/WSL 定向与组合回归；A06/A07/A08 原结论保留。A01 仍缺默认/NBE SESSION 下的真实 MySQL 自省和 CRUD，A02 仍缺 Windows 慢读总期限的可验证背压证据。Windows 全量原生 CMake 构建仍被既有 `test_http_server.cpp` 的 POSIX `<arpa/inet.h>` 阻断；所需服务/控制目标独立构建通过。S3 仅保留部分实现进度，本轮未进行完整 Redis 验收。
+
+修复执行入口为 [S0–S2 验收问题修复计划](completed-stages-fix-plan-2026-10-14.md)：F1–F8 阶段实现与评审记录保留；F9 清理边界、F10 停止投递恢复、F11 命令结果归属均已实现并复验。问题与策略见 [整体评审](completed-stages-overall-review-2026-10-14.md)。F 编号是修复任务，不替代 S 阶段或原专题编号。A01/A02 的实测缺口以及 macOS/Windows 本机管理、发行版本/包矩阵继续按 S2 门槛单独验收。
+
+### 2.6 修复完成后的剩余工作顺序
+
+当前代码修复批次 F1–F7/F9–F11 已完成实现与评审，F8 已完成 Linux/WSL 组合回归；A01/A02 的环境验收仍开放。后续按下列顺序补齐既有门槛，不重新实现已经关闭的修复项。
+
+| 顺序 | 工作 | 完成标准 |
+|---|---|---|
+| 1 | 补 A01/A02 真实环境证据 | 默认/NBE SESSION 的真实 MySQL 自省/CRUD；Windows 可证明背压的慢读总期限。没有环境时保留未验证，不重开已通过的构建/收包路径 |
+| 2 | 完成本机管理的平台与前台交付 | Windows 身份/ACL/句柄安全与 start，macOS 身份及启停；前台就绪输出、真实终端 Ctrl+C 按 CLI 契约验收 |
+| 3 | 完成 S2 发行门槛 | 对齐安装版版本来源；修复 Windows console script smoke；交付补全；独立 wheel/sdist 重建和 Python 3.8 实跑 |
+| 4 | 继续 S3 → S4 → S5 → S6 → S7 | 依第 2 节既有阶段门槛推进 Redis 缓存与发现，不把本轮 CLI 修复计入 Redis 功能完成 |
+
+可独立进行的环境准备、平台实现和发行工作不必相互等待；整体完成状态仍以各自通过证据为准。最新测试计数来自修复批次，本次仅更新进度文档。
 
 ## 3. 真正的依赖与可调整的先后
 
@@ -156,7 +177,7 @@ RowCache仍是每数据源共享协调器。缓存方案先落地 `(backend_epoc
 
 ## 5. S0核验和公共任务归属
 
-下列事项已经在专题文档出现，将它们归给首次修改该模块的阶段，不重复写两份补丁。这里不是宣称所有历史缺陷仍未修复；执行时先检查当前源码和已有测试，再决定是否需要变更。
+下列事项记录初始 `6c554dd` 排期时的线索和公共任务归属，不能作为当前“尚未实现”的结论。它们已经在专题文档出现，不重复写两份补丁；当前状态以第 2 节实施与独立验收记录为准。
 
 | 项目 | 当前已见依据 | 首次归属及后续复用 |
 |---|---|---|
@@ -193,6 +214,6 @@ RowCache仍是每数据源共享协调器。缓存方案先落地 `(backend_epoc
 
 已将三份新方案作为实际待实现主线，历史已落地方案归入基线核验；统一了阶段编号引用、共享模块归属、两个Redis故障策略、token与namespace、schema、动态扩容、SDK发送门控、打包及停机。专题文档的方案入口均链接回本路线，历史加固索引注明当前执行入口。
 
-S1阶段2已完成实现并取得定向、全量SDK及真实HTTP CRUD证据；S2–S7仍待执行。后续阶段仍须按同样的RED→GREEN、真实进程和平台验收门槛推进，不把本阶段证据外推为本机生命周期、Redis或动态发现已完成。
+S0/S1 已有实现和回归证据，S2 Linux 本机管理修复与基础安装、S3 Redis 基础已部分落地，S4–S7 待执行。2026-10-14 修复复验关闭已测 Linux/WSL 范围的 A03–A08 与 R01–R03；A01/A02 保留真实环境门槛，S2 平台、前台输出与发行门槛也未关闭。当前 CLI 阶段状态见 [CLI §6.1](cpl-cli-design.md#61-当前实施进度2026-10-14)。
 
 两位独立读者已复核实施顺序、控制面关键修订和跨方案契约，未发现影响实施的剩余依赖循环或路线冲突。文档核验覆盖本路线、三个专题和历史加固索引：相对文件链接可解析，Markdown围栏成对，现有JSON示例可解析；这不是产品测试或阶段完成证据。

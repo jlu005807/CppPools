@@ -15,6 +15,10 @@
 
 namespace cpppools::db {
 
+// Private test/implementation seam for running the production introspection path
+// on a caller-owned session (for example, with a session-specific sql_mode).
+bool mysql_introspect_schema(MYSQL* conn, Schema* out, std::string* error);
+
 // MySQL prepared statement 的 RAII 封装（对齐 SqliteStmt 的对外形态）。
 //
 // 与 SQLite 的差异（spec §九 / §十二）：

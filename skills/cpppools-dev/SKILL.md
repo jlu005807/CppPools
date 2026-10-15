@@ -1,136 +1,50 @@
 ---
 name: cpppools-dev
-description: CppPools 项目开发指南——C++17 多数据源数据库中间件（三级池化 + NVI 校验管道 + SQLite 后端），支持一致性哈希分布式集群（单 owner 路由/307 重定向/epoch 门控）与行级写穿透缓存，配套零依赖 Python SDK。涵盖项目背景、架构设计、构建部署、测试流程与开发约定。在本仓库中做任何开发、调试、测试、架构问答或文档工作时使用。
+description: Use when 在 CppPools 仓库理解、开发、调试、评审或验证 C++17 数据库中间件、SQLite/MySQL 后端、三级池化、行缓存、集群路由及 Python SDK，或对齐相关文档。
 ---
 
 # CppPools 开发指南
 
-## 1. 项目背景与定位
+CppPools 是数据库前面的 HTTP 中间件：JSON 行级 CRUD → 表路由 → 连接池 → SQLite/MySQL。可选集群把同一个路由键交给唯一 owner 处理和缓存；Python SDK 负责发现拓扑、直连 owner、跟随 307 与故障绕行。
 
-CppPools 是一个**学习驱动的 C++17 数据库中间件**，从"三级池化"练手项目演进而来，
-当前形态：
+## 先建立正确的项目模型
 
-- **多数据源中间件**：客户端发通用 JSON CRUD（`POST /api/v1/select|insert|update|delete`），
-  服务端按表名路由到配置的 SQLite（MySQL 后端保留未做）数据源。
-- **分布式集群（可选，`cluster` 配置段）**：按路由键
-  `(datasource, table, 唯一键列, 键值)` 做一致性哈希（murmur3_32 seed=0 无符号、
-  100 vnodes），每个键归唯一 owner 节点 —— 单 owner ⇒ 无需失效广播/分布式锁；
-  非 owner 回 **307 重定向**（不做代理转发）；拓扑变更用 **epoch 门控**。
-- **行级写穿透缓存（可选，`cache` 配置段）**：每数据源一份共享 RowCache
-  （分片锁/LRU 双阈值/TTL/世代号 CAS 回填/Singleflight），写直达 DB + 双删失效。
-- **零依赖 Python SDK**（`sdk/python/`）：建环、直连 owner、307 跟随、黑名单/attempt
-  绕行、Rejoin、错误分类重试。
+- SQLite 已实现且默认可用；MySQL 已实现，但必须用 CPPPOOLS_USE_MYSQL=ON 编译并提供客户端开发库。CMake 中 OFF 模式的 mock 摘要是遗留描述，不表示服务使用模拟数据库。
+- **拓扑来自静态配置**：每节点启动时读本地 JSON 的 cluster.nodes，通过 GET /api/v1/cluster 发布完整视图。SDK 给一个或多个 seed URL，初始化时逐个尝试获取视图并建环，再从 /api/v1/schema 获取唯一列信息。节点没有心跳、自动注册或配置传播。
+- **缓存在服务进程内存**：每个节点、每个数据源一份 RowCache，该源所有池连接共享；不是每连接一份，也不是 SDK 缓存或 Redis。分片哈希表存整行，LRU/TTL 管淘汰，Singleflight 合并回源，世代 CAS 阻止旧回填。
+- **数据库目标由部署配置保证**：集群设计要求所有节点连同一组实际数据源。节点各读各的 datasources 并建立连接池，不从 SDK 或邻居取得账号密码。datasource_digest 仅核对目标标识，SDK 初始化时比对并记录 digest_warnings，不能分发配置或证明数据一致。
+- 多进程 e2e 使用独立 SQLite 库验证路由与故障流程；实现没有复制、迁移或补写机制。不要由这些测试推断独立库故障后数据会收敛。相同路径在不同主机上也不代表同一 SQLite 数据库；TTL 只让缓存过期，不同步数据库。
 
-**一致性契约**：稳态**同键**强一致；跨键/绕行期/拓扑未收敛/外部写入者 →
-最终一致（旧读 ≤ TTL）。
+## 按任务读取
 
-权威文档（改动前先读对应的）：
+从仓库根执行命令。先读 AGENT.md、git status --short 和相关最近提交；旧文档与源码冲突时指出冲突，不把历史规划当现状。AGENT.md 中 MySQL 未做的例子已经过时，但架构与范围约束仍适用。
 
-| 文档 | 内容 |
+| 任务 | 入口 |
 |---|---|
-| `README.md` | 项目全貌、模块结构、快速开始 |
-| `docs/api/backend_api.md` | HTTP API 契约（端点/状态码矩阵/集群头/指标） |
-| `docs/api/sdk.md` | SDK 参数/语义/错误矩阵 |
-| `docs/superpowers/specs/2026-08-11-cluster-cache-design.md` | 集群+缓存设计 spec（规范性，含黄金向量 §3.2、决策矩阵 §3.6、不变量 I0/I1） |
-| `docs/superpowers/specs/2026-08-06-db-middleware-design.md` | 中间件改造 spec |
-| `docs/benchmarks/` | 性能基线与验收归档 |
+| 模块边界、请求路径、缓存与数据库区别 | [architecture.md](architecture.md) |
+| 构建、运行、测试前提及实测限制 | [verification.md](verification.md) |
+| HTTP 契约、配置、状态码、指标 | docs/api/backend_api.md、config/cpppools.example.json |
+| SDK 拓扑、重试、错误分类 | docs/api/sdk.md、sdk/python/cpppools/client.py、transport.py |
+| 集群不变量、哈希黄金向量 | docs/superpowers/specs/2026-08-11-cluster-cache-design.md |
+| MySQL 自省、事务、类型限制 | docs/superpowers/specs/2026-08-15-mysql-backend-design.md、src/db/mysql_database.cpp |
+| 最近加固的目的与验收要求 | docs/superpowers/plans/2026-08-17-code-hardening-index.md、相应源码与测试 |
+| 节点本地 Redis 缓存设计、恢复边界及分阶段 TDD | [redis-cache-design.md](../../docs/redis-cache-design.md) |
+| Redis 设计的运行配置、故障行为和发布检查摘要 | [redis-cache-operations.md](../../docs/redis-cache-operations.md) |
+| 缓存、Redis transport 与动态拓扑的统一实施顺序 | [implementation-roadmap.md](../../docs/implementation-roadmap.md) |
+| Redis 动态拓扑发现的独立设计 | [redis-discovery-design.md](../../docs/redis-discovery-design.md) |
 
-## 2. 架构速览
+**实现状态边界**：当前行缓存仍是每个服务进程、每个数据源一份的内存 `RowCache`；Redis 缓存和 Redis 拓扑发现均尚未实现。上述 Redis 文档是设计/实施计划，不是当前配置能力、运行保证或已通过测试的证明。回答“现在怎么运行”时以源码、当前配置示例和实际测试为准；回答“将来如何实现”时才引用这些方案，并标明尚未落地。
 
-```
-SDK / curl
-  │  建环（GET /api/v1/cluster）→ 按路由键直连 owner
-  ▼
-┌──────────── CppPools 节点 × N（单节点即退化形态）────────────┐
-│ ThreadPool → ObjectPool → NVI 校验管道 → 表路由 → 归属门控    │
-│   → RowCache（写穿透）→ DbConnectionPool × 数据源数           │
-└──────────────────────────────────────────────────────────────┘
-  ▼
-SQLite（各节点各自的库 = 真理之源）
-```
+**实施顺序入口**：所有新增方案先经过 [统一实施路线](../../docs/implementation-roadmap.md) 的 S0。S0 按顺序处理 MySQL ON 构建阻断、Singleflight 竞态、bypass 异常复位、Prometheus 重复声明和 HTTP 慢速发送总期限；五项均有真实 RED→GREEN 证据后，才进入 CLI（S1）、本地 Redis 缓存（S3–S4）和动态发现（S5–S7）。
 
-两个不变量（必须守住）：
-- **I0 失效永不 bypass**：任何旁路形态（kill-switch、非 owner 就地、epoch 不符）
-  只关读命中与回填，写的失效照常执行。
-- **I1 blacklist_ttl ≥ cache_ttl**：配置解析期 fail-fast；归队安全性的承担者。
+## 改动时守住的契约
 
-模块边界与关键决策细节见 [architecture.md](architecture.md)。
+- Database public 非虚 CRUD 做校验，后端只实现 do_*；无 DDL。where 必须单列真正唯一，联合主键的单个成员不能因此标为 unique。公开头与私有实现边界以实际文件为准。
+- **I0**：关闭缓存、Fallback 或 epoch bypass 只停读命中和回填，缓存表的写失效仍执行。**I1**：blacklist_ttl_ms >= ttl_ms，配置期拒绝违反者。
+- 路由哈希中的 datasource 是请求显式值或空串；本地缓存键使用解析后的数据源名。两者不可混用。哈希黄金向量和单 owner/307/epoch 决策不能随意更改。
+- 缓存允许表由 cache.tables 控制（空列表代表全部）。非空行 miss 读取整行再按请求投影；投影顺序和重复列保留。测试缓存行为须覆盖跨连接共享和写后旧回填。
+- SQLite update 用 BEGIN IMMEDIATE 包围读改写；MySQL update 使用事务内 SELECT ... FOR UPDATE。语句必须在连接关闭前释放，prepare 失败需可恢复。
+- SDK 默认每 30 秒在请求路径懒刷新，无后台发现线程；运行期刷新失败继续用旧环。epoch 响应不符刷新供后续请求使用，**不重发已经完成的操作**。
+- select/update/delete 可按错误类别限次重试；insert 仅在能得到显式可路由唯一键时允许重试。无键 insert 及其重定向目标失败不得自动重发；409 交调用方判断。
 
-## 3. 快速开始与部署
-
-环境：C++17 编译器 + CMake 3.16+ + SQLite3 开发库；SDK 需 Python 3.8+（零依赖）。
-
-```bash
-# 构建 + 全部测试（一条命令）
-scripts/build.sh                  # 可选 --clean / --no-test
-
-# 手动
-cmake -S . -B build && cmake --build build -j
-ctest --test-dir build --output-on-failure     # 预期 18/18
-
-# 单节点启动（自动种子演示库 data/cpppools_demo.db）
-scripts/run_server.sh
-curl -X POST http://127.0.0.1:8080/api/v1/insert \
-  -d '{"table":"user_scores","values":{"user_id":42,"score":99,"updated_at_ms":0}}'
-
-# 集群：每节点一份配置（cluster.node_id 不同、nodes 列表相同、epoch 一致）
-# 格式见 config/cpppools.example.json 与 docs/api/backend_api.md §6
-# 拓扑变更流程：递增全部节点 epoch → 逐节点重启 → 客户端 ≤30s 收敛
-
-# SDK 使用
-python3 -c "import sys; sys.path.insert(0,'sdk/python'); \
-from cpppools.client import ClusterClient; \
-c=ClusterClient(['http://127.0.0.1:8080']); print(c.select('user_scores',{'column':'user_id','value':42}))"
-
-# 优雅停机：SIGTERM/SIGINT（停 accept → 排空在途，上限 5s）
-```
-
-配置路径优先级：`--config` > `CPPPOOLS_CONFIG` > `config/cpppools.json`。
-剩余环境变量：`CPPPOOLS_MAX_QUEUE_SIZE` / `CPPPOOLS_DB_ACQUIRE_TIMEOUT_MS` /
-`CPPPOOLS_LATENCY_WINDOW_SIZE`。
-
-## 4. 测试流程与步骤
-
-测试金字塔（改动后**自下而上**验证）：
-
-```bash
-# ① C++ 单测（18 项 CTest；assert 基，CMake 已对测试加 -UNDEBUG 防假绿）
-ctest --test-dir build --output-on-failure
-
-# ② SDK 单测（51 项，fake 集群驱动；含 spec §3.2 黄金向量跨语言对拍）
-python3 -m unittest discover -s sdk/python/tests
-
-# ③ live e2e（起真实多进程集群）
-bash scripts/cluster_e2e.sh    # 双节点：路由分布/307/Fallback/epoch
-bash scripts/sdk_e2e.sh        # 三节点：杀节点绕行/归队清缓存/滚动重启
-
-# ④ 压测（v1.1 决策证据采集；bench 对照 / storm 归队观测）
-python3 scripts/loadtest_sdk.py bench --cache on --workers 8 --total 8000
-python3 scripts/loadtest_sdk.py storm --workers 8 --duration 30
-```
-
-开发流程约定（项目惯例，逐期验证有效）：
-
-1. **TDD**：先写失败测试（RED，必须亲眼看到失败原因正确）→ 最小实现（GREEN）
-   → 全量回归。新端点/新后端必须进 conformance 或决策矩阵测试。
-2. **变异验证**：关键校验逻辑（如校验管道、世代 CAS）用"删掉某检查测试必红"
-   证明测试真的钉住了行为。
-3. **每期/每功能评审闭环**：code-reviewer 子代理评审 → 分级修复（阻塞/重要/建议）
-   → 复验 → 提交。评审曾抓到：忙等待、世代 CAS 非原子、Fallback 头判定、
-   attempt 扫描窗口漏节点等真实缺陷 —— 不要跳过评审。
-4. **零告警**：`-Wall -Wextra ... -Werror=switch -Werror=return-type`，
-   新增路由忘接 handler 会被编译拦截。
-5. **黄金向量不可动**：spec §3.2 冻结值两端（C++ test_hash_ring / SDK
-   test_hash_ring）共同引用，改哈希口径必须两端同改 + spec 留痕。
-
-## 5. 开发约定
-
-- **提交信息**：单行标题，Conventional 前缀（feat/fix/test/docs/chore），
-  不写多段正文；不带"期N"字样，只描述改动本身。
-- **错误处理**：C++ 侧错误按值返回（`DbResult` + `DbStatus`），不用异常做控制流。
-- **文档同步**：改 API/指标/配置 → 同步 `docs/api/backend_api.md`；
-  改 SDK 语义 → 同步 `docs/api/sdk.md`；设计级变更 → spec 修订记录留痕。
-- **接口安全边界**：`Database` 基类禁止 DDL 方法（类型级保证）；
-  where 必须 PK/UNIQUE；表/列名走 schema 白名单（防注入靠集合成员判断，不靠转义）。
-- **MySQL 后端**：保留未做（工厂注册表已留位 + conformance 矩阵可复用；
-  待做唯一性自省口径专项）。
+改 API/指标/配置时同步 docs/api/backend_api.md，改 SDK 语义同步 docs/api/sdk.md。验证选与改动相关的单测和真实运行入口；报告命令、环境、退出码及跳过原因，不沿用历史测试数。普通文档修改不授权新增功能、重写 Git 历史或推送。

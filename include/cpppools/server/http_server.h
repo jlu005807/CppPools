@@ -21,6 +21,7 @@
 namespace cpppools::server {
 
 class OwnershipRouter;  // 归属路由器（期2）：实现细节在 src/server/。
+class LocalControl;
 
 // 单次请求的接收缓冲上限。请求行超过此值会得到 414。
 inline constexpr std::size_t kRequestBufferBytes = 4096;
@@ -87,8 +88,6 @@ struct HttpServerConfig {
     ClusterView cluster_view;
     // Optional local control channel. Empty means legacy signal-only mode.
     std::string control_dir;
-    std::string control_launch_id;
-    std::string control_token;
 };
 
 // HttpServer：单节点三级池化 API 服务的 HTTP 接入层。
@@ -197,6 +196,8 @@ private:
     // 归属路由器（spec §3.6）：从 config_.cluster_view 建环，启动后只读。
     // 单节点模式下 decide 恒本地，行为与无集群时逐字节一致。
     std::unique_ptr<OwnershipRouter> router_;
+    // Private local lifecycle protocol; the token is never part of public config.
+    std::unique_ptr<LocalControl> local_control_;
 
     // 优雅停机标志：request_stop() 置位后 accept 循环退出（SIGTERM/SIGINT
     // 经 main 注册的信号处理函数调用 request_stop，只碰这个原子量，信号安全）。
@@ -239,7 +240,7 @@ private:
     void unregister_active_socket(std::intptr_t fd);
     void interrupt_active_sockets() noexcept;
     bool control_stop_requested() const;
-    void publish_control_marker(const char* name) const;
+    void publish_control_stopping() const;
 };
 
 }  // namespace cpppools::server

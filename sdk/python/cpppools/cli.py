@@ -20,6 +20,7 @@ from . import errors, transport
 
 VERSION = "0+dev"
 MAX_INPUT_BYTES = 65536
+_MAX_JSON_DEPTH = 256
 # Kept as a lazy binding: importing the CLI (including ``--help``) must not
 # initialise a ClusterClient or perform topology/network work.  Tests and
 # embedders may replace this binding with a compatible client implementation.
@@ -198,6 +199,8 @@ def _reject_constant(value):
 
 
 def _parse_int(value):
+    if len(value.lstrip("-")) > 19:
+        raise InputError("integer is outside signed int64 range")
     number = int(value)
     if number < -(1 << 63) or number > (1 << 63) - 1:
         raise InputError("integer is outside signed int64 range")
@@ -227,14 +230,41 @@ def _load_json_bytes(data):
         text = data.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
         raise InputError("JSON input is not valid UTF-8: %s" % exc) from None
+    _check_json_depth(text)
     try:
         return json.loads(text, object_pairs_hook=_pairs_no_duplicates,
                           parse_constant=_reject_constant,
                           parse_int=_parse_int, parse_float=_parse_float)
     except InputError:
         raise
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+    except (ValueError, RecursionError) as exc:
         raise InputError("invalid JSON: %s" % exc) from None
+
+
+def _check_json_depth(text):
+    """Bound structural nesting consistently across JSON decoder versions."""
+    stack = []
+    in_string = False
+    escaped = False
+    for character in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            stack.append(character)
+            if len(stack) > _MAX_JSON_DEPTH:
+                raise InputError("JSON input exceeds maximum nesting depth")
+        elif character in "]}" and stack:
+            matching = "[" if character == "]" else "{"
+            if stack[-1] == matching:
+                stack.pop()
 
 
 def parse_json_source(source, stdin=None):
@@ -510,6 +540,9 @@ def _run_local(args, operation):
         code = getattr(exc, "code", 6)
         kind = getattr(exc, "kind", "start_error" if operation == "start"
                         else "local_state_error")
+        result = getattr(exc, "result", None)
+        if result is not None:
+            _print_local_result(result, args.output)
         _write_runtime_error(kind, exc, code)
         return code
 
@@ -538,13 +571,13 @@ def main(argv=None):
         try:
             return run_health(args)
         except InputError as exc:
-            print(str(exc), file=sys.stderr)
+            _write_runtime_error("input_error", exc, 2)
             return 2
     if command in {"select", "insert", "update", "delete"}:
         try:
             return run_crud(args)
         except InputError as exc:
-            print(str(exc), file=sys.stderr)
+            _write_runtime_error("input_error", exc, 2)
             return 2
     if command in {"start", "stop", "status"}:
         return _run_local(args, command)

@@ -4,6 +4,7 @@
 #include "server/route_table.h"
 #include "server/crud_api.h"
 #include "server/ownership_router.h"
+#include "server/local_control.h"
 #include "db/row_cache.h"
 
 #include <nlohmann/json.hpp>
@@ -16,8 +17,6 @@
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
-#include <fstream>
-#include <filesystem>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -67,20 +66,6 @@ void close_socket(SocketType s) {
 #else
     close(s);
 #endif
-}
-
-std::string read_trimmed_file(const std::filesystem::path& path) {
-    std::ifstream in(path, std::ios::in | std::ios::binary);
-    if (!in) {
-        return {};
-    }
-    std::string value((std::istreambuf_iterator<char>(in)),
-                      std::istreambuf_iterator<char>());
-    while (!value.empty() && (value.back() == '\n' || value.back() == '\r' ||
-                              value.back() == ' ' || value.back() == '\t')) {
-        value.pop_back();
-    }
-    return value;
 }
 
 // SocketGuard：把 socket 的关闭绑定到栈对象上。
@@ -408,6 +393,13 @@ HttpServer::HttpServer(uint16_t port,
     if (config_.latency_window_size == 0) {
         config_.latency_window_size = 1;
     }
+    if (!config_.control_dir.empty()) {
+        std::string error;
+        local_control_ = LocalControl::open(config_.control_dir, &error);
+        if (!local_control_) {
+            throw std::runtime_error("control error: " + error);
+        }
+    }
     // 归属路由器：启动期一次性建环，运行期只读（HashRing 的线程契约）。
     router_ = std::make_unique<OwnershipRouter>(config_.cluster_view);
 }
@@ -415,27 +407,28 @@ HttpServer::HttpServer(uint16_t port,
 HttpServer::~HttpServer() = default;
 
 bool HttpServer::control_stop_requested() const {
-    if (config_.control_dir.empty() || config_.control_launch_id.empty() ||
-        config_.control_token.empty()) {
+    if (managed_stop_requested()) {
+        return true;
+    }
+    if (!local_control_) {
         return false;
     }
-    const std::filesystem::path request =
-        std::filesystem::path(config_.control_dir) / "stop.request";
-    const std::string content = read_trimmed_file(request);
-    const std::string expected = "launch_id=" + config_.control_launch_id +
-                                 "\ntoken=" + config_.control_token;
-    return content == expected;
+    std::string error;
+    const bool requested = local_control_->stop_requested(&error);
+    if (!requested && !error.empty() &&
+        local_control_->claim_stop_request_warning()) {
+        std::cerr << "[warn] ignored control stop request: " << error << '\n';
+    }
+    return requested;
 }
 
-void HttpServer::publish_control_marker(const char* name) const {
-    if (config_.control_dir.empty()) {
+void HttpServer::publish_control_stopping() const {
+    if (!local_control_) {
         return;
     }
-    std::ofstream out(std::filesystem::path(config_.control_dir) / name,
-                      std::ios::out | std::ios::trunc);
-    if (out) {
-        out << "launch_id=" << config_.control_launch_id << "\n";
-        out.flush();
+    std::string error;
+    if (!local_control_->publish_stopping(&error)) {
+        std::cerr << "[warn] could not publish stopping marker: " << error << '\n';
     }
 }
 
@@ -481,20 +474,20 @@ void HttpServer::start() {
         throw std::runtime_error("listen failed");
     }
 
-#ifdef _WIN32
-    // Non-blocking accept gives the control-file channel the same bounded
-    // 200ms polling interval as the POSIX poll loop.
-    u_long nonblocking = 1;
-    if (ioctlsocket(server_fd, FIONBIO, &nonblocking) != 0) {
-        throw std::runtime_error("failed to make listener non-blocking");
+    if (local_control_) {
+        std::string error;
+        const int actual_port =
+            static_cast<int>(bound_port_.load(std::memory_order_relaxed));
+        if (!local_control_->publish_ready(actual_port,
+                                           config_.cluster_view.node_id, &error)) {
+            throw std::runtime_error("control ready marker failed: " + error);
+        }
     }
-#endif
-    publish_control_marker("ready");
 
     // 优雅停机的唤醒机制：POSIX 用 poll(200ms) 包住 accept —— 实测 macOS 的
     // SO_RCVTIMEO 不影响 accept（会无限阻塞，探针实证）。
-    // Windows 分支的 accept 无超时唤醒，停机需等下一个连接到达，
-    // 属已知限制（本项目主目标平台为 macOS/Linux）。
+    // Windows 用 select 等待 listener 可读，再以阻塞 accept 保持新连接的
+    // 默认阻塞模式传给 worker；select 超时后回到循环头检查停机标志。
 
     // 用 endl 而非 '\n'：start() 之后进入永不返回的 accept 循环，
     // 若不 flush，stdout 被重定向（systemd / docker / nohup）时启动横幅会永久留在缓冲区里。
@@ -514,7 +507,7 @@ void HttpServer::start() {
     // 这就是三级池化的入口：accept 主循环只做调度，真正的 I/O + 计算都在 worker 线程上。
     while (!stopping_.load(std::memory_order_relaxed)) {
         if (control_stop_requested()) {
-            publish_control_marker("stopping");
+            publish_control_stopping();
             request_stop();
             break;
         }
@@ -529,7 +522,12 @@ void HttpServer::start() {
         }
 #endif
 #ifdef _WIN32
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        // Keep the listener blocking: Winsock accept then creates a blocking
+        // client socket, allowing recv to honor SO_RCVTIMEO for delayed headers.
+        // The bounded wait is also the stop-flag wakeup point on Windows.
+        if (!wait_socket_readable(server_fd, std::chrono::milliseconds(200))) {
+            continue;
+        }
 #endif
         sockaddr_in client_addr{};
 #ifdef _WIN32

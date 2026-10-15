@@ -94,6 +94,18 @@ private:
     MYSQL_RES* result_;
 };
 
+std::string mysql_text_literal(const std::string& value) {
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string literal = "CONVERT(X'";
+    for (char ch : value) {
+        const auto byte = static_cast<unsigned char>(ch);
+        literal.push_back(digits[byte >> 4]);
+        literal.push_back(digits[byte & 0x0f]);
+    }
+    literal += "' USING utf8mb4)";
+    return literal;
+}
+
 // ---------------------------------------------------------------------------
 // 类型映射（spec §五.1）：MySQL data_type → ValueKind，或拒绝该数据源。
 // ---------------------------------------------------------------------------
@@ -153,14 +165,10 @@ bool introspect_columns(MYSQL* conn, const std::string& table, TableInfo* out,
                         std::string* error) {
     // 查询本表的列。table_schema 由 make_mysql_database 传入，这里用 SELECT DATABASE()
     // 取当前连接的默认库 —— 与 mysql_real_connect 指定的库一致，避免再传 schema 参数。
-    std::vector<char> esc_table(table.size() * 2 + 1);
-    const unsigned long esc_len = mysql_real_escape_string(
-        conn, esc_table.data(), table.c_str(), static_cast<unsigned long>(table.size()));
-    const std::string escaped_table(esc_table.data(), esc_len);
     const std::string sql =
         "SELECT column_name, data_type, is_nullable, column_key, extra "
         "FROM information_schema.columns "
-        "WHERE table_schema = DATABASE() AND table_name = '" + escaped_table + "' " +
+        "WHERE table_schema = DATABASE() AND table_name = " + mysql_text_literal(table) + " " +
         "ORDER BY ordinal_position";
     MysqlRows rows(conn, sql, error);
     if (!rows.ok()) {
@@ -228,15 +236,11 @@ bool introspect_columns(MYSQL* conn, const std::string& table, TableInfo* out,
 // - 普通索引（non_unique=1）：忽略。
 // 用 statistics 聚合判联合，绝不用 columns.column_key='UNI'（会误标联合唯一）。
 bool introspect_unique_indexes(MYSQL* conn, TableInfo* table, std::string* error) {
-    std::vector<char> esc_tbl(table->name.size() * 2 + 1);
-    const unsigned long esc_len2 = mysql_real_escape_string(
-        conn, esc_tbl.data(), table->name.c_str(),
-        static_cast<unsigned long>(table->name.size()));
-    const std::string escaped_tbl(esc_tbl.data(), esc_len2);
     const std::string sql =
         "SELECT index_name, column_name, sub_part, non_unique "
         "FROM information_schema.statistics "
-        "WHERE table_schema = DATABASE() AND table_name = '" + escaped_tbl + "' " +
+        "WHERE table_schema = DATABASE() AND table_name = " +
+        mysql_text_literal(table->name) + " " +
         "ORDER BY index_name, seq_in_index";
     MysqlRows rows(conn, sql, error);
     if (!rows.ok()) {
@@ -422,6 +426,10 @@ std::string delete_sql(const TableInfo& table, const std::string& where_column) 
 }
 
 }  // namespace
+
+bool mysql_introspect_schema(MYSQL* conn, Schema* out, std::string* error) {
+    return introspect(conn, out, error);
+}
 
 // ---------------------------------------------------------------------------
 // MysqlStmt
@@ -1135,7 +1143,7 @@ DatabaseCreateResult make_mysql_database(const config::DataSourceConfig& cfg) {
     // 表名/列名不规范化（对齐 SQLite 口径，避免跨平台大小写漂移，见 Schema::find_table 注释）。
     Schema schema;
     std::string intro_error;
-    if (!introspect(raw, &schema, &intro_error)) {
+    if (!mysql_introspect_schema(raw, &schema, &intro_error)) {
         mysql_close(raw);
         return fail_mysql("datasource \"" + cfg.name + "\": " + intro_error);
     }

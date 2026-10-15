@@ -6,6 +6,7 @@
 #endif
 #include "cpppools/pool/object_pool.h"
 #include "cpppools/server/http_server.h"
+#include "server/local_control.h"
 #include "cpppools/pool/thread_pool.h"
 
 #include <algorithm>
@@ -15,8 +16,6 @@
 #include <csignal>
 #include <cstdlib>
 #include <iostream>
-#include <fstream>
-#include <filesystem>
 #include <memory>
 #include <string>
 #ifdef _WIN32
@@ -49,6 +48,10 @@ void handle_stop_signal(int sig) {
     }
 }
 
+void handle_managed_stop_signal(int) {
+    cpppools::server::request_managed_stop();
+}
+
 // RAII：信号注册的生效范围与 server 的生命周期严格对齐 ——
 // 无论 start() 正常返回还是抛异常，析构都会解指针并恢复默认处置，
 // 不会有 handler 悬在已销毁对象上。
@@ -60,6 +63,17 @@ struct StopBridge {
     ~StopBridge() {
         g_stop_server.store(nullptr, std::memory_order_relaxed);
         g_stop_signal_count.store(0, std::memory_order_relaxed);
+        std::signal(SIGTERM, SIG_DFL);
+        std::signal(SIGINT, SIG_DFL);
+    }
+};
+
+struct ManagedStopBridge {
+    ManagedStopBridge() {
+        std::signal(SIGTERM, handle_managed_stop_signal);
+        std::signal(SIGINT, handle_managed_stop_signal);
+    }
+    ~ManagedStopBridge() {
         std::signal(SIGTERM, SIG_DFL);
         std::signal(SIGINT, SIG_DFL);
     }
@@ -101,41 +115,22 @@ std::string argument_value(int argc, char** argv, const char* option) {
     return {};
 }
 
-std::string read_control_file(const std::filesystem::path& path) {
-    std::ifstream in(path, std::ios::in | std::ios::binary);
-    if (!in) {
-        return {};
+bool accept_managed_stop(LocalControl* control) {
+    if (!managed_stop_requested() && control == nullptr) {
+        return false;
     }
-    std::string value((std::istreambuf_iterator<char>(in)),
-                      std::istreambuf_iterator<char>());
-    while (!value.empty() && (value.back() == '\n' || value.back() == '\r' ||
-                              value.back() == ' ' || value.back() == '\t')) {
-        value.pop_back();
+    std::string error;
+    const bool requested = managed_stop_requested() || control->stop_requested(&error);
+    if (!requested) {
+        if (!error.empty() && control->claim_stop_request_warning()) {
+            std::cerr << "[warn] ignored control stop request: " << error << '\n';
+        }
+        return false;
     }
-    return value;
-}
-
-std::string control_meta_launch_id(const std::string& meta) {
-    const std::string prefix = "launch_id=";
-    const auto pos = meta.find(prefix);
-    if (pos == std::string::npos) {
-        return {};
+    if (control != nullptr && !control->publish_stopping(&error)) {
+        std::cerr << "[warn] could not publish stopping marker: " << error << '\n';
     }
-    const auto begin = pos + prefix.size();
-    const auto end = meta.find('\n', begin);
-    return meta.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
-}
-
-void write_control_marker(const std::string& dir, const char* name,
-                          const std::string& launch_id) {
-    if (dir.empty()) {
-        return;
-    }
-    std::ofstream out(std::filesystem::path(dir) / name,
-                      std::ios::out | std::ios::trunc);
-    if (out) {
-        out << "launch_id=" << launch_id << '\n';
-    }
+    return true;
 }
 
 // 请求上下文对象池的**下限**容量。
@@ -158,7 +153,8 @@ constexpr std::size_t kRequestPoolSizeFloor = 128;
 constexpr std::size_t kMaxQueueSize = 1024;
 }  // namespace
 
-int main(int argc, char** argv) {
+int run_server(int argc, char** argv, const std::string& control_dir_arg,
+               LocalControl* control) {
     // 配置来源：JSON 配置文件，路径按优先级解析：
     //   --config <path>  >  环境变量 CPPPOOLS_CONFIG  >  config/cpppools.json
     // 配置错误直接 fail-fast（不回落默认）——“连哪个库”是必须显式声明的事实。
@@ -177,23 +173,11 @@ int main(int argc, char** argv) {
     const config::AppConfig& app_cfg = cfg_result.config;
     const int port = app_cfg.server.port;
     const int worker_count = static_cast<int>(app_cfg.server.worker_threads);
-    std::string control_dir_arg;
-    std::string control_launch_id;
+    if (accept_managed_stop(control)) {
+        return 0;
+    }
 
     try {
-        control_dir_arg = argument_value(argc, argv, "--control-dir");
-        std::string control_token;
-        if (!control_dir_arg.empty()) {
-            control_launch_id = control_meta_launch_id(
-                read_control_file(std::filesystem::path(control_dir_arg) / "control.meta"));
-            control_token = read_control_file(
-                std::filesystem::path(control_dir_arg) / "control.token");
-            if (control_launch_id.empty() || control_token.empty()) {
-                std::cerr << "control error: missing or malformed control.meta/control.token"
-                          << std::endl;
-                return 1;
-            }
-        }
         // 初始化“三大池子 + HTTP 服务”。
         // 池子对象由 main 统一管理生命周期，服务内部只持引用。
         // 声明顺序即销毁逆序：server 最先销毁，所以池子必定比它活得久。
@@ -230,6 +214,9 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::unique_ptr<DataSourceRegistry> registry = std::move(registry_result.registry);
+        if (accept_managed_stop(control)) {
+            return 0;
+        }
 
 
         ThreadPoolConfig tp_cfg;
@@ -255,6 +242,9 @@ int main(int argc, char** argv) {
         // init_size == max_size：启动即预分配全部，运行期内存峰值在启动期就定型。
         // 在这个配置下 acquire 的扩容分支不可达，失败路径仅当并发超过配置才出现。
         ObjectPool<RequestContext> request_pool("request", request_pool_size, request_pool_size);
+        if (accept_managed_stop(control)) {
+            return 0;
+        }
         // db_acquire_timeout 过渡期仍走环境变量；
         // latency_window_size 配置文件优先（避免“解析了但无效”的裂口）。
         HttpServerConfig server_cfg = build_server_config_from_env();
@@ -271,11 +261,6 @@ int main(int argc, char** argv) {
         server_cfg.cluster_view.cache_ttl_ms = app_cfg.cache.ttl_ms;
         server_cfg.cluster_view.blacklist_ttl_ms = app_cfg.cache.blacklist_ttl_ms;
         server_cfg.control_dir = control_dir_arg;
-        server_cfg.control_launch_id = control_launch_id;
-        if (!control_dir_arg.empty()) {
-            server_cfg.control_token = read_control_file(
-                std::filesystem::path(control_dir_arg) / "control.token");
-        }
 
         // 启动 HTTP 服务（阻塞运行）。
         // 其余启动信息由 HttpServer::start() 统一打印，避免重复输出。
@@ -287,16 +272,59 @@ int main(int argc, char** argv) {
             request_pool,
             *registry,
             server_cfg);
+        if (accept_managed_stop(control)) {
+            return 0;
+        }
         // 优雅停机：SIGTERM/SIGINT → 停 accept → 等在途请求排空 → 正常返回
         // （此后按声明逆序销毁：server → 三大池，生命周期安全）。
         // 排空等待中再收一次信号 = 强制退出（见 handle_stop_signal）。
-        g_stop_server.store(&server, std::memory_order_relaxed);
-        StopBridge stop_bridge;
+        std::unique_ptr<StopBridge> stop_bridge;
+        if (control == nullptr) {
+            g_stop_server.store(&server, std::memory_order_relaxed);
+            stop_bridge = std::make_unique<StopBridge>();
+        }
         server.start();
-        write_control_marker(control_dir_arg, "stopped", control_launch_id);
     } catch (const std::exception& ex) {
         std::cerr << "server failed: " << ex.what() << std::endl;
         return 1;
     }
     return 0;
+}
+
+int main(int argc, char** argv) {
+    std::string control_dir;
+    std::unique_ptr<LocalControl> control;
+    std::unique_ptr<ManagedStopBridge> managed_bridge;
+    try {
+        control_dir = argument_value(argc, argv, "--control-dir");
+        if (!control_dir.empty()) {
+            std::string error;
+            control = LocalControl::open(control_dir, &error);
+            if (!control) {
+                std::cerr << "control error: " << error << std::endl;
+                return 1;
+            }
+            managed_bridge = std::make_unique<ManagedStopBridge>();
+            if (!control->publish_starting(&error)) {
+                std::cerr << "control starting marker failed: " << error << std::endl;
+                return 1;
+            }
+        }
+
+        const int exit_code = run_server(argc, argv, control_dir, control.get());
+        if (exit_code != 0) {
+            return exit_code;
+        }
+        if (control) {
+            std::string error;
+            if (!control->publish_stopped(exit_code, &error)) {
+                std::cerr << "control stopped marker failed: " << error << std::endl;
+                return 1;
+            }
+        }
+        return exit_code;
+    } catch (const std::exception& ex) {
+        std::cerr << "server failed: " << ex.what() << std::endl;
+        return 1;
+    }
 }

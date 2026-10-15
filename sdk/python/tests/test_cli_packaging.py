@@ -33,7 +33,10 @@ class TestCliPackaging(unittest.TestCase):
             self.assertIn("0+dev", result.stdout)
             cpl = os.path.join(os.path.dirname(python), "cpl")
             if os.name == "nt":
-                cpl = os.path.join(os.path.dirname(python), "Scripts", "cpl.exe")
+                # ``python`` already points into the venv's Scripts directory.
+                # Adding another Scripts component breaks Windows console-script
+                # smoke outside the source tree.
+                cpl = os.path.join(os.path.dirname(python), "cpl.exe")
             script = subprocess.run([cpl, "--version"], cwd=tempfile.gettempdir(),
                                     check=False, text=True, capture_output=True)
             self.assertEqual(script.returncode, 0, script.stderr)

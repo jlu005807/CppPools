@@ -32,9 +32,16 @@ class TestStrictJsonInputs(unittest.TestCase):
     def test_rejects_duplicate_keys_special_numbers_and_integer_overflow(self):
         for text in ('{"a":1,"a":2}', '{"a":NaN}',
                      '{"a":Infinity}', '{"a":-Infinity}',
-                     '{"a":9223372036854775808}'):
+                     '{"a":9223372036854775808}',
+                     '{"a":-9223372036854775809}'):
             with self.subTest(text=text), self.assertRaises(cli.InputError):
                 cli.parse_json_source(text)
+
+    def test_accepts_exact_signed_int64_boundaries(self):
+        self.assertEqual(cli.parse_json_source('{"n":9223372036854775807}')['n'],
+                         9223372036854775807)
+        self.assertEqual(cli.parse_json_source('{"n":-9223372036854775808}')['n'],
+                         -9223372036854775808)
 
     def test_rejects_invalid_utf8_and_oversized_file(self):
         with tempfile.NamedTemporaryFile(delete=False) as handle:
@@ -53,6 +60,69 @@ class TestStrictJsonInputs(unittest.TestCase):
                 cli.parse_json_source("@" + oversized)
         finally:
             os.unlink(oversized)
+
+    def test_huge_integer_and_deep_json_are_input_errors_for_all_sources(self):
+        values = (
+            '{"id":' + '1' * 4301 + '}',
+            '{"id":' + '[' * 5000 + '0' + ']' * 5000 + '}',
+        )
+        for value in values:
+            self.assertLess(len(value.encode("utf-8")), cli.MAX_INPUT_BYTES)
+            with tempfile.NamedTemporaryFile(delete=False) as handle:
+                handle.write(value.encode("utf-8"))
+                path = handle.name
+            try:
+                sources = (
+                    (value, None),
+                    ("@" + path, None),
+                    ("-", io.BytesIO(value.encode("utf-8"))),
+                )
+                for source, stdin in sources:
+                    with self.subTest(size=len(value), source=source[:8]), \
+                            self.assertRaises(cli.InputError):
+                        cli.parse_json_source(source, stdin)
+            finally:
+                os.unlink(path)
+
+    def test_json_depth_check_ignores_delimiters_inside_strings(self):
+        value = "[{}]\\\"" * 2000
+        self.assertEqual(cli.parse_json_source(json.dumps({"text": value})),
+                         {"text": value})
+
+    def test_decoder_value_and_recursion_errors_are_input_errors_only(self):
+        for failure in (ValueError("decoder value error"),
+                        RecursionError("decoder recursion error")):
+            with self.subTest(error=type(failure).__name__), \
+                    mock.patch.object(cli.json, "loads", side_effect=failure), \
+                    self.assertRaises(cli.InputError):
+                cli._load_json_bytes(b"{}")
+
+        with mock.patch.object(cli.json, "loads",
+                               side_effect=MemoryError("out of memory")), \
+                self.assertRaises(MemoryError):
+            cli._load_json_bytes(b"{}")
+
+    def test_huge_integer_and_deep_json_subprocesses_have_no_traceback(self):
+        values = (
+            '{"id":' + '1' * 4301 + '}',
+            '{"id":' + '[' * 5000 + '0' + ']' * 5000 + '}',
+        )
+        sdk_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(filter(
+            None, (sdk_root, env.get("PYTHONPATH"))))
+        for value in values:
+            with self.subTest(size=len(value)):
+                completed = subprocess.run(
+                    [sys.executable, "-m", "cpppools", "insert", "users",
+                     "-D", value, "-o", "json"],
+                    capture_output=True, text=True, encoding="utf-8",
+                    env=env, timeout=10, check=False)
+                self.assertEqual(completed.returncode, 2, completed.stderr)
+                self.assertEqual(completed.stdout, "")
+                self.assertNotIn("Traceback", completed.stderr)
+                self.assertEqual(json.loads(completed.stderr)["kind"],
+                                 "input_error")
 
     def test_stdin_read_is_bounded(self):
         class BoundedReader:
@@ -172,6 +242,27 @@ class TestHealthCommand(unittest.TestCase):
         args = cli.build_parser().parse_args(["health", "-u", "file:///tmp/x"])
         with self.assertRaises(cli.InputError):
             cli.health_urls(args)
+
+    def test_main_reports_invalid_health_args_as_structured_input_error(self):
+        cases = (
+            ["health", "-u", "file:///tmp/x", "-o", "json"],
+            ["health", "-t", "nan", "-o", "json"],
+        )
+        with mock.patch.object(cli.transport, "request") as request:
+            for argv in cases:
+                out, err = io.StringIO(), io.StringIO()
+                with self.subTest(argv=argv), \
+                        contextlib.redirect_stdout(out), \
+                        contextlib.redirect_stderr(err):
+                    code = cli.main(argv)
+
+                self.assertEqual(code, 2)
+                self.assertEqual(out.getvalue(), "")
+                document = json.loads(err.getvalue())
+                self.assertEqual(document["kind"], "input_error")
+                self.assertEqual(document["exit_code"], 2)
+                self.assertNotIn("Traceback", err.getvalue())
+        request.assert_not_called()
 
 
 @unittest.skipUnless(os.environ.get("CPL_RUN_E2E") == "1" and
@@ -414,6 +505,48 @@ class TestCrudCommands(unittest.TestCase):
                 self.assertIn("input", err)
         self.assertFalse(any(call[0] == "init" for call in self.StubClient.calls))
 
+    def test_post_parse_crud_input_errors_are_structured_before_sdk(self):
+        with tempfile.NamedTemporaryFile(delete=False) as handle:
+            oversized_value = "x" * (cli.MAX_INPUT_BYTES - 128)
+            source = json.dumps({"name": oversized_value})
+            while len(json.dumps({
+                    "table": "users", "values": {"name": oversized_value}
+            }).encode("utf-8")) <= cli.MAX_INPUT_BYTES:
+                oversized_value += "x"
+                source = json.dumps({"name": oversized_value})
+            handle.write(source.encode("utf-8"))
+            oversized_path = handle.name
+        self.assertLess(os.path.getsize(oversized_path), cli.MAX_INPUT_BYTES)
+        cases = [
+            ["insert", "users", "-D", "", "-o", "json"],
+            ["select", "users", "-w", "null", "-o", "json"],
+            ["select", "users", "-w", "", "-o", "json"],
+            ["insert", "users", "-D", '{"id":1,"id":2}', "-o", "json"],
+            ["update", "users", "-w", '{"column":"id","value":1}',
+             "-D", '{"name":NaN}', "-o", "json"],
+            ["select", "users", "-w", '{"column":"id","value":1}',
+             "-t", "inf", "-o", "json"],
+            ["select", "users", "-w", '{"column":"id","value":1}',
+             "-t", "0", "-o", "json"],
+            ["delete", "users", "-w", '{"column":"id","value":1}',
+             "-u", "file:///tmp/x", "-o", "json"],
+            ["insert", "users", "-D", "@" + oversized_path, "-o", "json"],
+        ]
+        try:
+            for argv in cases:
+                with self.subTest(command=argv[0], input=argv[3]):
+                    code, out, err = self.invoke(argv)
+                    self.assertEqual(code, 2)
+                    self.assertEqual(out, "")
+                    document = json.loads(err)
+                    self.assertEqual(document["kind"], "input_error")
+                    self.assertEqual(document["exit_code"], 2)
+                    self.assertNotIn("Traceback", err)
+            self.assertFalse(any(call[0] == "init"
+                                 for call in self.StubClient.calls))
+        finally:
+            os.unlink(oversized_path)
+
 
 class TestLocalCommands(unittest.TestCase):
     class StubManager:
@@ -482,6 +615,85 @@ class TestLocalCommands(unittest.TestCase):
         self.assertEqual(code, 10)
         self.assertEqual(out.getvalue(), "")
         self.assertEqual(json.loads(err.getvalue())["kind"], "local_state_error")
+
+    def test_start_cancellation_and_foreground_interrupt_keep_exit_results(self):
+        outcomes = [
+            (local_node.LocalNodeError(
+                "startup canceled", result={"name": "dev", "state": "stopping",
+                                             "launch_id": "launch-1"}),
+             6, "start_error"),
+            (local_node.ExitOutcome(
+                "foreground stopped", 130, "interrupted",
+                {"name": "dev", "state": "stopped", "exit_kind": "graceful"}),
+             130, "interrupted"),
+        ]
+        for exception, expected_code, expected_kind in outcomes:
+            with self.subTest(code=expected_code):
+                class OutcomeManager(self.StubManager):
+                    def start(self, **_kwargs):
+                        raise exception
+
+                out, err = io.StringIO(), io.StringIO()
+                with mock.patch.object(cli, "LocalNodeManager", OutcomeManager,
+                                       create=True), \
+                        contextlib.redirect_stdout(out), \
+                        contextlib.redirect_stderr(err):
+                    code = cli.main(["start", "-n", "dev", "-c",
+                                     "/tmp/config.json", "-o", "json"])
+
+                self.assertEqual(code, expected_code)
+                self.assertEqual(json.loads(out.getvalue())["state"],
+                                 exception.result["state"])
+                self.assertEqual(json.loads(err.getvalue())["kind"], expected_kind)
+
+    def test_local_stop_outcome_prints_result_before_structured_error(self):
+        cases = [
+            (local_node.ExitOutcome(
+                "force accepted", 9, "forced_stop",
+                {"name": "dev", "state": "crashed", "exit_kind": "forced"}),
+             9, "forced_stop", "forced"),
+            (local_node.ExitOutcome(
+                "exit evidence missing", 10, "local_state_error",
+                {"name": "dev", "state": "crashed", "exit_kind": None}),
+             10, "local_state_error", None),
+            (local_node.StopTimeout(
+                "still stopping", result={"name": "dev", "state": "stopping"}),
+             7, "stop_timeout", None),
+        ]
+        original_print_result = cli._print_local_result
+        original_write_error = cli._write_runtime_error
+        for exception, expected_code, expected_kind, expected_exit_kind in cases:
+            with self.subTest(code=expected_code):
+                events = []
+
+                class OutcomeManager(self.StubManager):
+                    def stop(self, **_kwargs):
+                        raise exception
+
+                out, err = io.StringIO(), io.StringIO()
+                with mock.patch.object(cli, "LocalNodeManager", OutcomeManager,
+                                       create=True), \
+                        mock.patch.object(
+                            cli, "_print_local_result",
+                            side_effect=lambda result, output: (
+                                events.append("result"),
+                                original_print_result(result, output))), \
+                        mock.patch.object(
+                            cli, "_write_runtime_error",
+                            side_effect=lambda kind, exc, code: (
+                                events.append("error"),
+                                original_write_error(kind, exc, code))), \
+                        contextlib.redirect_stdout(out), \
+                        contextlib.redirect_stderr(err):
+                    code = cli.main(["stop", "-n", "dev", "-o", "json"])
+
+                self.assertEqual(code, expected_code)
+                self.assertEqual(events, ["result", "error"])
+                result = json.loads(out.getvalue())
+                self.assertEqual(result["state"], exception.result["state"])
+                self.assertEqual(json.loads(err.getvalue())["kind"], expected_kind)
+                if expected_exit_kind is not None:
+                    self.assertEqual(result["exit_kind"], expected_exit_kind)
 
 
 @unittest.skipUnless(os.environ.get("CPL_RUN_E2E") == "1" and

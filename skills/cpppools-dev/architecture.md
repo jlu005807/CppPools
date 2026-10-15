@@ -3,6 +3,25 @@
 SKILL.md 的深化材料：模块地图、请求路径、关键设计决策。
 规范性口径以 spec 与 `docs/api/` 为准，本文件只做结构化索引。
 
+## 拓扑、缓存和数据库的区别
+
+SDK 由 seed URL 拉取任一可达节点的 `/api/v1/cluster` 完整视图，按 node_id
+建立一致性哈希环，并用 `/api/v1/schema` 的唯一列元数据构造路由键。节点
+发布的是本地启动配置 `cluster.nodes`，不主动发现邻居。运行期请求触发默认
+30 秒懒刷新；epoch 不符会刷新，但不重发已经完成的操作。
+
+数据库连接来自每节点本地 JSON 的 `datasources`。部署方负责让各节点指向
+同一组实际数据库；节点之间不传播连接配置或凭据。摘要比对只检查目标字符串，
+SDK 初始化时记录 `digest_warnings`，不阻断、不同步数据，也不验证 schema。
+
+缓存是节点进程内的分片 `unordered_map` + LRU 链表；每数据源一份共享实例，
+由该数据源的全部连接装饰器使用。跨节点不共享缓存，Redis 尚未实现。
+路由环哈希决定 owner，本地哈希决定缓存分片，两者用途不同。
+
+集群 e2e 的独立 SQLite 库是路由测试环境。源码没有数据库复制/迁移机制，
+不能把替补库写入后 owner 读不到解释为 TTL 内自动恢复；缓存过期不搬运数据。
+
+
 ## 1. 模块地图
 
 ```
@@ -60,7 +79,7 @@ accept（poll 200ms 唤醒，优雅停机检查点）
                  └─ Database CRUD = 校验管道（白名单/唯一键/类型）→ do_*
                      └─ CachingDatabase：命中投影 / miss+Singleflight+CAS 回填
                          / 写穿透 + 双删失效（I0）
-                             └─ SqliteDatabase（statement cache）→ SQLite
+                             └─ SqliteDatabase / MysqlDatabase → 配置的数据库
 ```
 
 ## 3. 关键设计决策（改动前必读其理由）
@@ -70,7 +89,7 @@ accept（poll 200ms 唤醒，优雅停机检查点）
 | NVI 校验管道 | 校验在基类 public 非虚方法内联，后端结构上无法绕过；标识符来自 schema 快照（防注入 = 集合成员判断，非转义） | db-middleware spec |
 | where 唯一键 | 每操作至多一行 ⇒ 接口无法批量改删；0 行 = 200（SQL 语义，非 404） | backend_api §1.4/§1.5 |
 | 歧义不兜底 | 跨源重名表未显式指定 → 409 + 候选清单；兜底会静默写错库 | backend_api §3.5 |
-| 单 owner 路由 | 路由键 = 缓存键 = (源,表,唯一列,值)；datasource 哈希口径 = 显式值或空串（两端必须同口径）；insert 取 schema 列序第一个有值非 NULL 唯一列；REAL 键/NULL/无键不路由 | cluster spec §3.3/§3.6 |
+| 单 owner 路由 | 路由键四元组中的源 = 请求显式值或空串；缓存键中的源 = 解析后的数据源名，两者不能直接当同一编码；insert 取 schema 列序第一个有值非 NULL 唯一列；REAL 键/NULL/无键不路由 | cluster spec §3.3/§3.6 |
 | 307 而非代理转发 | 无出向 HTTP 客户端依赖、不占 worker、无级联故障 | cluster spec §3.6 |
 | 提示单调性 | 客户端头只能让节点更保守（不缓存/不重定向），不能更激进 | cluster spec §3.6 |
 | epoch 门控 | 每请求带头；不符 → bypass + 回显；SDK 立即刷拓扑、**不重发**（写重发撞 409） | cluster spec §5.4 |
@@ -78,7 +97,7 @@ accept（poll 200ms 唤醒，优雅停机检查点）
 | 世代号 CAS 回填 | 回源前记世代，回填在分片锁内原子比对；拦"写后到达的旧回填" | cluster spec §4.3.1 |
 | I0 / I1 | 失效永不 bypass；blacklist_ttl ≥ cache_ttl（fail-fast） | cluster spec §5.2 |
 | 三规则 | A 归属门控（非 owner 不缓存）/ B 归队清缓存（best-effort）/ C TTL（正确性真正承担者） | cluster spec §5.2 |
-| 幂等矩阵 | select/update/delete 可重试；显式键 insert 可重试（409=已生效）；自增 insert 绝不重试 | cluster spec §5.5 |
+| 重试矩阵 | select/update/delete 按错误类别可重试；有显式可路由唯一键的 insert 可重试，409 抛 ConflictError 交调用方判断；无键 insert 不自动重试，包括重定向目标失败 | client.py / errors.py |
 
 ## 4. 可观测性速查
 
@@ -94,8 +113,8 @@ accept（poll 200ms 唤醒，优雅停机检查点）
 
 | 层 | 入口 | 钉住什么 |
 |---|---|---|
-| C++ 单测 ×18（默认）/ ×20（`CPPPOOLS_USE_MYSQL=ON` 时 +2 MySQL 专项） | `ctest --test-dir build` | 三池行为、校验管道全分支、conformance（裸后端+装饰器双跑，MySQL 复用基线）、MySQL 自省口径专项 + CRUD 专项（环境变量驱动跳过）、黄金向量、决策矩阵五行、Rejoin 节流 |
-| SDK 单测 ×51 | `unittest discover -s sdk/python/tests` | 黄金向量跨语言、错误矩阵、路由/绕行/全黑/Rejoin/epoch/畸形拓扑 |
+| C++ 默认 18 / MySQL 启用时注册 20 项 | `ctest --test-dir build` | SQLite 裸后端与装饰器 conformance 双跑；MySQL 为两个独立专项，缺少测试账号会返回 0 跳过，不能据此声称验证了 MySQL |
+| SDK 单测（实测 60 项） | `unittest discover -s sdk/python/tests` | 黄金向量跨语言、错误矩阵、路由/绕行/全黑/Rejoin/epoch/畸形拓扑 |
 | live e2e ×2 | `scripts/cluster_e2e.sh`、`scripts/sdk_e2e.sh` | 稳态 0 个 307 = 两端环一致；杀节点/归队/滚动重启全链路 |
 | 压测 | `scripts/loadtest_sdk.py` | 缓存对照、归队风暴观测（docs/benchmarks/ 归档） |
 
@@ -103,8 +122,8 @@ accept（poll 200ms 唤醒，优雅停机检查点）
 
 - 服务端 HTTP：Connection: close，无 keep-alive/chunked/TLS；请求行 4095B / 体 1MB。
 - SQLite：不支持 BLOB 列 / WITHOUT ROWID；`:memory:` 字面路径强制单槽；单写者模型。
-- 集群：缓存命中仍需借连接（pool_size 即并发上限）；故障窗口内替补写入的行，
-  owner 归队后读不到（同键最终一致 ≤ TTL）；SDK 无连接复用。
+- 集群：缓存命中仍需借连接（pool_size 即并发上限）；SDK 无连接复用。
+  独立数据库的故障绕行和改环不保证数据收敛，须满足共享实际数据源前提。
 - MySQL（`CPPPOOLS_USE_MYSQL` 编译启用，默认 OFF）：已实现连接/自省/CRUD。
   自省口径是最大坑（缓存放大误标 unique 后果）：
   - 按 `information_schema.statistics` 聚合判联合唯一，**绝不用 `column_key='UNI'`**
@@ -120,7 +139,8 @@ accept（poll 200ms 唤醒，优雅停机检查点）
     **不按 `f->length` 预分配**——LONGTEXT 达 4GB 会 OOM）；超长值截断标记 →
     read_column 报 "foreign data of wrong type"。所有 read_column 失败路径补
     `rebind_reset`，避免 stmt 半消费态触发下次 execute "Commands out of sync"。
-  - `do_update` 隐式事务（`START TRANSACTION ... COMMIT`，`TxGuard` RAII 收尾）
+  - `do_update` 事务内 `SELECT ... FOR UPDATE` 锁定当前行，再读改写；
+    `START TRANSACTION ... COMMIT`，`TxGuard` RAII 收尾。
     防 MVCC REPEATABLE READ 下的丢失更新（与 SQLite 的关键差异）。
   - 已知限制：`DECIMAL` 精度只到 double；表名大小写不规范化（跨平台需
     `lower_case_table_names` 一致）；单 TEXT 值上限 64KB（超长报错，中间件只

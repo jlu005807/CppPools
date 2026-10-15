@@ -1,5 +1,7 @@
 # CppPools Code Hardening Implementation Plan
 
+> 2026-10-07 状态对齐：本历史计划的主要实现已有 `6d747f2`、`9d0d8a8`、`899e96e`、`e37bdca`、`6c554dd` 提交。未勾选项不代表仍需从头开发；当前新增功能执行入口为 [统一实施路线](../../implementation-roadmap.md)。其中 S0.1–S0.5 明确承接当前只读评审发现的五项高优问题；先核验残余缺陷和未验证平台，不能用已有提交替代当前测试证据。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Implement the approved code-level reliability fixes from the 2026-08-17 design without changing public APIs, architecture boundaries, or cluster/cache decisions.

@@ -82,6 +82,7 @@ add_library(cpppools STATIC
     src/server/route_table.cpp
     src/server/crud_api.cpp
     src/server/http_server.cpp
+    src/server/local_control.cpp
     src/server/hash_ring.cpp
     src/server/ownership_router.cpp
 )
@@ -198,8 +199,8 @@ cpppools_copy_mysql_dll(cpppools_server)
 # =========================
 # 测试
 # =========================
-# 测试全部基于 assert，因此必须确保 NDEBUG 不生效——否则在 Release 配置下
-# 所有断言会被消除，测试会退化成空 main 并全部“通过”，形成假绿。
+# 大多数测试基于 assert，因此必须确保 NDEBUG 不生效——否则在 Release 配置下
+# 断言会被消除，测试会退化成空 main 并全部“通过”，形成假绿。
 #
 # 测试额外加 -Isrc：需要直接调用 src/server/ 下 http_util / route_table / crud_api
 # 这些私有头文件里的函数。这是测试相对普通消费者的合理特权。
@@ -223,6 +224,15 @@ cpppools_add_test(test_http_util)
 cpppools_add_test(test_metrics)
 target_link_libraries(test_metrics PRIVATE nlohmann_json)
 cpppools_add_test(test_http_server)
+if (APPLE)
+    message(STATUS "Skipping test_local_control registration: macOS process identity is outside this stage")
+else()
+    cpppools_add_test(test_local_control)
+    target_link_libraries(test_local_control PRIVATE nlohmann_json)
+endif()
+if (NOT WIN32)
+    cpppools_add_test(test_managed_signal_bridge)
+endif()
 cpppools_add_test(test_config)
 cpppools_add_test(test_schema_validator)
 cpppools_add_test(test_statement_cache)
@@ -241,10 +251,13 @@ endif()
 
 # MySQL 自省专项测试：仅在启用 MySQL 后端时编译运行。
 # 连接信息来自环境变量（CPPPOOLS_TEST_MYSQL_HOST/PORT/USER/PASSWORD），
-# 未配置则测试内自行跳过（spec §十五.3）。
+# 未配置则以专用退出码跳过，由 CTest 显示为 Skipped（spec §十五.3）。
 if (CPPPOOLS_USE_MYSQL)
     cpppools_add_test(test_mysql_introspection)
     cpppools_add_test(test_mysql_crud)
+    set_tests_properties(test_mysql_introspection test_mysql_crud
+        PROPERTIES SKIP_RETURN_CODE 77
+    )
     # These tests intentionally exercise the real client API.  Keep the
     # client headers private to the tests instead of leaking them through the
     # public cpppools target interface.
