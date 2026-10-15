@@ -3,7 +3,7 @@
 > 日期：2026-10-14；代码 HEAD：`a8acc5b09c99f7ec617b0b996747efc7d46e2681`。
 > 范围：S0 五项修复、S1 远程 CLI、S2 已实现的本机管理与基础打包。S3 仅保留进度记录，S4–S7 未进入本次验收。
 > 方法：源码与方案逐项比对、独立代码审查、构建与回归、隔离真实服务及边界复现。第 1–3 节保留修复前发现；第 6 节记录 F1–F8 复验；最新整体复审结论见第 7 节。
-> 当前进度（2026-10-15 更新）：A01、A03–A08 与 R01–R03 已在相应实测范围修复验收；Windows 生命周期、DACL/句柄路径、文件级 reparse 和 Unicode 状态目录、本轮 Compose 真实验收见 §11–12。A02 总期限负对照、macOS 本机生命周期继续开放；S2 未整体关闭。完整阶段状态见 [CLI §6.1](cpl-cli-design.md#61-当前实施进度2026-10-14)。
+> 当前进度（2026-10-15 更新）：A01、A02、A03–A08 与 R01–R03 已在相应实测范围修复验收；Windows 生命周期、DACL/句柄路径、文件级 reparse 和 Unicode 状态目录见 §11–12。macOS 本机生命周期继续开放；S2 未整体关闭。完整阶段状态见 [CLI §6.1](cpl-cli-design.md#61-当前实施进度2026-10-14)。
 
 ## 1. 修复前验收基线
 
@@ -286,7 +286,7 @@ D:/Anaconda/python.exe -W error -m unittest sdk.python.tests.test_cli_packaging.
 
 产物本地保留在 `output/release-s2-20261015/cpppools_distribution_qm0vsl_p/`，不提交二进制构建产物。句柄错误分类修正由后续源码定向/组合回归单独覆盖，不用前面的包安装 smoke 冒充错误注入测试。
 
-独立评审已完成，所提补全光标、产物目录和句柄检查问题均修正复验。S2 的 Windows ACL/句柄级路径防护、file-level reparse、macOS 生命周期仍待完成；Windows start、前台就绪即时提示、真实终端 Ctrl+C 和发行门槛已在后续章节补验。A02 总期限负对照仍开放。未接入 Redis RowCache 或动态发现。
+独立评审已完成，所提补全光标、产物目录和句柄检查问题均修正复验。S2 的 Windows ACL/句柄级路径防护、file-level reparse、Windows 前台终端和发行门槛已在后续章节补验；macOS 生命周期仍待完成。A02 总期限负对照已在 Windows 专项中关闭。未接入 Redis RowCache 或动态发现。
 
 ## 10. S2 前台就绪与真实终端补验（2026-10-15）
 
@@ -313,7 +313,7 @@ PYTHONPATH=sdk/python CPL_RUN_E2E=1 \
   python3 -W error -m unittest discover -s sdk/python/tests
 ```
 
-本节的终端证据覆盖**单次** Ctrl+C。停止等待期间再次 Ctrl+C 仍可能传播 KeyboardInterrupt 并保留进程，这是既有行为，本批没有把它记为已通过的重复中断验收。Windows start 已通过真实生命周期补验；Windows ACL/句柄级路径防护与 file-level reparse、macOS 生命周期、A02 总期限负对照继续开放。S2 整体和 v1 尚未验收，Redis RowCache/动态发现仍待后续阶段。
+本节的终端证据覆盖**单次** Ctrl+C；停止等待期间再次 Ctrl+C 仍可能传播 KeyboardInterrupt 并保留进程，重复中断不属于本批验收范围。Windows start、ACL/句柄级路径防护与 file-level reparse 已在 §11–12 补验；macOS 生命周期仍开放。S2 整体和 v1 尚未验收，Redis RowCache/动态发现仍待后续阶段。
 
 ## 11. S2 Windows 本机生命周期补验（2026-10-15）
 
@@ -329,7 +329,7 @@ PYTHONPATH=sdk/python CPL_RUN_E2E=1 \
 | Windows 组合回归 | Python 3.12.3 `-W error` 全量 184 项：142 通过、42 跳过，退出 0，用时 28.507 秒；POSIX pidfd 测试改为 POSIX 门控。Windows 原生 socket/control 12 项中 11 通过、1 项慢读背压 skip；`test_local_control` 1/1 通过，但 file-level symbolic-link 子用例因当前账户权限 skip。 |
 | ACL 门槛 | 实际运行 `icacls` 发现新 control directory 继承 `CODEXSANDBOXUSERS`、域用户和 Administrators，同时有 SYSTEM；不满足设计要求的仅当前用户+SYSTEM、禁用继承。该 RED 证据保留，ACL 未关闭。 |
 
-Windows 的 `LocalNodeManager.start/status/stop` 已关闭本机生命周期门槛，但不能把它扩展为 Windows ACL/句柄级路径防护完成。file-level reparse 尚未独立实测；directory junction reparse 已通过。macOS 当前环境无法验收，A02 总期限负对照仍开放。
+Windows 的 `LocalNodeManager.start/status/stop`、ACL/句柄级路径防护和 file-level reparse 已在本批真实测试中通过。macOS 当前环境无法验收，保留为 S2 的唯一平台门槛；A02 总期限负对照见本节后续补验记录。
 
 ## 12. Docker Compose 远程验收与回归修复（2026-10-15）
 
@@ -337,17 +337,34 @@ Windows 的 `LocalNodeManager.start/status/stop` 已关闭本机生命周期门�
 
 | 项目 | 实际结果 |
 |---|---|
-| Compose 运行 | WSL Ubuntu Docker Engine 29.1.3、Compose 2.40.3；唯一 project name、随机宿主机端口、真实镜像多阶段构建，服务健康检查通过。镜像内以 UID 10001 的 `cpppools` 非 root 用户运行。 |
-| SDK/CLI 远程操作 | SDK `ClusterClient` 实际完成 insert/select/update；CLI 实际完成 health、insert/select/update/delete。拓扑中的 `cluster.nodes` 发布地址与随机宿主端口一致，避免 SDK 从 seed 跳到错误的固定 8080。 |
-| 生命周期和持久化 | `docker compose stop` 后容器退出码 0 且未 OOM；`down` 后保留命名卷重新 `up`，SDK 读回停止前数据，随后完成 delete/select 空结果。测试结束仅清理本次唯一 project 的卷。 |
+| Compose 运行 | WSL Docker Engine/Compose 的定义、项目隔离、随机端口和配置静态检查通过；真实镜像 build 请求 Docker Hub `ubuntu:24.04` 超时，未将 live health 记为通过。 |
+| SDK/CLI 远程操作 | 真实容器 SDK/CLI CRUD、health、stop 和卷恢复因上述镜像拉取阻断，本轮未重新获得 live 证据；已有实现和测试入口保留，不能用宿主机进程代替。 |
+| 生命周期和持久化 | 同上：本轮不声称 `docker compose stop/down/up` 的 live 结果，待 Docker Hub 网络可用后重跑完整 smoke。 |
 | Windows 路径安全 | 控制目录设置并核验仅当前用户和 SYSTEM 的 protected DACL；逐级持有不共享删除的目录句柄。真实 ancestor junction 的创建与 secret 清理回归通过；Python 的打开后文件属性检查、C++ file-level GUID reparse 分支独立实测通过，不依赖符号链接创建权限。 |
 | 停止竞态修复 | 优雅 stop 在服务刚退出后打开等待句柄的竞态归并已写入的 `stopped` 证据，不误报身份错误。真实服务退出后再打开句柄的可控交错测试由 RED 转 GREEN。 |
 | Unicode 状态目录 | 中文及非 BMP emoji 的 `state_root` 真实启动先失败，报 `filesystem ... Illegal byte sequence`。Windows 控制参数改从 Unicode 命令行读取，内部用 UTF-8 保存、`fs::u8path` 还原；真实 start/status/graceful stop 通过。只覆盖控制路径，未据此承诺配置文件、数据库或二进制所有 Unicode 路径都已验收。 |
-| 本批最终测试 | Compose 定义/隔离和真实 smoke 共 5/5；Windows Python `-W error` 全量 202 项中 159 通过、43 跳过（44.344 秒）；WSL Python live 全量 202 项中 179 通过、23 跳过（50.331 秒）；WSL C++ CTest 20/20（45.01 秒），均退出 0。Windows 全量包含控制文件 5 项和真实本机生命周期 7 项；原生 `test_local_control` 输出 `Windows file-level GUID reparse fixture exercised` 后退出 0。 |
+| 本批最终测试 | Windows 原生完整 CTest 19/19；Windows Python 3.12 全量 203 项（跳过 43）；Python 3.8 全量 203 项（跳过 44）；WSL Python live 全量 203 项中 179 通过、24 跳过；WSL C++ CTest 20/20，均退出 0。Windows 全量包含控制文件、真实本机生命周期和前台终端用例；原生 `test_local_control` 输出 `Windows file-level GUID reparse fixture exercised` 后退出 0。 |
 | 最终发行回归 | 包含本批 Windows 生产修改的干净源码独立构建 wheel、sdist、从 sdist 重建 wheel；Windows Python 3.12.3/3.8.10 × 三种产物，共六项源码树外安装、入口/metadata 版本、补全资源及真实 CRUD 全部通过。矩阵退出 0，用时 132.883 秒；产物保留于 `output/release-s2-20261015/cpppools_distribution_3bwslzq2/`，不提交构建产物。 |
 | 最低 Python 版本回归 | 同一最终源码在真实 Windows Python 3.8.10 下设置 live 环境后，`-W error` 全量 202 项中 159 通过、43 跳过（47.758 秒），退出 0；Windows 控制文件和真实生命周期均执行，未以安装版远程 CRUD 代替本机管理兼容性。 |
 
-Compose smoke 不代表 macOS 本机生命周期已验收，也不关闭 A02 Windows 慢读客户端总期限负对照。Windows 全量原生 CTest 仍受 `test_config.cpp` 的 POSIX API 编译阻断；本轮构建了所需服务和控制专项。自定义 `log_file` 的 hostile reparse 路径不属于控制目录防护范围。Redis RowCache、动态发现仍未实现。
+### A02 Windows 总发送期限补验
+
+在 `build-redis-verify-off2/bin/test_http_server.exe` 中运行确定性 Windows socket 夹具。真实实现的非读端和每 50 ms 读取 1 字节端均观察到背压，并在约 10 秒的同一绝对期限内返回：
+
+```text
+[send deadline] slow_reads=0 backpressure=1 elapsed_ms=10054 bytes_read=1
+[send deadline] slow_reads=1 backpressure=1 elapsed_ms=10040 bytes_read=163840
+```
+
+负对照故意在每次成功 partial send 后重置期限；12 秒后已完成 50 次成功发送、读取 196608 字节但仍未完成：
+
+```text
+[send deadline mutant] completed=0 sender_done=1 successful_sends=50 bytes_read=196608 elapsed_s=12
+```
+
+因此 A02 的关闭条件已满足：成功发送不会延长生产实现的总 deadline，错误的逐次重置实现会在测试预算内失败。测试专用 POSIX `MSG_NOSIGNAL` 仅用于避免负对照清理阶段的 SIGPIPE，不改变生产发送路径。
+
+Compose smoke 不代表 macOS 本机生命周期已验收。本轮 Compose 定义/隔离检查通过，但真实 build 因 Docker Hub `docker.io/library/ubuntu:24.04` 元数据请求超时而阻断，不能记为 live smoke 通过。Windows 原生完整 CTest 已通过；自定义 `log_file` 的 hostile reparse 路径不属于控制目录防护范围。Redis RowCache、动态发现仍未实现。
 
 本批最终生产补丁经独立复审，无剩余 Critical/Important；Compose 地址说明和路线待办中的两处旧表述已同步修正。构建仍有既有编译告警；WSL 的 Windows 挂载目录还出现亚秒级 clock-skew 告警，不能将结果表述为零告警构建。
 

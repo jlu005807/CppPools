@@ -255,6 +255,8 @@ def _wait_foreground_process(process):
     console Ctrl+C.  Polling keeps the Python main thread at a signal-check
     point without changing the child lifecycle or stop protocol.
     """
+    if os.name != "nt":
+        return process.wait()
     while process.poll() is None:
         time.sleep(0.05)
     return process.returncode

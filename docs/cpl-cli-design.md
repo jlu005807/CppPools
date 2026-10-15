@@ -1,6 +1,6 @@
 # `cpl` 命令行设计方案
 
-**状态**：阶段 0–2 已实现；Linux/WSL 本机生命周期、Windows SDK start/status/stop、ACL/句柄级路径安全、file-level reparse 及 F9–F11 修复通过；发行/兼容性和 Linux 前台就绪、真实终端 Ctrl+C 已补验。Compose 的远程 health、SDK/CLI CRUD、优雅停止和数据卷恢复已在 WSL Docker Engine 验收；macOS 本机生命周期仍待对应环境。当前进度见 [§6.1](#61-当前实施进度2026-10-14)。
+**状态**：阶段 0–2 已实现；Linux/WSL 本机生命周期、Windows SDK start/status/stop、ACL/句柄级路径安全、file-level reparse 及 F9–F11 修复通过；发行/兼容性、Linux 前台就绪、Windows 前台真实终端 Ctrl+C 已补验。Compose 定义/隔离检查通过，但本轮真实 build 受 Docker Hub 网络超时阻断；macOS 本机生命周期仍待对应环境。当前进度见 [§6.1](#61-当前实施进度2026-10-14)。
 **目标版本**：`cpl` v1  
 **文档修订**：R5
 
@@ -425,7 +425,7 @@ CRUD 在成功 HTTP 响应中遇到无效 JSON/结果结构时属于 protocol_er
 | 0 / S1 | parser、别名、帮助、模块入口已实现；离线 help/version 及参数契约已测 | 无本轮新增阻断 |
 | 1 / S1 | 严格 JSON、输出及远程 health 已实现；F6 补齐超长整数、深嵌套和运行期错误 JSON | 无本轮新增阻断 |
 | 2 / S1 | 四个 CRUD 复用 SDK；真实 HTTP 往返及既有路由/重试回归通过 | 发布时继续保留 SDK 组合回归 |
-| 3 / S2 | Linux/WSL 与 Windows start/status/stop、身份核验、配置一致性、退出归并已实现；Windows 中文/emoji 状态目录真实启停通过；Linux 前台 running 登记后即时 stderr 提示、真实 PTY Ctrl+C + 慢收尾和输出失败保留进程均已验证 | macOS 身份/生命周期；Windows/macOS 前台真实终端验收 |
+| 3 / S2 | Linux/WSL 与 Windows start/status/stop、身份核验、配置一致性、退出归并已实现；Windows 中文/emoji 状态目录真实启停通过；Linux 前台 running 登记后即时 stderr 提示、真实 PTY Ctrl+C + 慢收尾和输出失败保留进程、Windows 前台真实终端 Ctrl+C 均已验证 | macOS 身份/生命周期 |
 | 4 / S2 | Linux 与 Windows C++ 服务使用 JSON v1 控制协议；Windows DACL、句柄级路径固定、目录创建/清理 junction、file-level reparse 和真实停止竞态回归已通过 | macOS 控制生命周期；Windows 自定义日志路径不属于控制目录防护范围 |
 | 5 / S2 | 安装版 metadata 版本、三类静态补全和 README 加载说明已交付；Windows 3.12.3/3.8.10 六项独立构建/安装/真实 CRUD 矩阵通过；3.8 源码单测实跑通过 | 平台生命周期仍需按第 7.4 节单独验收；macOS 发行与生命周期不能从 Windows/Linux 结果外推 |
 
@@ -433,9 +433,9 @@ F9–F11 的实现、测试和独立代码复审已完成：前台 Ctrl+C 使用
 
 前台命令在 running 登记后即时将状态写 stderr，在附着结束后向 stdout 输出一个最终实例结果；携带结果的失败另写单行结构化诊断。2026-10-15 在 WSL 真实 PTY 中输入 `0x03`，验证内核将 SIGINT 发给 CLI 前台进程组，server 独立 session 不重复接收；在唯一 worker 被半包请求阻塞时，CLI 等待 graceful 后返回 130。就绪输出异常不杀 running 进程的真实测试也通过，详见验收报告 §10；这些证据仅覆盖 Linux/WSL。
 
-F9–F11 的历史测试计数保留在验收报告 §7；本轮发行/兼容性测试见 §9。S2 整体与 v1 发布仍按第 7.4 节门槛验收；A01 已有真实 MySQL SQL mode/CRUD 证据，A02 Windows 总期限的负对照门槛继续保留。
+F9–F11 的历史测试计数保留在验收报告 §7；本轮发行/兼容性测试见 §9。S2 整体与 v1 发布仍按第 7.4 节门槛验收；A01 真实 MySQL SQL mode/CRUD 和 A02 Windows 总期限负对照均已通过。
 
-本表为当前状态；后文 F4–F7 按日期保留历史实现限制，已关闭项以验收报告 §11–12 为准。Compose 部署验收见 [部署说明](docker-compose-deployment.md)，不会自动补齐 macOS 本机生命周期、Windows/macOS 前台真实终端或原生完整 CTest 的未决门槛。Unicode 状态目录通过不代表配置、数据库和二进制的所有 Unicode 路径均已验证。
+本表为当前状态；后文 F4–F7 按日期保留历史实现限制，已关闭项以验收报告 §11–12 为准。Compose 部署验收见 [部署说明](docker-compose-deployment.md)，不会自动补齐 macOS 本机生命周期。Windows 原生完整 CTest 已通过；Unicode 状态目录通过不代表配置、数据库和二进制的所有 Unicode 路径均已验证。
 
 ### 阶段 0：契约冻结与工程骨架
 

@@ -4,7 +4,7 @@
 
 容器部署使用仓库根的 `docker-compose.yml`。先运行 `docker compose config --quiet`，再用 `CPL_RUN_DOCKER=1 PYTHONPATH=sdk/python python3 -W error -m unittest sdk.python.tests.test_docker_compose -v` 执行真实构建、容器 health、非 root 用户、SDK/CLI CRUD、优雅 stop 和命名卷恢复。测试用唯一 project、随机宿主端口与匹配的 `cluster.nodes` 临时配置，结束时只清理自己的卷。无引擎时运行静态测试并明确 live skip，不能用宿主机进程代替容器证据。
 
-2026-10-15，`98dd98e` 上的未提交修改在 WSL Ubuntu 实测 Docker Engine 29.1.3 / Compose 2.40.3：Compose 定义/隔离/真实容器验收共 5/5；WSL C++ `build-accept-s0-s2` 构建与 CTest 20/20。Windows Anaconda Python 3.12.3（`D:/Anaconda/python.exe`）`-W error` 全量 202 项中 159 通过、43 跳过，包含真实生命周期 7 项、Windows 控制文件 5 项；WSL Python live 全量 202 项中 179 通过、23 跳过，均退出 0。中文/emoji 状态目录由真实失败修复后通过。当前 macOS 本机生命周期、A02 总期限负对照仍开放；Windows 全量原生 CTest 受 `test_config.cpp` 的 POSIX API 阻断，服务/control 专项构建不代表全部原生目标通过。详细证据与范围见 [验收报告 §12](../../docs/completed-stages-acceptance-2026-10-14.md#12-docker-compose-远程验收与回归修复2026-10-15)。
+2026-10-15 最终补验：Windows 原生完整 CTest 19/19 通过；WSL C++ `build-accept-s0-s2` CTest 20/20；Windows Python 3.12 全量 203 项（跳过 43）和 Python 3.8 全量 203 项（跳过 44）通过；WSL Python live 全量 203 项（通过 179、跳过 24）通过。Windows 前台真实终端 `cpl start -F` + Ctrl+C 通过，A02 Windows 慢读总期限及确定性负对照通过。Compose 定义/隔离静态检查通过，但真实 build 因 Docker Hub 网络超时阻断，不能记为 live smoke 通过。macOS 本机生命周期仍未验收；详细证据与范围见 [验收报告 §12](../../docs/completed-stages-acceptance-2026-10-14.md#12-docker-compose-远程验收与回归修复2026-10-15)。
 
 所有命令从仓库根运行；Bash 命令用于 Linux/WSL。需要 C++17 编译器、CMake
 3.16+、SQLite 开发库和 Python 3.8+。不要混用 Windows 与 WSL 的 CMake 构建目录。

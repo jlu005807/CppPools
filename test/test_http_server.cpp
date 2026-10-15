@@ -36,6 +36,12 @@ using TestLength = std::size_t;
 constexpr TestSocket kInvalidTestSocket = -1;
 #endif
 
+#ifdef MSG_NOSIGNAL
+constexpr int kTestSendFlags = MSG_NOSIGNAL;
+#else
+constexpr int kTestSendFlags = 0;
+#endif
+
 using namespace cpppools;
 
 // handle_client 层的端到端测试（整体深度评审 I-3 补上的真空地带）。
@@ -118,7 +124,7 @@ static bool send_with_reset_deadline_mutant(TestSocket fd, const std::string& pa
         const auto remaining = payload.size() - sent;
         const auto attempt = std::min<std::size_t>(remaining, 4096);
         const TestSsize written = send(fd, payload.data() + sent,
-                                       static_cast<TestLength>(attempt), 0);
+                                       static_cast<TestLength>(attempt), kTestSendFlags);
         if (written > 0) {
             sent += static_cast<std::size_t>(written);
             successful_sends->fetch_add(1, std::memory_order_relaxed);

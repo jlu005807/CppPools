@@ -14,8 +14,8 @@ CppPools 是数据库前面的 HTTP 中间件：JSON 行级 CRUD → 表路由 �
 - **缓存在服务进程内存**：每个节点、每个数据源一份 RowCache，该源所有池连接共享；不是每连接一份，也不是 SDK 缓存或 Redis。分片哈希表存整行，LRU/TTL 管淘汰，Singleflight 合并回源，世代 CAS 阻止旧回填。
 - **数据库目标由部署配置保证**：集群设计要求所有节点连同一组实际数据源。节点各读各的 datasources 并建立连接池，不从 SDK 或邻居取得账号密码。datasource_digest 仅核对目标标识，SDK 初始化时比对并记录 digest_warnings，不能分发配置或证明数据一致。
 - 多进程 e2e 使用独立 SQLite 库验证路由与故障流程；实现没有复制、迁移或补写机制。不要由这些测试推断独立库故障后数据会收敛。相同路径在不同主机上也不代表同一 SQLite 数据库；TTL 只让缓存过期，不同步数据库。
-- **容器部署边界**：`docker-compose.yml`、根目录 `.dockerignore`、`docker/Dockerfile` 和 `docs/docker-compose-deployment.md` 是当前可审查的 Compose 入口。容器内服务按 Linux 运行；Compose 负责容器生命周期和数据卷，`cpl start/stop/status` 不管理容器。更改发布端口时必须同步 `cluster.nodes` 的可达端口；测试用唯一 project、随机端口和临时配置。Docker Compose 真实 smoke 只有在 `CPL_RUN_DOCKER=1` 且本机 Docker 引擎可用时才运行；静态文件检查不能替代真实容器证据。2026-10-15 WSL Docker Engine 的真实 health/SDK/CLI CRUD/stop/卷恢复已通过。
-- **本机管理边界**：Linux/WSL 与 Windows 的 `LocalNodeManager.start/status/stop` 已实测；Windows 控制目录使用当前用户+SYSTEM 的 protected DACL、祖先句柄固定和打开后 reparse 检查。中文/emoji 状态目录已通过真实启停，但配置、数据库、二进制的全部 Unicode 路径及自定义日志路径安全没有因此获得验收。macOS 本机管理、Windows/macOS 前台真实终端仍需各自平台证据，Compose 的 Linux 容器结果不能代替。
+- **容器部署边界**：`docker-compose.yml`、根目录 `.dockerignore`、`docker/Dockerfile` 和 `docs/docker-compose-deployment.md` 是当前可审查的 Compose 入口。容器内服务按 Linux 运行；Compose 负责容器生命周期和数据卷，`cpl start/stop/status` 不管理容器。更改发布端口时必须同步 `cluster.nodes` 的可达端口；测试用唯一 project、随机端口和临时配置。Docker Compose 真实 smoke 只有在 `CPL_RUN_DOCKER=1` 且本机 Docker 引擎可用时才运行；静态文件检查不能替代真实容器证据。本轮 Compose 定义/隔离检查通过，真实 build 因 Docker Hub 网络超时阻断，不能记为 live 通过。
+- **本机管理边界**：Linux/WSL 与 Windows 的 `LocalNodeManager.start/status/stop` 已实测；Windows 控制目录使用当前用户+SYSTEM 的 protected DACL、祖先句柄固定和打开后 reparse 检查。中文/emoji 状态目录已通过真实启停，但配置、数据库、二进制的全部 Unicode 路径及自定义日志路径安全没有因此获得验收。Windows 前台真实终端 Ctrl+C 已通过；macOS 本机管理仍未验收，Compose 的 Linux 容器结果不能代替。
 
 ## 按任务读取
 
@@ -38,7 +38,7 @@ CppPools 是数据库前面的 HTTP 中间件：JSON 行级 CRUD → 表路由 �
 
 **实现状态边界**：当前行缓存仍是每个服务进程、每个数据源一份的内存 `RowCache`；Redis 缓存和 Redis 拓扑发现均尚未实现。上述 Redis 文档是设计/实施计划，不是当前配置能力、运行保证或已通过测试的证明。回答“现在怎么运行”时以源码、当前配置示例和实际测试为准；回答“将来如何实现”时才引用这些方案，并标明尚未落地。
 
-**实施顺序入口**：按 [统一实施路线](../../docs/implementation-roadmap.md) 区分 S0 修复、S1 远程 CLI、S2 本机 CLI/打包、S3–S4 本地 Redis 缓存和 S5–S7 动态发现。S0 五项修复已有实现；A02 Windows 慢读总期限的负对照仍开放，不能因本机有界退出就关闭。继续任务前先查最新状态及证据，不重做已关闭修复，也不把 S3 的配置/transport 基础计为 RowCache 后端完成。
+**实施顺序入口**：按 [统一实施路线](../../docs/implementation-roadmap.md) 区分 S0 修复、S1 远程 CLI、S2 本机 CLI/打包、S3–S4 本地 Redis 缓存和 S5–S7 动态发现。S0 五项修复已有实现和证据，A01/A02 均已关闭；macOS 本机生命周期仍是 S2 未关闭门槛。继续任务前先查最新状态及证据，不重做已关闭修复，也不把 S3 的配置/transport 基础计为 RowCache 后端完成。
 
 ## 改动时守住的契约
 
