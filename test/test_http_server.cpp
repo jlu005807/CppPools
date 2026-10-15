@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -25,6 +26,7 @@ using TestLength = int;
 constexpr TestSocket kInvalidTestSocket = INVALID_SOCKET;
 #else
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -78,6 +80,58 @@ void set_receive_timeout(TestSocket fd, std::chrono::milliseconds timeout) {
 void set_buffer_size(TestSocket fd, int option, int size) {
     assert(setsockopt(fd, SOL_SOCKET, option,
                      reinterpret_cast<const char*>(&size), sizeof(size)) == 0);
+}
+
+bool test_set_nonblocking(TestSocket fd) {
+#ifdef _WIN32
+    u_long mode = 1;
+    return ioctlsocket(fd, FIONBIO, &mode) == 0;
+#else
+    const int flags = fcntl(fd, F_GETFL, 0);
+    return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+#endif
+}
+
+bool test_would_block() {
+#ifdef _WIN32
+    const int error = WSAGetLastError();
+    return error == WSAEWOULDBLOCK || error == WSAEINPROGRESS;
+#else
+    return errno == EAGAIN || errno == EWOULDBLOCK;
+#endif
+}
+
+// Deliberately incorrect send loop used as a negative control for A02.  It
+// resets the total budget after every successful partial send.  The real
+// implementation must finish/abort under one absolute deadline instead.
+static bool send_with_reset_deadline_mutant(TestSocket fd, const std::string& payload,
+                                            std::atomic<std::size_t>* successful_sends,
+                                            std::chrono::milliseconds budget) {
+    if (!test_set_nonblocking(fd)) {
+        return false;
+    }
+    auto deadline = std::chrono::steady_clock::now() + budget;
+    std::size_t sent = 0;
+    while (sent < payload.size() && std::chrono::steady_clock::now() < deadline) {
+        // Keep each attempt small so this negative control has deterministic
+        // repeated successful sends even on Windows loopback.
+        const auto remaining = payload.size() - sent;
+        const auto attempt = std::min<std::size_t>(remaining, 4096);
+        const TestSsize written = send(fd, payload.data() + sent,
+                                       static_cast<TestLength>(attempt), 0);
+        if (written > 0) {
+            sent += static_cast<std::size_t>(written);
+            successful_sends->fetch_add(1, std::memory_order_relaxed);
+            deadline = std::chrono::steady_clock::now() + budget;  // BUG: resets total budget
+            continue;
+        }
+        if (written < 0 && test_would_block()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
+        }
+        return false;
+    }
+    return sent == payload.size();
 }
 
 int connected_sockets(TestSocket (&fds)[2]) {
@@ -712,6 +766,56 @@ static void test_send_deadline_under_slow_reader() {
     check_send_deadline(true);
 }
 
+static void test_send_deadline_negative_control_resets() {
+    TestSocket fds[2];
+    assert(connected_sockets(fds) == 0);
+    set_buffer_size(fds[1], SO_RCVBUF, 1024);
+    set_buffer_size(fds[0], SO_SNDBUF, 1024);
+    const std::string payload(4 * 1024 * 1024, 'x');
+    std::atomic<bool> receiver_done{false};
+    std::atomic<std::size_t> bytes_read{0};
+    std::thread receiver([&] {
+        char buffer[1024];
+        while (true) {
+            const TestSsize count = recv(fds[1], buffer, sizeof(buffer), 0);
+            if (count <= 0) {
+                break;
+            }
+            bytes_read.fetch_add(static_cast<std::size_t>(count));
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        receiver_done.store(true);
+    });
+    std::atomic<std::size_t> successful_sends{0};
+    std::atomic<bool> sender_done{false};
+    const auto started = std::chrono::steady_clock::now();
+    std::atomic<bool> completed{false};
+    std::thread sender([&] {
+        completed.store(send_with_reset_deadline_mutant(
+            fds[0], payload, &successful_sends, std::chrono::seconds(10)),
+            std::memory_order_relaxed);
+        sender_done.store(true, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(std::chrono::seconds(12));
+    const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - started).count();
+    test_shutdown_socket(fds[0]);
+    test_shutdown_socket(fds[1]);
+    sender.join();
+    receiver.join();
+    test_close_socket(fds[0]);
+    test_close_socket(fds[1]);
+    std::cout << "[send deadline mutant] completed=" << completed.load()
+              << " sender_done=" << sender_done.load()
+              << " successful_sends=" << successful_sends.load()
+              << " bytes_read=" << bytes_read.load()
+              << " elapsed_s=" << elapsed << std::endl;
+    assert(successful_sends.load() >= 2 && "negative control must observe multiple partial sends");
+    assert(bytes_read.load() > 65536 && "negative control must reopen the receive window");
+    assert(!completed.load() && "resetting the deadline must not complete within one total budget");
+    assert(elapsed >= 12 && "negative control must consume the total budget");
+}
+
 static void test_graceful_stop_drains_inflight_request() {
     // 有在途请求时停机：start() 必须等在途跑完（排空）才返回，
     // 而不是立即返回把它丢弃 —— 排空分支的真实连接回归
@@ -794,6 +898,7 @@ int main() {
     test_stalled_connection_forced_shutdown();
     test_send_deadline_with_non_reading_peer();
     test_send_deadline_under_slow_reader();
+    test_send_deadline_negative_control_resets();
 #ifdef _WIN32
     assert(WSACleanup() == 0);
 #endif
