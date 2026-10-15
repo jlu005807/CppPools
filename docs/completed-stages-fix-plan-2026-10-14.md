@@ -629,9 +629,9 @@ PYTHONPATH=sdk/python CPL_RUN_E2E=1 \
 | macOS 本机生命周期 | Linux /proc 实现不能外推 | 修复批次验收后补平台身份查询/锁/启停，再跑 macOS 实机矩阵 |
 | Windows 本机 start | 当前显式拒绝执行 | 先完成受限 ACL、身份/终止/锁，再实现启动和真实启停；Windows HTTP 修复不能替代它 |
 | 前台输出与终端验收 | 当前附着结束后输出结果；Ctrl+C 路径有确定性模拟测试 | 原规划的就绪即时输出尚未实现；按 CLI 契约完成输出时机、真实终端 Ctrl+C 和慢收尾的专项验收 |
-| 发行版本来源 | CLI 固定 0+dev，与 pyproject 0.1.0 未对齐 | 从已安装包 metadata 取版本，源码不可用时回退 0+dev；对齐 --version/包元数据 |
-| Windows console script smoke | Scripts 路径重复拼接 | 修正平台测试定位 cpl.exe，再在源码树外执行原生安装 smoke |
-| wheel/sdist、Python 3.8、补全资源 | 完整构建/安装矩阵未验收，静态补全尚未交付 | 独立构建/安装、最低版本及补全资产逐项留证据；不能用当前 Python 3.12 源码测试替代 |
+| 发行版本来源 | 已完成：安装版读取 metadata，缺 metadata 才回退 0+dev | 两类入口与 metadata 在六项安装矩阵中一致，见验收报告 §9 |
+| Windows console script smoke | 已完成：修正路径且源码树外实跑通过 | 六项安装矩阵实际调用 cpl.exe 与 -m |
+| wheel/sdist、Python 3.8、补全资源 | 已完成本轮 Windows 发行与兼容性补验；三类补全随包交付 | 独立构建/重建和 3.12.3/3.8.10 六项安装/真实 CRUD 通过；Bash/PowerShell 候选、zsh 加载实跑。macOS 平台结果单独保留 |
 
 F8 通过后可以确认 S0/S1 和 Linux 已实现本机生命周期的修复验收；只有上述承诺的平台/发行矩阵也关闭，才允许将 S2 标记为整体完成。后续 Redis/发现继续沿统一路线推进，不在此次修复计划中重复设计。
 

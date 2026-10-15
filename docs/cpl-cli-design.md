@@ -2,8 +2,9 @@
 
 **状态**：阶段 0–2 已实现；Linux/WSL 本机生命周期及 F9–F11 修复已通过定向与组合回归；阶段 3–5 的平台与发行门槛尚未全部关闭。当前进度见 [§6.1](#61-当前实施进度2026-10-14)。  
 **目标版本**：`cpl` v1  
-**文档修订**：R3  
-**修订日期**：2026-10-14  
+**文档修订**：R4
+
+**修订日期**：2026-10-15
 **适用范围**：CppPools Python SDK 的命令行入口，以及本机 CppPools 节点的生命周期管理。
 **实施前置**：先完成[统一实施路线 S0 五项高优修复](implementation-roadmap.md#21-s0-内部执行顺序五个优先问题)；CLI 的真实 HTTP 验收依赖 HTTP 慢速发送边界已经有测试证据。
 
@@ -415,7 +416,7 @@ CRUD 在成功 HTTP 响应中遇到无效 JSON/结果结构时属于 protocol_er
 
 ### 6.1 当前实施进度（2026-10-14）
 
-依据 HEAD `a8acc5b` 加当前未提交修复核对；以下记录实现与已有测试证据，不代表已提交或发布 v1。
+原 F9–F11 修复已包含在 `50bc1ff`；2026-10-15 的发行补验见验收报告 §9。以下记录已实现和已测范围，不表示已发布 v1。
 
 | CLI 阶段 / 全局阶段 | 当前实现与已测范围 | 剩余交付或验收 |
 |---|---|---|
@@ -424,13 +425,13 @@ CRUD 在成功 HTTP 响应中遇到无效 JSON/结果结构时属于 protocol_er
 | 2 / S1 | 四个 CRUD 复用 SDK；真实 HTTP 往返及既有路由/重试回归通过 | 发布时继续保留 SDK 组合回归 |
 | 3 / S2 | Linux/WSL start/status/stop、身份核验、配置一致性、退出归并已实现；F9–F11 补齐前台中断、续停和旧命令结果归属 | macOS 身份/生命周期；真实终端 Ctrl+C 专项证据；原规划的就绪即时输出尚未实现 |
 | 4 / S2 | Linux 与 Windows C++ 服务使用 JSON v1 控制协议；Linux CLI 生命周期、Windows 服务 idle-stop 与目录 reparse 拒绝已有证据 | Windows SDK start、当前用户 + SYSTEM DACL、句柄级路径防护及 file-level reparse 实测；macOS 控制生命周期 |
-| 5 / S2 | 根 pyproject、cpl/-m 入口和 Linux 源码树外安装 smoke 已实现并验证 | 版本来源对齐、Windows 安装 smoke、独立 wheel/sdist 重建、Python 3.8 与静态补全资源 |
+| 5 / S2 | 安装版 metadata 版本、三类静态补全和 README 加载说明已交付；Windows 3.12.3/3.8.10 六项独立构建/安装/真实 CRUD 矩阵通过；3.8 源码单测实跑通过 | 平台生命周期仍需按第 7.4 节单独验收；macOS 发行与生命周期不能从 Windows/Linux 结果外推 |
 
 F9–F11 的实现、测试和独立代码复审已完成：前台 Ctrl+C 使用普通认证停止，graceful 后返回 `interrupted`/130；同代 stopping 可补发请求；被取消的 start 返回 6，被新代替换的旧 stop 返回 10。无需新增状态机。详见 [整体评审](completed-stages-overall-review-2026-10-14.md) 和 [修复计划第 7 节](completed-stages-fix-plan-2026-10-14.md#7-整体复审补充任务与执行结果)。
 
 当前前台命令在附着结束后输出一个实例结果；携带结果的失败同时将结构化诊断写到 stderr。原方案的就绪即时输出仍属未交付项，不能据当前测试标为通过。Ctrl+C 路径由确定性模拟测试覆盖，完整 live 套件验证既有真实进程生命周期；本轮未单独执行真实终端中断测试。
 
-最新 Python 全量 live 为 171 项中 169 项通过、2 项 Windows 专属用例按平台跳过；定向模块为 92 项中 79 项通过、13 项按平台/live 条件跳过。这些是 F9–F11 代码修复时的结果，本次进度文档更新没有重跑代码测试。S2 整体与 v1 发布仍按第 7.4 节门槛验收；A01 真实 MySQL SQL mode 与 A02 Windows 慢读期限的缺口单独保留。
+F9–F11 的历史测试计数保留在验收报告 §7；本轮发行/兼容性测试见 §9。S2 整体与 v1 发布仍按第 7.4 节门槛验收；A01 已有真实 MySQL SQL mode/CRUD 证据，A02 Windows 总期限的负对照门槛继续保留。
 
 ### 阶段 0：契约冻结与工程骨架
 
@@ -747,13 +748,14 @@ fixture 的 finally 清理只终止自己已核验的子进程，确认退出后
 | `sdk/python/tests/test_cli_commands.py` | health/CRUD 适配、真实 HTTP CRUD、输出与退出码测试 |
 | `sdk/python/tests/test_local_node.py` | 状态、身份、锁、确定性交错与真实 Linux 生命周期测试 |
 | `sdk/python/tests/test_server_socket_live.py` | 当前原生服务 socket/control live 入口 |
-| `sdk/python/tests/test_cli_packaging.py` | 已有基础安装与源码树外入口 smoke；独立 wheel/sdist 和 Windows 矩阵仍待完成 |
+| `sdk/python/tests/test_cli_packaging.py` | 基础安装及可选独立 wheel/sdist 重建、双解释器六项源码树外安装/真实 CRUD 矩阵 |
+| `sdk/python/tests/test_cli_completions.py` | parser 资源完整性、实际 Bash/PowerShell 候选项与光标范围 |
 | `test/test_local_control.cpp`、`CMakeLists.txt` | 本机控制协议/边界 CTest 注册及现有 C++ 回归 |
 | `pyproject.toml` | `cpl` console script 和包元数据 |
-| `sdk/python/cpppools/completions/` | 尚未交付：Bash/zsh/PowerShell 补全资源及随包安装 |
+| `sdk/python/cpppools/completions/` | 已交付 Bash/zsh/PowerShell 静态资源，wheel/sdist 均包含 |
 | `docs/api/sdk.md` | 已有 SDK 使用说明；CLI 用户用法说明仍待补齐 |
 
-上表不要求另建 `test_cli_e2e.py`：现有模块已承载 live 测试，沿用其入口即可。新增文件和平台能力只按实际交付更新状态，本次仅维护 docs。
+上表不要求另建 `test_cli_e2e.py`：现有模块已承载 live 测试，沿用其入口即可。新增文件和平台能力只按实际交付更新状态。
 
 ## 11. 本方案的事实依据
 

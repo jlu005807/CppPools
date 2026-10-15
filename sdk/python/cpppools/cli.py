@@ -14,11 +14,11 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from importlib import metadata
 
 from . import errors, transport
 
 
-VERSION = "0+dev"
 MAX_INPUT_BYTES = 65536
 _MAX_JSON_DEPTH = 256
 # Kept as a lazy binding: importing the CLI (including ``--help``) must not
@@ -121,7 +121,11 @@ def _add_crud_common(parser):
 
 def build_parser():
     parser = _parser(prog="cpl", description="CppPools command-line client")
-    parser.add_argument("-V", "--version", action="version", version=VERSION)
+    try:
+        version = metadata.version("cpppools")
+    except metadata.PackageNotFoundError:
+        version = "0+dev"
+    parser.add_argument("-V", "--version", action="version", version=version)
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
 
     start = sub.add_parser("start", aliases=[], allow_abbrev=False,

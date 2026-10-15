@@ -90,6 +90,35 @@ def _config_sha256(path):
 def _pid_alive(pid):
     if not isinstance(pid, int) or pid <= 0:
         return False
+    if os.name == "nt":
+        if pid > 0xFFFFFFFF:
+            return False
+        # On Windows signal 0 is CTRL_C_EVENT, not a harmless existence probe.
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+        if not handle:
+            error = ctypes.get_last_error()
+            if error == 5:  # ERROR_ACCESS_DENIED, like EPERM
+                return True
+            if error == 87:  # ERROR_INVALID_PARAMETER: no process with this PID.
+                return False
+            raise ctypes.WinError(error)
+        try:
+            result = kernel32.WaitForSingleObject(handle, 0)
+            if result == 0xFFFFFFFF:  # WAIT_FAILED
+                raise ctypes.WinError(ctypes.get_last_error())
+            return result == 258  # WAIT_TIMEOUT means the process is still alive.
+        finally:
+            kernel32.CloseHandle(handle)
     if os.name == "posix":
         try:
             with open("/proc/%d/stat" % pid, "r", encoding="ascii") as handle:

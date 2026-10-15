@@ -52,6 +52,46 @@ class TestExitTransition(unittest.TestCase):
 
 
 class TestVerifiedProcessSignal(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "requires Windows process handles")
+    def test_windows_liveness_probe_never_sends_console_events(self):
+        with mock.patch.object(local_node.os, "kill") as kill:
+            self.assertTrue(local_node._pid_alive(os.getpid()))
+            self.assertFalse(local_node._pid_alive(os.getpid() + 2**32))
+        kill.assert_not_called()
+
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            self.assertTrue(local_node._pid_alive(process.pid))
+        finally:
+            process.terminate()
+            process.wait(timeout=5)
+        self.assertFalse(local_node._pid_alive(process.pid))
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows process handles")
+    def test_windows_liveness_probe_distinguishes_missing_and_unknown_process(self):
+        import ctypes
+
+        kernel = mock.Mock()
+        kernel.OpenProcess.return_value = None
+        with mock.patch.object(ctypes, "WinDLL", return_value=kernel):
+            for error, expected in ((5, True), (87, False)):
+                with self.subTest(error=error), \
+                        mock.patch.object(ctypes, "get_last_error", return_value=error):
+                    self.assertEqual(local_node._pid_alive(43210), expected)
+            for error in (8, 1450):
+                with self.subTest(error=error), \
+                        mock.patch.object(ctypes, "get_last_error", return_value=error):
+                    with self.assertRaises(OSError):
+                        local_node._pid_alive(43210)
+            kernel.CloseHandle.assert_not_called()
+
+            kernel.OpenProcess.return_value = 98765
+            kernel.WaitForSingleObject.return_value = 0xFFFFFFFF
+            with mock.patch.object(ctypes, "get_last_error", return_value=6):
+                with self.assertRaises(OSError):
+                    local_node._pid_alive(43210)
+            kernel.CloseHandle.assert_called_once_with(98765)
+
     def test_pidfd_rechecks_identity_after_open_before_signalling(self):
         pidfd = os.open(os.devnull, os.O_RDONLY)
         pidfd_open = mock.Mock(return_value=pidfd)
@@ -1749,7 +1789,7 @@ class TestLocalNodeState(unittest.TestCase):
 
     def test_binary_without_path_is_resolved_from_path(self):
         with tempfile.TemporaryDirectory() as root:
-            binary = os.path.join(root, "cpppools_server")
+            binary = os.path.join(root, "cpppools_server.exe" if os.name == "nt" else "cpppools_server")
             with open(binary, "w", encoding="ascii") as handle:
                 handle.write("#!/bin/sh\n")
             os.chmod(binary, 0o755)

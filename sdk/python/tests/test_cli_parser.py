@@ -4,6 +4,8 @@ import os
 import subprocess
 import sys
 import unittest
+from importlib import metadata
+from unittest import mock
 
 from cpppools import cli
 
@@ -75,7 +77,21 @@ class TestCliParser(unittest.TestCase):
             with self.assertRaises(SystemExit) as version_exit:
                 cli.main(["--version"])
         self.assertEqual(version_exit.exception.code, 0)
-        self.assertIn("0+dev", version_out.getvalue())
+        self.assertTrue(version_out.getvalue().strip())
+
+    def test_version_uses_distribution_metadata_and_source_fallback(self):
+        for installed, expected in (("2.3.4", "2.3.4"),
+                                    (metadata.PackageNotFoundError("cpppools"), "0+dev")):
+            with self.subTest(expected=expected):
+                out = io.StringIO()
+                kwargs = ({"side_effect": installed} if isinstance(installed, Exception)
+                          else {"return_value": installed})
+                with mock.patch.object(metadata, "version", **kwargs), \
+                        contextlib.redirect_stdout(out):
+                    with self.assertRaises(SystemExit) as result:
+                        cli.main(["--version"])
+                self.assertEqual(result.exception.code, 0)
+                self.assertEqual(out.getvalue().strip(), expected)
 
     def test_local_management_missing_state_is_local_error(self):
         err = io.StringIO()

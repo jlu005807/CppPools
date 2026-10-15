@@ -252,3 +252,36 @@ ctest --test-dir build-accept-s0-s2 --output-on-failure
 ```
 
 独立评审完成：测试可移植性和资源回收未发现额外阻断；要求保留 A02 的负对照限制，已改名并补注释。S2 平台/发行及 S3–S7 功能不因本节测试通过而自动验收。
+
+## 9. S2 发行与兼容性补验（2026-10-15）
+
+本批基于 `44a7d03`，交付 CLI 阶段 5 的版本来源、静态补全与独立构建/安装验证；保留平台生命周期发布门槛。
+
+| 项目 | 修改与真实验证 |
+|---|---|
+| 版本与包范围 | 安装版读取 `importlib.metadata.version("cpppools")`，缺 metadata 回退 `0+dev`；RED 复现旧入口始终输出 `0+dev`。包发现限制为 `cpppools*` 的普通包；安装检查先复现误带 `tests/`、`examples/`，修正后两者不再进入 wheel。运行时仍零依赖。 |
+| 干净发行矩阵 | 临时复制无 egg-info/缓存的源码，分别构建 wheel、sdist，再从 sdist 重建 wheel。每次使用唯一产物目录。Windows Python 3.12.3 / 3.8.10 × 原 wheel / 直接 sdist / 重建 wheel 共六项安装，均清除 PYTHONPATH、切到源码树外，核验 site-packages 加载位置、metadata/cpl/-m 版本、离线 help 和补全资源；每项真实 insert/select/update/select/delete 通过。矩阵测试退出 0，用时 144.710 秒。 |
+| 补全资源 | wheel 和重建 wheel 均含 `cpl.bash`、`_cpl`、`cpl.ps1`；直接 sdist 安装也检查三类资源。实际 Bash 候选和 PowerShell 5.1 `CompleteInput` 通过；评审发现 PowerShell 忽略中间光标位置，新增 RED 后修正，两个中间光标回归通过。WSL 提取 Ubuntu zsh 5.9 包到忽略目录，`compinit` 注册和 `autoload +X _cpl` 加载实际成功；未把加载 smoke 表述为完整交互候选测试。README 提供三种 shell 的资源定位与加载命令。 |
+| Python 3.8 源码兼容 | 真实 Python 3.8.10，`-W error` 全量 178 项：129 通过、49 按 Windows/POSIX/live 条件跳过，退出 0；没有设置 live 环境。修正仅测试夹具的 Windows 可执行文件后缀，避免 `shutil.which` 的 PATHEXT 差异。 |
+| Windows 存活检查 | 全量 suite 两次收到非预期 KeyboardInterrupt，单独 socket suite 正常。定位 `_pid_alive` 在 Windows 使用 `os.kill(pid, 0)`，该平台的 0 是 CTRL_C_EVENT。改用 SYNCHRONIZE 进程句柄与零超时等待，不发送事件；真实当前/活子进程/退出子进程验证通过。评审补齐 DWORD PID 上界与未知 OpenProcess 错误的 RED→GREEN，未知错误不得当作进程已退出。独立评审连续 1000 次真实探测句柄数 163→163，等待各分支正确关闭句柄。 |
+| Windows 组合回归 | 最终句柄修正后，Python 3.12.3 全量 live 配置 178 项：141 通过、37 跳过，退出 0，用时 35.073 秒；句柄定向 5/5 通过。Windows start/macOS 仍不可由这些结果宣称可用。 |
+| Linux 组合回归 | WSL Python 3.12.3、真实 server、`CPL_RUN_E2E=1`，`-W error` 全量 178 项：172 通过、6 跳过，退出 0，用时 47.823 秒；包括既有生命周期和 Bash 实际候选项。 |
+
+构建器：Python 3.12.3，`build 1.3.0`、`setuptools 80.9.0`、`wheel 0.45.1`；安装环境冻结 `pip 24.3.1`、`setuptools 68.2.2`、`wheel 0.45.1`，通过本地 wheelhouse 离线获取，避免 Python 3.8 随附旧 pip 的 TLS/proxy 故障。Python 3.8.10 使用官方 NuGet runtime，未修改系统 Python 注册或 PATH；下载包 SHA256 为 `C63A2FC8FC62612B5ABD391FDA99AE1D90BAD42ED8A9E99B1BD81C7FFDB4FEFA`。
+
+实际入口（环境变量路径均指向本机实存资源）：
+
+```powershell
+# PYTHONPATH=sdk/python
+# CPL_BUILD_PYTHON=output/release-build-env/Scripts/python.exe 的绝对路径
+# CPL_TEST_PYTHON38=官方 NuGet 3.8.10 tools/python.exe 的绝对路径
+# CPL_TEST_SERVER=build-redis-verify-off2/bin/cpppools_server.exe 的绝对路径
+# CPL_PACKAGING_WHEELHOUSE=output/release-wheelhouse 的绝对路径
+# CPL_PACKAGE_OUTPUT=output/release-s2-20261015 的绝对路径
+$env:CPL_RUN_PACKAGING='1'
+D:/Anaconda/python.exe -W error -m unittest sdk.python.tests.test_cli_packaging.TestDistributionAcceptance -v
+```
+
+产物本地保留在 `output/release-s2-20261015/cpppools_distribution_qm0vsl_p/`，不提交二进制构建产物。句柄错误分类修正由后续源码定向/组合回归单独覆盖，不用前面的包安装 smoke 冒充错误注入测试。
+
+独立评审已完成，所提补全光标、产物目录和句柄检查问题均修正复验。S2 的 Windows start/ACL/句柄级路径防护、file-level reparse、macOS 生命周期、前台就绪即时提示与真实终端 Ctrl+C 仍待完成；A02 总期限负对照仍开放。未接入 Redis RowCache 或动态发现。

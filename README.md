@@ -38,6 +38,50 @@ SQLite（已实现） / MySQL（已实现）…… 每节点各自的数据源�
 - 设计文档：`docs/superpowers/specs/2026-08-06-db-middleware-design.md`（中间件）、
   `docs/superpowers/specs/2026-08-11-cluster-cache-design.md`（集群与缓存）
 
+### Python CLI 安装与补全
+
+Python 3.8+，推荐在虚拟环境中安装：
+
+```sh
+python -m pip install .
+cpl --version
+python -m cpppools --help
+```
+
+`cpl` 与 `python -m cpppools` 使用相同入口；安装后的版本来自包元数据。
+CLI 提供 `health`、行级 CRUD 和本地节点管理命令，详见
+[CLI 设计与平台边界](docs/cpl-cli-design.md)。本地节点管理已验证 Linux/WSL，
+macOS 尚未验收；Windows 的 `start` 明确不支持，可直接启动服务程序，
+再使用 CLI 的 HTTP 命令。
+
+安装包包含 Bash、zsh、PowerShell 静态补全。使用安装该包的 Python 获取资源目录：
+
+```sh
+python -c "import cpppools.completions as c; from pathlib import Path; print(Path(c.__file__).parent)"
+```
+
+Bash（可把 `source` 行加入 `~/.bashrc`）：
+
+```sh
+cpl_completion_dir="$(python -c 'import cpppools.completions as c; from pathlib import Path; print(Path(c.__file__).parent)')"
+source "$cpl_completion_dir/cpl.bash"
+```
+
+zsh（在初始化补全前加入资源目录，也可加入 `~/.zshrc`）：
+
+```sh
+cpl_completion_dir="$(python -c 'import cpppools.completions as c; from pathlib import Path; print(Path(c.__file__).parent)')"
+fpath=("$cpl_completion_dir" $fpath)
+autoload -Uz compinit && compinit
+```
+
+PowerShell 5.1+（可加入 `$PROFILE`）：
+
+```powershell
+$cplCompletionDir = python -c "import cpppools.completions as c; from pathlib import Path; print(Path(c.__file__).parent)"
+. (Join-Path $cplCompletionDir 'cpl.ps1')
+```
+
 ---
 
 ## 1. 项目结构

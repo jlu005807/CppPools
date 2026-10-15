@@ -17,3 +17,8 @@ package-dir = {"" = "sdk/python"}
 
 [tool.setuptools.packages.find]
 where = ["sdk/python"]
+include = ["cpppools*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+"cpppools.completions" = ["cpl.bash", "_cpl", "cpl.ps1"]

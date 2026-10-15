@@ -1,0 +1,21 @@
+#compdef cpl
+local -a options
+if (( CURRENT == 2 )); then
+    options=(start stop status st health h select get insert add update set delete del -h --help -V --version)
+else
+    case "$words[2]" in
+        start) options=(-h --help -c --config -n --name -b --binary -W --workdir -R --state-dir -l --log-file -t --timeout -F --foreground -o --output) ;;
+        stop) options=(-h --help -n --name -R --state-dir -t --timeout -f --force -o --output) ;;
+        status|st) options=(-h --help -n --name -R --state-dir -u --url -t --timeout -o --output) ;;
+        health|h) options=(-h --help -u --url -t --timeout -o --output) ;;
+        select|get) options=(-h --help -w --where -C --column -u --url -d --datasource -t --timeout -o --output) ;;
+        insert|add) options=(-h --help -D --data -u --url -d --datasource -t --timeout -o --output) ;;
+        update|set) options=(-h --help -w --where -D --data -u --url -d --datasource -t --timeout -o --output) ;;
+        delete|del) options=(-h --help -w --where -u --url -d --datasource -t --timeout -o --output) ;;
+    esac
+    case "$words[CURRENT-1]" in
+        -o|--output) options=(table json) ;;
+        -c|--config|-b|--binary|-W|--workdir|-R|--state-dir|-l|--log-file) _files; return ;;
+    esac
+fi
+compadd -- "${options[@]}"
