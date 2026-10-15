@@ -248,6 +248,18 @@ def _reap_child(pid):
     return None
 
 
+def _wait_foreground_process(process):
+    """Wait for a foreground child while allowing console signals to run.
+
+    On Windows ``Popen.wait()`` can remain in an uninterruptible wait after a
+    console Ctrl+C.  Polling keeps the Python main thread at a signal-check
+    point without changing the child lifecycle or stop protocol.
+    """
+    while process.poll() is None:
+        time.sleep(0.05)
+    return process.returncode
+
+
 def _pidfd_functions():
     if os.name != "posix":
         return None, None
@@ -1334,7 +1346,7 @@ class LocalNodeManager:
                 try:
                     if on_ready is not None:
                         on_ready(result)
-                    process.wait()
+                    _wait_foreground_process(process)
                 except KeyboardInterrupt:
                     stopped = self.stop(timeout=10.0)
                     raise ExitOutcome(
