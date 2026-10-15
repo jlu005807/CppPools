@@ -12,6 +12,8 @@
 
 ## 1. 基线、范围与执行顺序
 
+2026-10-15 补验更新：A01 已用本机 Oracle MySQL 8.0.11 实际通过并关闭；A02 已验证 Windows 有界退出，但重置期限负对照仍通过，因此总期限门槛保持开放。Windows HTTP 测试已可原生编译，全量构建的下一个阻断为 `test_config.cpp`。命令、结果和评审边界见 [验收报告第 8 节](completed-stages-acceptance-2026-10-14.md#8-本机真实环境补验2026-10-15)。下文任务记录保留历史状态，以本更新为准。
+
 日期：2026-10-14；审查基线：`a8acc5b09c99f7ec617b0b996747efc7d46e2681`。问题事实和复现证据见 [验收报告](completed-stages-acceptance-2026-10-14.md)，阶段进度见 [统一实施路线](implementation-roadmap.md)，协议和退出码以 [CLI 方案 §3–§5](cpl-cli-design.md) 为准。
 
 本文件已进入执行记录：F1–F7 的实现、定向回归和阶段评审已完成；F8 的 Linux/WSL 组合验收已完成，完整环境验收仍部分完成。整体复审新增 F9–F11 的实现、测试和独立代码复审已完成；Windows 慢读期限及真实 MySQL SQL mode 仍缺环境证据。A01、A02 保持开放，不把 skip 记为通过。CLI 分阶段进度见 [CLI §6.1](cpl-cli-design.md#61-当前实施进度2026-10-14)。

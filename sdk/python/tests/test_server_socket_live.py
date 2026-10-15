@@ -212,10 +212,8 @@ class TestServerSocketLive(unittest.TestCase):
     def test_slow_nonreading_client_obeys_send_deadline_and_worker_recovers(self):
         if os.name == "nt":
             self.skipTest(
-                "Windows loopback accepted a 65.6 MB response, and a WSL peer "
-                "accepted a 131.1 MB response into the send queue with a 2.3 KB "
-                "peer receive buffer; this host cannot prove remote-drain "
-                "backpressure reliably")
+                "this external-socket fixture cannot constrain Winsock's send queue; "
+                "test_http_server verifies Windows deadlines with server SO_SNDBUF=0")
 
         with self._running_server(large_schema=True) as (_, port, _):
             stats_status, stats_body = self._request(

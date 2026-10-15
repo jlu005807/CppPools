@@ -1,7 +1,7 @@
 # 未完成方案实现顺序与对齐清单
 
-> 日期：2026-10-14；修订：R9；初始排期基线：`6c554dd`；本轮验收 HEAD：`a8acc5b` 加当前未提交修复。
-> 状态：S0/S1 已实现，S2/S3 部分实现，S4–S7 待执行。F1–F8 原范围证据保留；新增 F9–F11 已修复并通过 Linux/WSL Python live 复验。A01 缺少真实 MySQL SQL mode 证据，A02 缺少 Windows 慢读期限证据；S2 平台与发行矩阵仍未完成。详见 [整体评审与设计补充](completed-stages-overall-review-2026-10-14.md)。
+> 日期：2026-10-15；修订：R10；初始排期基线：`6c554dd`；本轮补验基线：`50bc1ff`。
+> 状态：S0/S1 已实现，S2/S3 部分实现，S4–S7 待执行。A01 已通过真实 MySQL SESSION mode/CRUD；A02 已有 Windows 有界退出证据，但负对照未能区分逐次与总期限，仍开放。最新证据见 [验收报告第 8 节](completed-stages-acceptance-2026-10-14.md#8-本机真实环境补验2026-10-15)；下文历史记录保留当时结论。S2 平台与发行矩阵仍未完成。
 > 用途：统一现有方案的先后、依赖和交叉契约；具体配置、命令、测试仍以对应专题文档为准。
 
 ## 1. 当前有哪些真正未完成的方案
@@ -20,7 +20,7 @@
 |---|---|
 | [后端CRUD API](superpowers/specs/2026-08-06-cpp-crud-api-design.md)、[DB中间件](superpowers/specs/2026-08-06-db-middleware-design.md)、[三池加固](superpowers/specs/2026-08-06-pool-hardening-design.md)及其分期计划 | 当前已有通用CRUD、DataSourceRegistry、SQLite后端、NVI和三池实现/对应测试文件；作为已有底座，按当前API核验，不重新实现旧score API |
 | [静态集群与内存缓存](superpowers/specs/2026-08-11-cluster-cache-design.md)及ownership/SDK/failover分期计划 | `eef0a5f`、`2c432b2`已交付核心模块；现有hash、owner/307、缓存和Python SDK作为回归基线 |
-| [MySQL后端](superpowers/specs/2026-08-15-mysql-backend-design.md) | `c64f57c`已有实现；F1 兼容修复及 MariaDB/Windows MySQL 构建通过；A01 默认/NBE SESSION 自省和 CRUD 因缺测试账号未验收 |
+| [MySQL后端](superpowers/specs/2026-08-15-mysql-backend-design.md) | `c64f57c`已有实现；F1 双客户端构建通过；2026-10-15 本机 Oracle MySQL 8.0.11 的默认/空/NBE SESSION 自省和 CRUD 通过，A01 已关闭 |
 | [代码加固及六个子计划](superpowers/plans/2026-08-17-code-hardening-index.md) | `6d747f2`、`9d0d8a8`、`899e96e`、`e37bdca`、`6c554dd`对应阶段性实现；保留残余缺陷和未验证平台的核验，不从第一个任务全部重跑开发 |
 
 历史“实现已落地”与“所有平台验收完成”是两件事。当前盘点只确认源码和提交存在；MySQL、Windows/macOS、sanitizer、真实Redis及e2e的通过情况，在实施时按实际环境留证据。
@@ -31,7 +31,7 @@
 
 | 全局阶段 | 对应原方案 | 具体交付 | 进入下一步的门槛 | 当前状态 |
 |---|---|---|---|---|
-| S0 基线与五项高优修复 | 历史加固残余项、缓存P0、HTTP生命周期Task 4 | 先完成基线证据和五个只读评审问题：MySQL ON 编译阻断、Singleflight 竞态、bypass 异常复位、Prometheus 重复声明、HTTP 慢速发送总期限 | 目标平台上的基线/定向测试真实运行；五项均有 RED→GREEN 证据；默认内存/静态集群契约不变 | 五项修复及 Linux 回归通过；F1 兼容实现已构建，A01 的 SQL mode 端到端验收仍待测试账号；Windows 慢读期限仍待可证明背压的环境 |
+| S0 基线与五项高优修复 | 历史加固残余项、缓存P0、HTTP生命周期Task 4 | 先完成基线证据和五个只读评审问题：MySQL ON 编译阻断、Singleflight 竞态、bypass 异常复位、Prometheus 重复声明、HTTP 慢速发送总期限 | 目标平台上的基线/定向测试真实运行；五项均有 RED→GREEN 证据；默认内存/静态集群契约不变 | 五项修复及 Linux 回归通过；A01 本机真实自省/CRUD 已通过；A02 Windows 有界退出通过，总期限负对照门槛仍开放 |
 | S1 远程CLI | CLI阶段0–2 | parser、严格JSON/输出/错误映射、health、四个CRUD，源码`python -m cpppools`入口 | 无网络help/version；远程命令复用SDK；成功写不因CLI重新执行；真实HTTP CRUD | A06/A07 已修复并通过 WSL 全量回归；真实 HTTP CRUD 通过 |
 | S2 本机CLI与基础打包 | CLI阶段3–5 | POSIX/Windows控制、ready/stopped、start/stop/status、pyproject、cpl入口与包安装 | 目标平台真实进程控制；停止超时不假报成功；源码树外wheel/sdist可安装 | A03–A08 与 R01–R03 在 Linux/WSL 修复复验通过；A02 Windows 慢读期限、真实终端中断/前台就绪输出、Windows/macOS 本机管理与发行矩阵仍开放 |
 | S3 共享缓存与Redis基础 | 缓存P1–P2、P3的transport子任务 | 稳定RowCache协调入口、flight_id/token/异常复位；配置/codec；唯一可选hiredis构建和私有有界transport | 原内存语义不变；flight身份竞态关闭；OFF无依赖、ON能链接；transport确实受总期限/响应大小限制 | 配置校验、OFF构建开关和有界PING transport已完成；hiredis/真实Redis及RowCache接入待执行 |
@@ -109,11 +109,11 @@ A03–A08 原范围已有针对性 GREEN 与组合回归证据。整体复审新
 
 ### 2.6 修复完成后的剩余工作顺序
 
-当前代码修复批次 F1–F7/F9–F11 已完成实现与评审，F8 已完成 Linux/WSL 组合回归；A01/A02 的环境验收仍开放。后续按下列顺序补齐既有门槛，不重新实现已经关闭的修复项。
+当前代码修复批次 F1–F7/F9–F11 已完成实现与评审，F8 已完成 Linux/WSL 组合回归。2026-10-15 A01 真实环境验收关闭；A02 的 Windows 有界退出已有证据，总期限负对照门槛仍开放。后续补齐既有门槛，不重新实现已经关闭的修复项。
 
 | 顺序 | 工作 | 完成标准 |
 |---|---|---|
-| 1 | 补 A01/A02 真实环境证据 | 默认/NBE SESSION 的真实 MySQL 自省/CRUD；Windows 可证明背压的慢读总期限。没有环境时保留未验证，不重开已通过的构建/收包路径 |
+| 1 | 补 A02 总期限证据 | A01 已关闭；Windows 还须有能使“每次成功发送后重置期限”错误实现失败的慢读用例。已有有界退出、接收与空闲停止证据保留 |
 | 2 | 完成本机管理的平台与前台交付 | Windows 身份/ACL/句柄安全与 start，macOS 身份及启停；前台就绪输出、真实终端 Ctrl+C 按 CLI 契约验收 |
 | 3 | 完成 S2 发行门槛 | 对齐安装版版本来源；修复 Windows console script smoke；交付补全；独立 wheel/sdist 重建和 Python 3.8 实跑 |
 | 4 | 继续 S3 → S4 → S5 → S6 → S7 | 依第 2 节既有阶段门槛推进 Redis 缓存与发现，不把本轮 CLI 修复计入 Redis 功能完成 |

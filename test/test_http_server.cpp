@@ -14,11 +14,25 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include <iostream>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+using TestSocket = SOCKET;
+using TestSsize = int;
+using TestLength = int;
+constexpr TestSocket kInvalidTestSocket = INVALID_SOCKET;
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+using TestSocket = int;
+using TestSsize = ssize_t;
+using TestLength = std::size_t;
+constexpr TestSocket kInvalidTestSocket = -1;
+#endif
 
 using namespace cpppools;
 
@@ -29,11 +43,67 @@ using namespace cpppools;
 // 且生产配置下对象池 503 路径不可达 —— 既不可达又无测试的分支
 // 是回归腐坏的最佳温床。
 //
-// 方法：socketpair 造一对 fd，一端交给 handle_client（它会 recv+send
-// 后关闭），另一端预写请求、事后读响应。无需真实监听端口。
-// macOS/Linux 均可用（AF_UNIX + SOCK_STREAM）。
+// 一端交给 handle_client（它会 recv+send 后关闭），另一端发送请求并读响应。
+// POSIX 使用 socketpair；Windows 使用真实 loopback TCP，保留完整 SOCKET 宽度。
 
 namespace {
+
+void test_close_socket(TestSocket fd) {
+#ifdef _WIN32
+    closesocket(fd);
+#else
+    close(fd);
+#endif
+}
+
+void test_shutdown_socket(TestSocket fd) {
+#ifdef _WIN32
+    shutdown(fd, SD_BOTH);
+#else
+    shutdown(fd, SHUT_RDWR);
+#endif
+}
+
+void set_receive_timeout(TestSocket fd, std::chrono::milliseconds timeout) {
+#ifdef _WIN32
+    const DWORD value = static_cast<DWORD>(timeout.count());
+#else
+    const timeval value{static_cast<long>(timeout.count() / 1000),
+                        static_cast<long>((timeout.count() % 1000) * 1000)};
+#endif
+    assert(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                     reinterpret_cast<const char*>(&value), sizeof(value)) == 0);
+}
+
+void set_buffer_size(TestSocket fd, int option, int size) {
+    assert(setsockopt(fd, SOL_SOCKET, option,
+                     reinterpret_cast<const char*>(&size), sizeof(size)) == 0);
+}
+
+int connected_sockets(TestSocket (&fds)[2]) {
+#ifdef _WIN32
+    const TestSocket listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    assert(listener != kInvalidTestSocket);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    assert(bind(listener, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0);
+    assert(listen(listener, 1) == 0);
+    int length = sizeof(address);
+    assert(getsockname(listener, reinterpret_cast<sockaddr*>(&address), &length) == 0);
+    fds[1] = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    assert(fds[1] != kInvalidTestSocket);
+    // Set before connect so the advertised TCP window is small from the start.
+    set_buffer_size(fds[1], SO_RCVBUF, 1024);
+    assert(connect(fds[1], reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0);
+    fds[0] = accept(listener, nullptr, nullptr);
+    assert(fds[0] != kInvalidTestSocket);
+    test_close_socket(listener);
+    return 0;
+#else
+    return socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+#endif
+}
 
 struct Fixture {
     pool::ThreadPool thread_pool{[] {
@@ -49,14 +119,23 @@ struct Fixture {
     server::HttpServer server;
 
     // 可配对象池容量：耗尽测试用 (1,1)，正常路径用宽松容量。
-    explicit Fixture(std::size_t pool_init, std::size_t pool_max)
+    explicit Fixture(std::size_t pool_init, std::size_t pool_max, bool large_response = false)
         : request_pool("request", pool_init, pool_max),
-          server(0, thread_pool, request_pool, init_registry()) {}
+          server(0, thread_pool, request_pool, init_registry(large_response)) {}
 
-    db::DataSourceRegistry& init_registry() {
+    db::DataSourceRegistry& init_registry(bool large_response) {
         db::register_sqlite_backend();
         db_path = testing::make_temp_db_path("http");
         testing::seed_user_scores_table(db_path);
+        if (large_response) {
+            sqlite3* raw = nullptr;
+            assert(sqlite3_open(db_path.c_str(), &raw) == SQLITE_OK);
+            assert(sqlite3_exec(raw,
+                "CREATE TABLE response_rows(id INTEGER PRIMARY KEY, payload TEXT);"
+                "INSERT INTO response_rows VALUES(1, replace(hex(zeroblob(1048576)), '00', 'x'));",
+                nullptr, nullptr, nullptr) == SQLITE_OK);
+            assert(sqlite3_close(raw) == SQLITE_OK);
+        }
         config::DataSourceConfig cfg;
         cfg.name = "main";
         cfg.type = "sqlite";
@@ -80,22 +159,22 @@ struct Fixture {
     // 走一次完整的 handle_client：peer 端预写请求，返回收到的响应文本。
     // request_id 透传给 handle_client（X-Request-Id 回显测试可注入不同值）。
     std::string round_trip(const std::string& request, std::uint64_t request_id = 1) {
-        int fds[2];
-        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+        TestSocket fds[2];
+        assert(connected_sockets(fds) == 0);
         const std::size_t to_write = request.size();
-        assert(send(fds[1], request.data(), to_write, 0) ==
-               static_cast<ssize_t>(to_write));
+        assert(send(fds[1], request.data(), static_cast<TestLength>(to_write), 0) ==
+               static_cast<TestSsize>(to_write));
 
         server.handle_client(static_cast<std::intptr_t>(fds[0]), request_id);
         // fds[0] 已被 handle_client 内的 SocketGuard 关闭。
 
         std::string response;
         char buf[4096];
-        ssize_t n;
+        TestSsize n;
         while ((n = recv(fds[1], buf, sizeof(buf), 0)) > 0) {
             response.append(buf, static_cast<std::size_t>(n));
         }
-        ::close(fds[1]);
+        test_close_socket(fds[1]);
         return response;
     }
 
@@ -136,7 +215,8 @@ static void test_object_pool_exhausted_returns_503() {
     auto held = f.request_pool.acquire();
     assert(held);
 
-    const std::string resp = f.round_trip("GET /health HTTP/1.1\r\n");
+    // Exhaustion is checked before reading: no request bytes are needed here.
+    const std::string resp = f.round_trip("");
     assert(resp.find("503") != std::string::npos);
     assert(resp.find("request pool exhausted") != std::string::npos);
 
@@ -215,11 +295,11 @@ static void test_get_without_body_unchanged() {
 static void test_response_waits_for_body() {
     // 行为守护：body 未发完时，响应不得先到达（handle_client 必须在路由前读体）。
     Fixture f(2, 4);
-    int fds[2];
-    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    TestSocket fds[2];
+    assert(connected_sockets(fds) == 0);
     const std::string header = "POST /health HTTP/1.1\r\nContent-Length: 5\r\n\r\n";
-    assert(send(fds[1], header.data(), header.size(), 0) ==
-           static_cast<ssize_t>(header.size()));
+    assert(send(fds[1], header.data(), static_cast<TestLength>(header.size()), 0) ==
+           static_cast<TestSsize>(header.size()));
 
     std::thread server_thread([&f, fd = fds[0]] {
         f.server.handle_client(static_cast<std::intptr_t>(fd), 1);
@@ -227,24 +307,24 @@ static void test_response_waits_for_body() {
 
     // 等 100ms：body 还没发，响应不应到达（recv 超时返回 <= 0）。
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    struct timeval short_tv{0, 100 * 1000};
-    setsockopt(fds[1], SOL_SOCKET, SO_RCVTIMEO, &short_tv, sizeof(short_tv));
+    const auto short_tv = std::chrono::milliseconds(0 * 1000 + (100 * 1000) / 1000);
+    set_receive_timeout(fds[1], short_tv);
     char peek[64];
-    const ssize_t early = recv(fds[1], peek, sizeof(peek), 0);
+    const TestSsize early = recv(fds[1], peek, sizeof(peek), 0);
     assert(early <= 0 && "body 未发送完毕时响应不得先到达");
 
     // 发 body → 响应应到达。
-    struct timeval long_tv{2, 0};
-    setsockopt(fds[1], SOL_SOCKET, SO_RCVTIMEO, &long_tv, sizeof(long_tv));
+    const auto long_tv = std::chrono::milliseconds(2 * 1000 + (0) / 1000);
+    set_receive_timeout(fds[1], long_tv);
     assert(send(fds[1], "abcde", 5, 0) == 5);
     std::string resp;
     char buf[256];
-    ssize_t nn;
+    TestSsize nn;
     while ((nn = recv(fds[1], buf, sizeof(buf), 0)) > 0) {
         resp.append(buf, static_cast<std::size_t>(nn));
     }
     server_thread.join();
-    ::close(fds[1]);
+    test_close_socket(fds[1]);
     assert(resp.find("405") != std::string::npos);
 }
 
@@ -253,15 +333,15 @@ static void test_large_body_across_multiple_segments() {
     // 读体循环必须真正循环多轮并拼装出完整 body。
     // 用 /health 的 405 证明请求走完了完整链路（头区未被 body 污染）。
     Fixture f(2, 4);
-    int fds[2];
-    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    TestSocket fds[2];
+    assert(connected_sockets(fds) == 0);
     const std::size_t kSeg = 2048;
     const std::size_t kTotal = kSeg * 3;
     const std::string header = "POST /health HTTP/1.1\r\n"
                                "Content-Length: " + std::to_string(kTotal) + "\r\n"
                                "\r\n";
-    assert(send(fds[1], header.data(), header.size(), 0) ==
-           static_cast<ssize_t>(header.size()));
+    assert(send(fds[1], header.data(), static_cast<TestLength>(header.size()), 0) ==
+           static_cast<TestSsize>(header.size()));
 
     std::thread server_thread([&f, fd = fds[0]] {
         f.server.handle_client(static_cast<std::intptr_t>(fd), 1);
@@ -270,20 +350,20 @@ static void test_large_body_across_multiple_segments() {
     const std::string segment(kSeg, 'x');
     for (int i = 0; i < 3; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        assert(send(fds[1], segment.data(), segment.size(), 0) ==
-               static_cast<ssize_t>(kSeg));
+        assert(send(fds[1], segment.data(), static_cast<TestLength>(segment.size()), 0) ==
+               static_cast<TestSsize>(kSeg));
     }
 
-    struct timeval tv{2, 0};
-    setsockopt(fds[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    const auto tv = std::chrono::milliseconds(2 * 1000 + (0) / 1000);
+    set_receive_timeout(fds[1], tv);
     std::string resp;
     char buf[256];
-    ssize_t nn;
+    TestSsize nn;
     while ((nn = recv(fds[1], buf, sizeof(buf), 0)) > 0) {
         resp.append(buf, static_cast<std::size_t>(nn));
     }
     server_thread.join();
-    ::close(fds[1]);
+    test_close_socket(fds[1]);
     assert(resp.find("405") != std::string::npos && "多段 body 必须被完整读完后走路由");
 }
 
@@ -347,9 +427,9 @@ static void test_graceful_stop_returns_from_start() {
 
 // ===== Phase 4 Task 3: Fragmented header tests =====
 
-static void send_fragment(int fd, const char* data) {
+static void send_fragment(TestSocket fd, const char* data) {
     const std::size_t len = std::strlen(data);
-    assert(send(fd, data, len, 0) == static_cast<ssize_t>(len));
+    assert(send(fd, data, static_cast<TestLength>(len), 0) == static_cast<TestSsize>(len));
     std::this_thread::sleep_for(std::chrono::milliseconds(30));
 }
 
@@ -357,8 +437,8 @@ static void test_fragmented_header_reassembled() {
     // Task 3: send request line and headers in multiple TCP segments.
     // The server must reassemble them into a complete request before routing.
     Fixture f(2, 4);
-    int fds[2];
-    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    TestSocket fds[2];
+    assert(connected_sockets(fds) == 0);
 
     std::thread server_thread([&f, fd = fds[0]] {
         f.server.handle_client(static_cast<std::intptr_t>(fd), 1);
@@ -370,25 +450,25 @@ static void test_fragmented_header_reassembled() {
     send_fragment(fds[1], "gth: 5\r\n");
     // No terminator yet - server should not respond.
     {
-        struct timeval tv{0, 200 * 1000};
-        setsockopt(fds[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        const auto tv = std::chrono::milliseconds(0 * 1000 + (200 * 1000) / 1000);
+        set_receive_timeout(fds[1], tv);
         char peek[64];
-        ssize_t early = recv(fds[1], peek, sizeof(peek), 0);
+        TestSsize early = recv(fds[1], peek, sizeof(peek), 0);
         assert(early <= 0 && "no response before terminator");
     }
     // Send terminator + body.
     send_fragment(fds[1], "\r\nabcde");
 
-    struct timeval tv{3, 0};
-    setsockopt(fds[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    const auto tv = std::chrono::milliseconds(3 * 1000 + (0) / 1000);
+    set_receive_timeout(fds[1], tv);
     std::string resp;
     char buf[256];
-    ssize_t n;
+    TestSsize n;
     while ((n = recv(fds[1], buf, sizeof(buf), 0)) > 0) {
         resp.append(buf, static_cast<std::size_t>(n));
     }
     server_thread.join();
-    ::close(fds[1]);
+    test_close_socket(fds[1]);
     assert(resp.find("405") != std::string::npos && "fragmented header must be reassembled and routed");
 }
 
@@ -397,8 +477,8 @@ static void test_incomplete_header_timeout_does_not_hang() {
     // Server must not hang 30s; it should return a response within a few seconds
     // (after the 1s subsequent-read timeout kicks in).
     Fixture f(2, 4);
-    int fds[2];
-    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    TestSocket fds[2];
+    assert(connected_sockets(fds) == 0);
 
     auto start_time = std::chrono::steady_clock::now();
     std::thread server_thread([&f, fd = fds[0]] {
@@ -408,19 +488,19 @@ static void test_incomplete_header_timeout_does_not_hang() {
     // Send a valid request line but no terminator.
     {
         const std::string req_line = "GET /health HTTP/1.1\r\n";
-        assert(send(fds[1], req_line.data(), req_line.size(), 0) ==
-               static_cast<ssize_t>(req_line.size()));
+        assert(send(fds[1], req_line.data(), static_cast<TestLength>(req_line.size()), 0) ==
+               static_cast<TestSsize>(req_line.size()));
     }
     // Do NOT send \r\n - let the server's 1s subsequent-read timeout fire.
 
-    struct timeval tv{5, 0};
-    setsockopt(fds[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    const auto tv = std::chrono::milliseconds(5 * 1000 + (0) / 1000);
+    set_receive_timeout(fds[1], tv);
     char buf[256];
-    ssize_t n = recv(fds[1], buf, sizeof(buf), 0);
+    TestSsize n = recv(fds[1], buf, sizeof(buf), 0);
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::now() - start_time).count();
     server_thread.join();
-    ::close(fds[1]);
+    test_close_socket(fds[1]);
 
     // Server should respond (likely 400 or 414 for incomplete request).
     assert(n > 0 && "server must respond to incomplete header, not hang silently");
@@ -450,23 +530,23 @@ static void test_queued_request_drained_on_shutdown() {
     assert(port != 0);
 
     // First connection: send header without body -> worker blocks reading body.
-    const int fd1 = socket(AF_INET, SOCK_STREAM, 0);
-    assert(fd1 >= 0);
+    const TestSocket fd1 = socket(AF_INET, SOCK_STREAM, 0);
+    assert(fd1 != kInvalidTestSocket);
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     assert(connect(fd1, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
     const std::string hdr1 = "POST /health HTTP/1.1\r\nContent-Length: 5\r\n\r\n";
-    assert(send(fd1, hdr1.data(), hdr1.size(), 0) == static_cast<ssize_t>(hdr1.size()));
+    assert(send(fd1, hdr1.data(), static_cast<TestLength>(hdr1.size()), 0) == static_cast<TestSsize>(hdr1.size()));
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
 
     // Second connection: queued behind the first.
-    const int fd2 = socket(AF_INET, SOCK_STREAM, 0);
-    assert(fd2 >= 0);
+    const TestSocket fd2 = socket(AF_INET, SOCK_STREAM, 0);
+    assert(fd2 != kInvalidTestSocket);
     assert(connect(fd2, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
     const std::string hdr2 = "GET /health HTTP/1.1\r\n";
-    assert(send(fd2, hdr2.data(), hdr2.size(), 0) == static_cast<ssize_t>(hdr2.size()));
+    assert(send(fd2, hdr2.data(), static_cast<TestLength>(hdr2.size()), 0) == static_cast<TestSsize>(hdr2.size()));
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     // Stop: start() should not return while the worker is still busy.
@@ -485,23 +565,23 @@ static void test_queued_request_drained_on_shutdown() {
     assert(stopped.load() && "start() must return after draining in-flight + queued work");
 
     // Read responses from both connections.
-    struct timeval tv{2, 0};
-    setsockopt(fd1, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd2, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    const auto tv = std::chrono::milliseconds(2 * 1000 + (0) / 1000);
+    set_receive_timeout(fd1, tv);
+    set_receive_timeout(fd2, tv);
     char buf[256];
     // fd1 got 405 (POST /health).
-    ssize_t n1 = recv(fd1, buf, sizeof(buf), 0);
+    TestSsize n1 = recv(fd1, buf, sizeof(buf), 0);
     assert(n1 > 0);
     std::string resp1(buf, static_cast<std::size_t>(n1));
     assert(resp1.find("405") != std::string::npos);
     // fd2 got 200 (GET /health).
-    ssize_t n2 = recv(fd2, buf, sizeof(buf), 0);
+    TestSsize n2 = recv(fd2, buf, sizeof(buf), 0);
     assert(n2 > 0);
     std::string resp2(buf, static_cast<std::size_t>(n2));
     assert(resp2.find("200") != std::string::npos);
 
-    ::close(fd1);
-    ::close(fd2);
+    test_close_socket(fd1);
+    test_close_socket(fd2);
     server_thread.join();
 }
 
@@ -524,15 +604,15 @@ static void test_stalled_connection_forced_shutdown() {
     assert(port != 0);
 
     // Connect and send header without body; never send the body.
-    const int fd = socket(AF_INET, SOCK_STREAM, 0);
-    assert(fd >= 0);
+    const TestSocket fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(fd != kInvalidTestSocket);
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     assert(connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
     const std::string hdr = "POST /health HTTP/1.1\r\nContent-Length: 5\r\n\r\n";
-    assert(send(fd, hdr.data(), hdr.size(), 0) == static_cast<ssize_t>(hdr.size()));
+    assert(send(fd, hdr.data(), static_cast<TestLength>(hdr.size()), 0) == static_cast<TestSsize>(hdr.size()));
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
 
     // Request stop. The stalled connection should cause a forced shutdown.
@@ -543,96 +623,93 @@ static void test_stalled_connection_forced_shutdown() {
     }
     assert(stopped.load() && "forced shutdown must return within 15s for stalled connection");
 
-    ::close(fd);
+    test_close_socket(fd);
     server_thread.join();
 }
 
 // ===== Phase 4 Task 4: Send deadline with non-reading peer =====
 
-static void test_send_deadline_with_non_reading_peer() {
-    // Task 4: request a response larger than the peer's receive buffer,
-    // and leave the peer unread. The handler must exit after the send deadline
-    // instead of blocking forever.
-    Fixture f(2, 4);
-    int fds[2];
-    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
-
-    // Shrink the peer's receive buffer so the send blocks quickly.
-    int rcvbuf = 1024;
-    setsockopt(fds[1], SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-    // Also set the send buffer small on the server side.
-    int sndbuf = 1024;
-    setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-
-    // Request /api/v1/stats which returns a large JSON body.
-    auto start_time = std::chrono::steady_clock::now();
-    std::thread server_thread([&f, fd = fds[0]] {
-        f.server.handle_client(static_cast<std::intptr_t>(fd), 1);
-    });
-
-    // Send the request.
-    const std::string req = "GET /api/v1/stats HTTP/1.1\r\n";
-    assert(send(fds[1], req.data(), req.size(), 0) == static_cast<ssize_t>(req.size()));
-
-    // Do NOT read the response. The server's send_all should time out after 10s.
-    // We wait for the server thread to finish, with a 15s upper bound.
-    server_thread.join();
-    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::steady_clock::now() - start_time).count();
-
-    // Send deadline is 10s; allow some slack for CI.
-    assert(elapsed < 15 && "send deadline must prevent indefinite blocking");
-    assert(elapsed >= 1 && "should not return instantly with unread peer");
-
-    ::close(fds[1]);
-}
-
-static void test_send_deadline_is_total_under_slow_reader() {
-    // A peer that drains one byte at a time can keep each individual blocking
-    // send below SO_SNDTIMEO while still exhausting a worker for far longer.
-    // The response must obey one wall-clock deadline for the whole send loop.
-    Fixture f(2, 4);
-    int fds[2];
-    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
-    int sndbuf = 128;
-    assert(setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) == 0);
-    int rcvbuf = 128;
-    assert(setsockopt(fds[1], SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) == 0);
+static void check_send_deadline(bool slow_reads) {
+    Fixture f(2, 4, true);
+    TestSocket fds[2];
+    assert(connected_sockets(fds) == 0);
+    set_buffer_size(fds[1], SO_RCVBUF, 1024);
+#ifdef _WIN32
+    // Zero disables Winsock's copy into its pending-send buffer.
+    // On this provider the large send still blocks until SO_SNDTIMEO. This
+    // verifies bounded completion, not repeated successful sends sharing a
+    // deadline: a reset-after-success negative control also passes on Windows.
+    set_buffer_size(fds[0], SO_SNDBUF, 0);
+#else
+    set_buffer_size(fds[0], SO_SNDBUF, 1024);
+#endif
+    set_receive_timeout(fds[1], std::chrono::seconds(2));
 
     std::atomic<bool> server_done{false};
+    std::atomic<std::size_t> bytes_read{0};
     const auto start_time = std::chrono::steady_clock::now();
-    std::thread server_thread([&f, &server_done, fd = fds[0]] {
-        f.server.handle_client(static_cast<std::intptr_t>(fd), 1);
-        server_done.store(true, std::memory_order_release);
+    std::thread server_thread([&] {
+        f.server.handle_client(static_cast<std::intptr_t>(fds[0]), 1);
+        server_done.store(true);
     });
-    std::thread slow_reader([&server_done, fd = fds[1]] {
-        char byte;
-        while (!server_done.load(std::memory_order_acquire)) {
-            const ssize_t n = recv(fd, &byte, 1, 0);
-            if (n <= 0) {
-                break;
+    const std::string body = R"({"table":"response_rows","where":{"column":"id","value":1}})";
+    const std::string req = "POST /api/v1/select HTTP/1.1\r\nContent-Length: " +
+        std::to_string(body.size()) + "\r\n\r\n" + body;
+    assert(send(fds[1], req.data(), static_cast<TestLength>(req.size()), 0) ==
+           static_cast<TestSsize>(req.size()));
+
+    // Receiving a byte proves the real handler has entered send_all.
+    char first_byte;
+    assert(recv(fds[1], &first_byte, 1, 0) == 1);
+    bytes_read.store(1);
+    std::thread reader;
+    if (slow_reads) {
+        reader = std::thread([&] {
+            char received_bytes[1024];
+            while (!server_done.load()) {
+                const TestSsize count = recv(fds[1], received_bytes, sizeof(received_bytes), 0);
+                if (count <= 0) {
+                    break;
+                }
+                bytes_read.fetch_add(static_cast<std::size_t>(count));
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-    });
-
-    const std::string req = "GET /metrics HTTP/1.1\r\n";
-    assert(send(fds[1], req.data(), req.size(), 0) == static_cast<ssize_t>(req.size()));
-
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(12);
-    while (!server_done.load(std::memory_order_acquire) &&
-           std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        });
     }
-    const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    const bool observed_backpressure = !server_done.load();
+    const auto deadline = start_time + std::chrono::seconds(13);
+    while (!server_done.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    const bool completed_in_budget = server_done.load();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start_time).count();
-    if (!server_done.load(std::memory_order_acquire)) {
-        ::close(fds[1]);
-    }
+    // Release a broken sender before join, so a deadline regression cannot hang CTest.
+    test_shutdown_socket(fds[1]);
     server_thread.join();
-    slow_reader.join();
-    assert(server_done.load(std::memory_order_acquire));
-    assert(elapsed < 12 && "send loop must obey a total deadline under slow reads");
+    if (reader.joinable()) {
+        reader.join();
+    }
+    test_close_socket(fds[1]);
+
+    std::cout << "[send deadline] slow_reads=" << slow_reads
+              << " backpressure=" << observed_backpressure
+              << " elapsed_ms=" << elapsed << " bytes_read=" << bytes_read.load() << std::endl;
+    assert(observed_backpressure && "fixture must actually block the sender");
+    assert(completed_in_budget && elapsed >= 9000 && elapsed < 13000);
+    if (slow_reads) {
+        assert(bytes_read.load() > 65536 && "peer must reopen its TCP window repeatedly");
+    }
+    assert(f.round_trip("GET /health HTTP/1.1\r\n").find("200") != std::string::npos);
+}
+
+static void test_send_deadline_with_non_reading_peer() {
+    check_send_deadline(false);
+}
+
+static void test_send_deadline_under_slow_reader() {
+    check_send_deadline(true);
 }
 
 static void test_graceful_stop_drains_inflight_request() {
@@ -654,16 +731,16 @@ static void test_graceful_stop_drains_inflight_request() {
     assert(port != 0 && "bind 后必须回填端口");
 
     // 真实连接：发带头部的请求但暂不发 body → worker 挂在读体（在途）。
-    const int fd = socket(AF_INET, SOCK_STREAM, 0);
-    assert(fd >= 0);
+    const TestSocket fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(fd != kInvalidTestSocket);
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     assert(connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
     const std::string header = "POST /health HTTP/1.1\r\nContent-Length: 5\r\n\r\n";
-    assert(send(fd, header.data(), header.size(), 0) ==
-           static_cast<ssize_t>(header.size()));
+    assert(send(fd, header.data(), static_cast<TestLength>(header.size()), 0) ==
+           static_cast<TestSsize>(header.size()));
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
 
     // 停机请求：有在途请求 → start() 不得立即返回。
@@ -673,15 +750,15 @@ static void test_graceful_stop_drains_inflight_request() {
 
     // 补发 body → 在途完成 → 排空 → start() 返回，且请求拿到正常响应。
     assert(send(fd, "abcde", 5, 0) == 5);
-    const struct timeval tv{3, 0};
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    const auto tv = std::chrono::milliseconds(3 * 1000 + (0) / 1000);
+    set_receive_timeout(fd, tv);
     std::string response;
     char buf[256];
-    ssize_t n;
+    TestSsize n;
     while ((n = recv(fd, buf, sizeof(buf), 0)) > 0) {
         response.append(buf, static_cast<std::size_t>(n));
     }
-    ::close(fd);
+    test_close_socket(fd);
     assert(response.find("405") != std::string::npos && "在途请求必须被完整处理");
 
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
@@ -693,6 +770,10 @@ static void test_graceful_stop_drains_inflight_request() {
 }
 
 int main() {
+#ifdef _WIN32
+    WSADATA data{};
+    assert(WSAStartup(MAKEWORD(2, 2), &data) == 0);
+#endif
     test_normal_request_through_handle_client();
     test_object_pool_exhausted_returns_503();
     test_db_timeout_through_handle_client_returns_503();
@@ -712,6 +793,9 @@ int main() {
     test_queued_request_drained_on_shutdown();
     test_stalled_connection_forced_shutdown();
     test_send_deadline_with_non_reading_peer();
-    test_send_deadline_is_total_under_slow_reader();
+    test_send_deadline_under_slow_reader();
+#ifdef _WIN32
+    assert(WSACleanup() == 0);
+#endif
     return 0;
 }

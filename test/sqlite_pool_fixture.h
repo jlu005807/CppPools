@@ -14,6 +14,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <unistd.h>
@@ -22,7 +23,8 @@
 namespace cpppools::testing {
 
 inline std::string make_temp_db_path(const std::string& tag) {
-    std::string path = "/tmp/cpppools_scoretest_" + tag + "_XXXXXX";
+    const std::string path = (std::filesystem::temp_directory_path() /
+        ("cpppools_scoretest_" + tag + "_XXXXXX")).string();
     std::vector<char> buf(path.begin(), path.end());
     buf.push_back('\0');
     const int fd = mkstemp(buf.data());

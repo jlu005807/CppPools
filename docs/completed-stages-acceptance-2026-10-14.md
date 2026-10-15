@@ -219,3 +219,36 @@ Windows 原生复验结果：
 定向重跑 `test_local_node` 与 `test_cli_commands` 共 92 项，79 项通过、13 项按平台/live 条件跳过；Python 全量 live 为 171 项中 169 项通过、2 项 Windows 专属用例跳过。未重跑 C++、MySQL 或 Windows live。R01–R03 在已测 Linux/WSL 范围关闭；A06/A07/A08 原结论保留，A01/A02 和 S2 平台/发行门槛继续开放。
 
 独立代码复审已完成，未发现需要阻止本批验收的问题。以上为修复批次的测试结果，本次进度文档更新没有重跑代码测试。后续剩余工作按 [统一路线 §2.6](implementation-roadmap.md#26-修复完成后的剩余工作顺序) 推进；本报告不将平台 skip、未交付输出/补全或未完成发行矩阵记为通过。
+
+## 8. 本机真实环境补验（2026-10-15）
+
+基线 `50bc1ff`；Windows 原生 MinGW 14.2、Anaconda Python 3.12；Linux 对照为 WSL Ubuntu。以下结果更新前文的环境缺口，历史运行记录保留。
+
+| 项目 | 实际结果与验收结论 |
+|---|---|
+| A01 真实 MySQL | 本机 MySQL 服务及 Oracle 客户端均为 8.0.11。ON 构建两专项目标成功，CTest 2/2 实际通过、无 skip；自省和 CRUD 均打印 SESSION `''` 与 `NO_BACKSLASH_ESCAPES`，原 factory 默认模式路径保留。特殊名称、唯一列和含引号/反斜杠/中文/emoji 文本往返断言通过。A01 关闭。 |
+| 数据库隔离与清理 | 仅使用测试自己的 `cpppools_intro_test_*` / `cpppools_crud_test_*` 临时库；运行前后 `SHOW DATABASES LIKE 'cpppools%'` 均仅有原 `cpppools`。GLOBAL mode 前后均为 `STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION`，未修改全局设置。 |
+| Windows HTTP 原生专项 | 修复测试专用 socket/timeout 类型与 POSIX 头依赖，SQLite 夹具改用系统临时目录。`test_http_server` 编译并实际通过，约 38 秒。1 MiB 真实 CRUD 响应、服务端 `SO_SNDBUF=0` 下，不读端约 10023 ms、慢读端约 10049 ms 结束；慢读累计 163840 字节，结束后 health 可用。 |
+| A02 证据边界 | **仍开放。** 独立评审在隔离测试副本中把 deadline 改为每次成功发送后重置，错误实现仍约 10 秒通过。该 Winsock provider 在零发送缓冲时是一次 send 等到 socket timeout，没有连续成功的 partial send；AF_UNIX 探测也相同。因此本用例只证明本机有界退出，不能关闭 Windows 多次发送共享总期限的门槛。未为适配测试修改生产发送逻辑。 |
+| Windows TCP/control live | `test_server_socket_live` 共 9 项，8 通过、外部慢读夹具 1 skip；延迟/分片收包、只插入一次、空闲认证停止和目录 reparse 均通过。外部夹具无法限制服务端发送队列，skip 原因明确指向原生专项及上述边界。 |
+| Linux 回归 | `build-accept-s0-s2` 从当前源码完整构建成功，CTest 20/20 通过，约 44 秒；不读/慢读专项均实际执行。 |
+| Windows 全量构建 | HTTP 编译阻断已解除；继续全量构建时在既有 `test_config.cpp` 的双参数 `mkdir` 和 `setenv/unsetenv` 失败。全量原生 CTest 仍不能计为通过。 |
+
+实际命令（凭据只通过进程环境注入，不写入文档）：
+
+```powershell
+cmake --build build-s0-mysql-win2 --target test_mysql_introspection test_mysql_crud -j2
+# CPPPOOLS_TEST_MYSQL_HOST/USER/PASSWORD 已在本次进程设置；PATH 包含客户端 DLL。
+ctest --test-dir build-s0-mysql-win2 -V -R '^test_mysql_(introspection|crud)$'
+cmake --build build-redis-verify-off2 --target test_http_server -j2
+ctest --test-dir build-redis-verify-off2 -R '^test_http_server$' -V
+# PYTHONPATH=sdk/python，CPL_TEST_SERVER=上述构建的 cpppools_server.exe
+D:/Anaconda/python.exe -W error -m unittest sdk.python.tests.test_server_socket_live -v
+```
+
+```bash
+cmake --build build-accept-s0-s2 -j2
+ctest --test-dir build-accept-s0-s2 --output-on-failure
+```
+
+独立评审完成：测试可移植性和资源回收未发现额外阻断；要求保留 A02 的负对照限制，已改名并补注释。S2 平台/发行及 S3–S7 功能不因本节测试通过而自动验收。
