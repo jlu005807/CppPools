@@ -1,0 +1,12 @@
+.git
+.gitignore
+build*/
+cmake-build-*/
+output/
+_tmp/
+**/__pycache__/
+**/*.egg-info/
+*.db
+*.log
+.vscode/
+.idea/

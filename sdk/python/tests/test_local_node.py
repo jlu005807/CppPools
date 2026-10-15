@@ -53,6 +53,22 @@ class TestExitTransition(unittest.TestCase):
 
 class TestVerifiedProcessSignal(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "requires Windows process handles")
+    def test_windows_force_verifies_identity_on_the_termination_handle(self):
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            state = {"pid": process.pid, "binary": sys.executable,
+                     "process_start_time": "wrong-creation-time"}
+            # A PID-based check must not authorize a separately opened handle.
+            with mock.patch.object(local_node, "_identity_matches", return_value=True):
+                with self.assertRaises(local_node.IdentityError):
+                    local_node._send_verified_signal(state, local_node._FORCE_SIGNAL)
+            self.assertIsNone(process.poll())
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows process handles")
     def test_windows_liveness_probe_never_sends_console_events(self):
         with mock.patch.object(local_node.os, "kill") as kill:
             self.assertTrue(local_node._pid_alive(os.getpid()))
@@ -92,6 +108,7 @@ class TestVerifiedProcessSignal(unittest.TestCase):
                     local_node._pid_alive(43210)
             kernel.CloseHandle.assert_called_once_with(98765)
 
+    @unittest.skipUnless(os.name == "posix", "pidfd is POSIX-only")
     def test_pidfd_rechecks_identity_after_open_before_signalling(self):
         pidfd = os.open(os.devnull, os.O_RDONLY)
         pidfd_open = mock.Mock(return_value=pidfd)
@@ -116,6 +133,7 @@ class TestVerifiedProcessSignal(unittest.TestCase):
             with contextlib.suppress(OSError):
                 os.close(pidfd)
 
+    @unittest.skipUnless(os.name == "posix", "pidfd is POSIX-only")
     def test_verified_pidfd_is_used_instead_of_numeric_pid(self):
         pidfd = os.open(os.devnull, os.O_RDONLY)
         pidfd_open = mock.Mock(return_value=pidfd)
@@ -137,6 +155,7 @@ class TestVerifiedProcessSignal(unittest.TestCase):
             with contextlib.suppress(OSError):
                 os.close(pidfd)
 
+    @unittest.skipUnless(os.name == "posix", "numeric POSIX signal fallback")
     def test_numeric_fallback_rechecks_identity_before_signalling(self):
         state = {"pid": 43210, "process_start_time": "start",
                  "binary": "/bin/false"}
@@ -166,11 +185,67 @@ def _write_fake_handshake(command, pid, port=8080):
 
 
 class TestLocalNodeState(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows device names")
+    def test_windows_reserved_device_names_are_rejected(self):
+        for name in ("CON", "nul", "AUX", "prn", "COM1", "com9", "LPT1", "lpt9"):
+            with self.subTest(name=name), self.assertRaises(local_node.LocalStateError):
+                local_node.LocalNodeManager("unused-state", name)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows DACLs")
+    def test_windows_control_directory_has_protected_owner_and_system_acl(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = os.path.join(root, "control")
+            local_node._ensure_private_control_dir(directory)
+            script = (
+                "$a=Get-Acl -LiteralPath '" + directory.replace("'", "''") + "';"
+                "$s=[System.Security.Principal.SecurityIdentifier];"
+                "$u=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value;"
+                "[pscustomobject]@{protected=$a.AreAccessRulesProtected;"
+                "owner=$a.GetOwner($s).Value;user=$u;"
+                "rules=@($a.GetAccessRules($true,$true,$s)|ForEach-Object{"
+                "[pscustomobject]@{sid=$_.IdentityReference.Value;"
+                "inherited=$_.IsInherited;rights=[int]$_.FileSystemRights;"
+                "type=[int]$_.AccessControlType}})}|ConvertTo-Json -Depth 4"
+            )
+            result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive",
+                                     "-Command", script], capture_output=True,
+                                    text=True, check=True)
+            acl = json.loads(result.stdout)
+            self.assertTrue(acl["protected"])
+            self.assertEqual(acl["owner"], acl["user"])
+            self.assertEqual({rule["sid"] for rule in acl["rules"]},
+                             {acl["user"], "S-1-5-18"})
+            for rule in acl["rules"]:
+                self.assertFalse(rule["inherited"])
+                self.assertEqual(rule["type"], 0)
+                self.assertEqual(rule["rights"], 2032127)  # FullControl
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows byte-range locks")
+    def test_windows_instance_lock_is_exclusive_and_does_not_grow(self):
+        with tempfile.TemporaryDirectory() as root:
+            manager = local_node.LocalNodeManager(root, "demo")
+            for _ in range(5):
+                with manager._exclusive():
+                    with self.assertRaises(local_node.LocalStateError):
+                        with local_node.LocalNodeManager(root, "demo")._exclusive():
+                            self.fail("second manager acquired the held lock")
+            self.assertLessEqual(os.path.getsize(manager.lock_path), 1)
+
     def setUp(self):
         self.pidfd_patcher = mock.patch.object(
             local_node, "_pidfd_functions", return_value=(None, None), create=True)
         self.pidfd_patcher.start()
         self.addCleanup(self.pidfd_patcher.stop)
+        if os.name == "nt":
+            # State-machine fixtures use synthetic PIDs. Native handle identity
+            # and waiting are covered by TestVerifiedProcessSignal/live tests.
+            kernel = mock.Mock()
+            kernel.WaitForSingleObject.side_effect = (
+                lambda pid, timeout: 258 if local_node._pid_alive(pid) else 0)
+            patcher = mock.patch.object(local_node, "_open_verified_windows_process",
+                side_effect=lambda state, **kwargs: (kernel, state["pid"]))
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def test_config_digest_uses_original_file_bytes(self):
         path = None
@@ -343,11 +418,11 @@ class TestLocalNodeState(unittest.TestCase):
                 with self.assertRaises(local_node.LocalStateError):
                     local_node._ensure_private_control_dir(link)
 
-    def test_windows_local_start_remains_explicitly_unsupported(self):
-        manager = local_node.LocalNodeManager(tempfile.gettempdir(), "unsupported")
+    def test_windows_local_start_reaches_configuration_validation(self):
+        manager = local_node.LocalNodeManager(tempfile.gettempdir(), "windows-start")
         with mock.patch.object(local_node.os, "name", "nt"):
             with self.assertRaisesRegex(local_node.LocalNodeError,
-                                        "Windows local start is not supported"):
+                                        "config file does not exist"):
                 manager.start("config-does-not-need-to-exist.json")
 
     @unittest.skipUnless(sys.platform == "linux", "local lifecycle requires Linux /proc")
@@ -1104,7 +1179,9 @@ class TestLocalNodeState(unittest.TestCase):
                     mock.patch.object(local_node, "_write_stop_request",
                                       side_effect=[False, True]) as write_request, \
                     mock.patch.object(local_node, "_send_verified_signal") as send_signal:
-                with self.assertRaises(local_node.StopTimeout):
+                expected_error = (local_node.LocalStateError if os.name == "nt"
+                                  else local_node.StopTimeout)
+                with self.assertRaises(expected_error):
                     manager.stop(timeout=0.01)
                 with self.assertRaises(local_node.StopTimeout):
                     manager.stop(timeout=0.01)

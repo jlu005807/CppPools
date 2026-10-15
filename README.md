@@ -50,9 +50,9 @@ python -m cpppools --help
 
 `cpl` 与 `python -m cpppools` 使用相同入口；安装后的版本来自包元数据。
 CLI 提供 `health`、行级 CRUD 和本地节点管理命令，详见
-[CLI 设计与平台边界](docs/cpl-cli-design.md)。本地节点管理已验证 Linux/WSL，
-macOS 尚未验收；Windows 的 `start` 明确不支持，可直接启动服务程序，
-再使用 CLI 的 HTTP 命令。
+[CLI 设计与平台边界](docs/cpl-cli-design.md)。本地节点管理已验证 Linux/WSL
+和 Windows；macOS 尚未验收。Compose 部署由 Docker 管容器启停，SDK/CLI
+只通过远程 HTTP 执行 health 和 CRUD，不使用本机 `start/stop/status`。
 
 `cpl start -F ... -o json` 就绪后立即在 stderr 提示 running 状态，停止后
 stdout 输出一份最终 JSON；Ctrl+C 确认服务优雅退出后返回 130。stderr 可含
@@ -476,10 +476,26 @@ curl        http://127.0.0.1:8080/api/v1/schema
 curl        http://127.0.0.1:8080/api/v1/stats
 ```
 
+### 6.4 Docker Compose 部署（推荐跨宿主机运行）
+
+Compose 负责容器启停，SDK/CLI 通过 HTTP 负责 health 和 CRUD；容器模式不使用本机 `cpl start/stop/status`。详细边界见 [Docker Compose 部署说明](docs/docker-compose-deployment.md)。
+
+```bash
+docker compose up -d --build
+PYTHONPATH=sdk/python python -m cpppools health -u http://127.0.0.1:8080 -o json
+PYTHONPATH=sdk/python python -m cpppools insert users \
+  -u http://127.0.0.1:8080 -D '{"id":1,"name":"compose"}' -o json
+PYTHONPATH=sdk/python python -m cpppools select users \
+  -u http://127.0.0.1:8080 -w '{"column":"id","value":1}' -o json
+docker compose stop
+```
+
+SQLite 数据保存在命名卷 `cpppools-data`；`docker compose down -v` 会删除该测试卷。Docker 引擎不可用时只能进行定义检查，不能声称真实容器 smoke 已通过。
+
 多数据源：在配置文件的 `datasources` 数组里加源即可；
 表名跨源重复时请求需带 `"datasource":"<源名>"`（否则 409）。
 
-### 6.4 集群与缓存
+### 6.5 集群与缓存
 
 配置文件加 `cluster`（节点身份 + 拓扑 + epoch）与 `cache`（`enabled:true`）
 两段（格式见 `docs/api/backend_api.md` §6 与 `config/cpppools.example.json`）；
@@ -499,7 +515,7 @@ client = ClusterClient(["http://127.0.0.1:8080"])
 client.insert("user_scores", {"user_id": 42, "score": 99, "updated_at_ms": 0})
 ```
 
-### 6.5 观察池化行为
+### 6.6 观察池化行为
 
 ```bash
 # 观察连接池耗尽（503）需要 worker 数 > 连接池大小

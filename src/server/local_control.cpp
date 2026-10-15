@@ -18,6 +18,8 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <aclapi.h>
+#include <sddl.h>
 #include <processthreadsapi.h>
 #else
 #include <fcntl.h>
@@ -76,37 +78,158 @@ std::string windows_error(const char* operation) {
            std::to_string(GetLastError()) + ")";
 }
 
-bool validate_directory(const fs::path& dir, std::string* error) {
-    const std::wstring path = dir.wstring();
-    HANDLE handle = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
-                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                nullptr, OPEN_EXISTING,
-                                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-                                nullptr);
-    if (handle == INVALID_HANDLE_VALUE) {
-        set_error(error, windows_error("open control directory"));
+class WindowsHandle {
+public:
+    explicit WindowsHandle(HANDLE value) : value_(value) {}
+    ~WindowsHandle() { if (value_ != INVALID_HANDLE_VALUE) { CloseHandle(value_); } }
+    WindowsHandle(const WindowsHandle&) = delete;
+    WindowsHandle& operator=(const WindowsHandle&) = delete;
+    WindowsHandle(WindowsHandle&& other) noexcept : value_(other.value_) {
+        other.value_ = INVALID_HANDLE_VALUE;
+    }
+    HANDLE get() const noexcept { return value_; }
+private:
+    HANDLE value_;
+};
+
+bool secure_owned_handle(HANDLE handle, bool directory, std::string* error) {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        set_error(error, windows_error("open process token"));
         return false;
     }
-    BY_HANDLE_FILE_INFORMATION info{};
-    const bool ok = GetFileInformationByHandle(handle, &info) != 0;
-    CloseHandle(handle);
-    if (!ok) {
-        set_error(error, windows_error("inspect control directory"));
+    WindowsHandle owned_token(token);
+    DWORD token_size = 0;
+    GetTokenInformation(token, TokenUser, nullptr, 0, &token_size);
+    std::vector<unsigned char> token_buffer(token_size);
+    if (token_size == 0 || !GetTokenInformation(token, TokenUser,
+                                                 token_buffer.data(), token_size,
+                                                 &token_size)) {
+        set_error(error, windows_error("read process token"));
         return false;
     }
-    if ((info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
-        (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
-        set_error(error, "control path is not a regular directory");
+    const auto* token_user = reinterpret_cast<const TOKEN_USER*>(token_buffer.data());
+    PSID owner = nullptr;
+    PSECURITY_DESCRIPTOR previous = nullptr;
+    const DWORD owner_result = GetSecurityInfo(handle, SE_FILE_OBJECT,
+        OWNER_SECURITY_INFORMATION, &owner, nullptr, nullptr, nullptr, &previous);
+    const bool owned = owner_result == ERROR_SUCCESS && owner != nullptr &&
+                       EqualSid(owner, token_user->User.Sid);
+    if (previous != nullptr) { LocalFree(previous); }
+    if (!owned) {
+        set_error(error, "control path is not owned by the current user");
+        return false;
+    }
+    LPWSTR user_sid_text = nullptr;
+    if (!ConvertSidToStringSidW(token_user->User.Sid, &user_sid_text)) {
+        set_error(error, windows_error("format process SID"));
+        return false;
+    }
+    const std::wstring inheritance = directory ? L"OICI" : L"";
+    const std::wstring sddl = L"D:P(A;" + inheritance + L";FA;;;SY)(A;" +
+                              inheritance + L";FA;;;" + user_sid_text + L")";
+    LocalFree(user_sid_text);
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.c_str(), SDDL_REVISION_1, &descriptor, nullptr)) {
+        set_error(error, windows_error("build private control ACL"));
+        return false;
+    }
+    BOOL present = FALSE, defaulted = FALSE;
+    PACL acl = nullptr;
+    const BOOL parsed = GetSecurityDescriptorDacl(descriptor, &present, &acl, &defaulted);
+    const DWORD security_result = parsed && present && acl != nullptr ?
+        SetSecurityInfo(handle, SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            nullptr, nullptr, acl, nullptr) : ERROR_INVALID_SECURITY_DESCR;
+    LocalFree(descriptor);
+    if (security_result != ERROR_SUCCESS) {
+        set_error(error, "secure control directory ACL failed (Windows error " +
+                         std::to_string(security_result) + ")");
+        return false;
+    }
+    PSECURITY_DESCRIPTOR verify_descriptor = nullptr;
+    SECURITY_DESCRIPTOR_CONTROL verify_flags = 0;
+    DWORD verify_revision = 0;
+    PACL verified_acl = nullptr;
+    if (GetSecurityInfo(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                        nullptr, nullptr, &verified_acl, nullptr,
+                        &verify_descriptor) != ERROR_SUCCESS ||
+        !GetSecurityDescriptorControl(verify_descriptor, &verify_flags,
+                                       &verify_revision) ||
+        (verify_flags & SE_DACL_PROTECTED) == 0 ||
+        verified_acl == nullptr || verified_acl->AceCount != 2) {
+        if (verify_descriptor != nullptr) {
+            LocalFree(verify_descriptor);
+        }
+        set_error(error, "could not verify the protected control ACL");
+        return false;
+    }
+    bool user_granted = false, system_granted = false;
+    for (DWORD index = 0; index < verified_acl->AceCount; ++index) {
+        void* raw = nullptr;
+        if (!GetAce(verified_acl, index, &raw)) { break; }
+        const auto* ace = static_cast<const ACCESS_ALLOWED_ACE*>(raw);
+        if (ace->Header.AceType != ACCESS_ALLOWED_ACE_TYPE ||
+            (ace->Header.AceFlags & INHERITED_ACE) != 0 || ace->Mask != FILE_ALL_ACCESS) {
+            break;
+        }
+        PSID sid = const_cast<DWORD*>(&ace->SidStart);
+        user_granted = user_granted || EqualSid(sid, token_user->User.Sid);
+        system_granted = system_granted || IsWellKnownSid(sid, WinLocalSystemSid);
+    }
+    LocalFree(verify_descriptor);
+    if (!user_granted || !system_granted) {
+        set_error(error, "control ACL must grant only the current user and SYSTEM");
         return false;
     }
     return true;
 }
 
+class WindowsDirectoryGuard {
+public:
+    bool open(const fs::path& dir, std::string* error) {
+        const fs::path absolute = fs::absolute(dir).lexically_normal();
+        fs::path current = absolute.root_path();
+        for (const auto& part : absolute.relative_path()) {
+            current /= part;
+            const bool leaf = current == absolute;
+            const DWORD access = FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES |
+                (leaf ? READ_CONTROL | WRITE_DAC : 0);
+            HANDLE handle = CreateFileW(current.c_str(), access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+            if (handle == INVALID_HANDLE_VALUE) {
+                set_error(error, windows_error("pin control directory"));
+                return false;
+            }
+            handles_.emplace_back(handle);
+            BY_HANDLE_FILE_INFORMATION info{};
+            if (!GetFileInformationByHandle(handle, &info) ||
+                (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+                (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+                set_error(error, "control path contains a reparse point or non-directory");
+                return false;
+            }
+        }
+        if (handles_.empty()) {
+            set_error(error, "control directory cannot be a drive root");
+            return false;
+        }
+        return secure_owned_handle(handles_.back().get(), true, error);
+    }
+private:
+    // No FILE_SHARE_DELETE: ancestors remain pinned until the operation ends.
+    std::vector<WindowsHandle> handles_;
+};
+
 bool read_file_secure(const fs::path& dir, const char* filename,
                       std::string* contents, std::string* error,
                       bool missing_ok = false) {
+    WindowsDirectoryGuard directory;
+    if (!directory.open(dir, error)) { return false; }
     const fs::path path = dir / filename;
-    HANDLE handle = CreateFileW(path.wstring().c_str(), GENERIC_READ,
+    HANDLE handle = CreateFileW(path.wstring().c_str(), GENERIC_READ | READ_CONTROL | WRITE_DAC,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                 nullptr, OPEN_EXISTING,
                                 FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
@@ -126,6 +249,10 @@ bool read_file_secure(const fs::path& dir, const char* filename,
         (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
         CloseHandle(handle);
         set_error(error, std::string(filename) + " is not a regular file");
+        return false;
+    }
+    if (!secure_owned_handle(handle, false, error)) {
+        CloseHandle(handle);
         return false;
     }
     const std::uint64_t size =
@@ -150,6 +277,8 @@ bool read_file_secure(const fs::path& dir, const char* filename,
 
 bool write_file_atomic(const fs::path& dir, const char* filename,
                        const std::string& bytes, std::string* error) {
+    WindowsDirectoryGuard directory;
+    if (!directory.open(dir, error)) { return false; }
     if (bytes.size() > kMaxControlFileBytes) {
         set_error(error, std::string(filename) + " exceeds 4 KiB");
         return false;
@@ -444,9 +573,10 @@ std::unique_ptr<LocalControl> LocalControl::open(const std::string& dir,
         set_error(error, "control directory is empty");
         return nullptr;
     }
-    const fs::path directory(dir);
+    const fs::path directory = fs::u8path(dir);
 #ifdef _WIN32
-    if (!validate_directory(directory, error)) {
+    WindowsDirectoryGuard guard;
+    if (!guard.open(directory, error)) {
         return nullptr;
     }
     const std::int64_t pid = static_cast<std::int64_t>(GetCurrentProcessId());
@@ -488,7 +618,7 @@ std::unique_ptr<LocalControl> LocalControl::open(const std::string& dir,
     }
     LocalIdentity identity{launch_id, pid, std::move(start_time)};
     return std::unique_ptr<LocalControl>(
-        new LocalControl(directory.string(), std::move(identity), std::move(token)));
+        new LocalControl(directory.u8string(), std::move(identity), std::move(token)));
 }
 
 const LocalIdentity& LocalControl::identity() const noexcept {
@@ -498,7 +628,7 @@ const LocalIdentity& LocalControl::identity() const noexcept {
 bool LocalControl::write_json(const char* filename, const void* document,
                               std::string* error) const {
     const auto& value = *static_cast<const Json*>(document);
-    return write_file_atomic(fs::path(dir_), filename, value.dump() + "\n", error);
+    return write_file_atomic(fs::u8path(dir_), filename, value.dump() + "\n", error);
 }
 
 bool LocalControl::publish_state(const char* filename, const char* state,
@@ -548,7 +678,7 @@ bool LocalControl::stop_requested(std::string* error) const {
         error->clear();
     }
     std::string bytes;
-    if (!read_file_secure(fs::path(dir_), "stop.request", &bytes, error, true)) {
+    if (!read_file_secure(fs::u8path(dir_), "stop.request", &bytes, error, true)) {
         return false;
     }
     if (bytes.empty()) {

@@ -30,6 +30,10 @@ client.delete("users", {"column": "id", "value": 42})
 - 运行期每 `topology_refresh`（默认 30s）懒刷新；**刷新失败继续用旧环**
   + `topology_refresh_failures` 计数（不报错）。
 
+Docker Compose 部署时，SDK 仍按上述 HTTP 拓扑工作：seed 使用可达的宿主发布端口，
+`cluster.nodes` 必须发布 SDK 同样可达的地址/端口。Compose 管容器启停，远程
+SDK/CLI 管 health 和 CRUD；具体操作见 [Compose 部署说明](../docker-compose-deployment.md)。
+
 ## 2. 构造参数（默认值规范性）
 
 | 参数 | 默认 | 说明 |

@@ -495,7 +495,7 @@ class TestServerSocketLive(unittest.TestCase):
                 [os.environ["CPL_TEST_SERVER"], "--control-dir", junction],
                 capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 1, result.stderr)
-            self.assertIn("control error: control path is not a regular directory",
+            self.assertIn("control error: control path contains a reparse point or non-directory",
                           result.stderr)
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)

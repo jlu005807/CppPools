@@ -116,7 +116,7 @@ target_link_libraries(cpppools PRIVATE nlohmann_json)
 # 版本号由构建系统注入，避免在源码里硬编码（供 /api/v1/get-config 使用）。
 target_compile_definitions(cpppools PUBLIC CPPPOOLS_VERSION="${PROJECT_VERSION}")
 if (WIN32)
-    target_link_libraries(cpppools PUBLIC ws2_32)
+    target_link_libraries(cpppools PUBLIC ws2_32 advapi32)
 endif()
 cpppools_set_warnings(cpppools)
 
@@ -193,6 +193,9 @@ endfunction()
 # =========================
 add_executable(cpppools_server src/main.cpp)
 target_link_libraries(cpppools_server PRIVATE cpppools)
+if (WIN32)
+    target_link_libraries(cpppools_server PRIVATE shell32)
+endif()
 cpppools_set_warnings(cpppools_server)
 cpppools_copy_mysql_dll(cpppools_server)
 

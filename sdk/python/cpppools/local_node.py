@@ -1,4 +1,4 @@
-"""Small POSIX-focused manager for locally launched CppPools processes.
+"""Manager for locally launched CppPools processes.
 
 The manager owns only the instance metadata and process it launched.  The
 server remains responsible for graceful drain; this layer waits for health and
@@ -29,6 +29,7 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _CONTROL_MAX_BYTES = 4096
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _FILE_ATTRIBUTE_DIRECTORY = 0x10
+_FORCE_SIGNAL = getattr(signal, "SIGKILL", 9)
 
 _STATE_TRANSITIONS = {
     "starting": {"running", "stopping", "stopped", "crashed"},
@@ -140,6 +141,31 @@ def _process_executable(pid):
             return os.path.realpath("/proc/%d/exe" % pid)
         except OSError:
             return None
+    if os.name == "nt":
+        if type(pid) is not int or pid <= 0 or pid > 0xFFFFFFFF:
+            return None
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.QueryFullProcessImageNameW.argtypes = (
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD))
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return None
+        try:
+            size = wintypes.DWORD(32768)
+            buffer = ctypes.create_unicode_buffer(size.value)
+            if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+                return None
+            return os.path.realpath(buffer.value)
+        finally:
+            kernel32.CloseHandle(handle)
     return None
 
 
@@ -152,6 +178,36 @@ def _process_start_time(pid):
             return fields[19]
         except (OSError, IndexError, UnicodeError):
             return None
+    if os.name == "nt":
+        if type(pid) is not int or pid <= 0 or pid > 0xFFFFFFFF:
+            return None
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessTimes.argtypes = (
+            wintypes.HANDLE, ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME))
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return None
+        try:
+            created = wintypes.FILETIME()
+            exited = wintypes.FILETIME()
+            kernel = wintypes.FILETIME()
+            user = wintypes.FILETIME()
+            if not kernel32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                                            ctypes.byref(kernel), ctypes.byref(user)):
+                return None
+            value = (created.dwHighDateTime << 32) | created.dwLowDateTime
+            return str(value)
+        finally:
+            kernel32.CloseHandle(handle)
     return None
 
 
@@ -199,11 +255,72 @@ def _pidfd_functions():
             getattr(signal, "pidfd_send_signal", None))
 
 
+def _open_verified_windows_process(state, terminate=False):
+    import ctypes
+    from ctypes import wintypes
+
+    pid = state.get("pid")
+    if type(pid) is not int or pid <= 0 or pid > 0xFFFFFFFF:
+        raise IdentityError("invalid Windows process identity")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.GetProcessTimes.argtypes = (
+        wintypes.HANDLE, ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME))
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.QueryFullProcessImageNameW.argtypes = (
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD))
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    access = 0x1000 | 0x00100000 | (0x0001 if terminate else 0)
+    handle = kernel32.OpenProcess(access, False, pid)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+        size = wintypes.DWORD(32768)
+        image = ctypes.create_unicode_buffer(size.value)
+        if (not kernel32.GetProcessTimes(handle, ctypes.byref(created),
+                                        ctypes.byref(exited), ctypes.byref(kernel),
+                                        ctypes.byref(user)) or
+                not kernel32.QueryFullProcessImageNameW(handle, 0, image, ctypes.byref(size))):
+            raise IdentityError("cannot verify the target process handle")
+        created_at = str((created.dwHighDateTime << 32) | created.dwLowDateTime)
+        expected_binary = state.get("binary")
+        if (created_at != str(state.get("process_start_time")) or not expected_binary or
+                os.path.normcase(os.path.realpath(image.value)) !=
+                os.path.normcase(os.path.realpath(expected_binary))):
+            raise IdentityError("process identity changed before control delivery")
+        return kernel32, handle
+    except BaseException:
+        kernel32.CloseHandle(handle)
+        raise
+
+
 def _send_verified_signal(state, sig):
-    """Signal only the process whose stored identity was just revalidated."""
+    """Deliver only to the verified process; Windows caller owns returned handle."""
     pid = state.get("pid")
     if type(pid) is not int or pid <= 0:
         raise IdentityError("refusing to signal an invalid process identity")
+    if os.name == "nt":
+        if sig != _FORCE_SIGNAL:
+            raise OSError(errno.ENOTSUP, "Windows graceful stop requires the control request")
+        import ctypes
+        kernel32, handle = _open_verified_windows_process(state, terminate=True)
+        try:
+            if not kernel32.TerminateProcess(handle, 137):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return kernel32, handle
+        except BaseException:
+            kernel32.CloseHandle(handle)
+            raise
 
     pidfd_open, pidfd_send = _pidfd_functions()
     if callable(pidfd_open) and callable(pidfd_send):
@@ -250,9 +367,17 @@ def _atomic_json(path, document):
 
 def _atomic_bytes(path, payload):
     directory = os.path.dirname(path)
-    os.makedirs(directory, mode=0o700, exist_ok=True)
-    if os.name == "posix":
+    if os.name == "nt":
+        _ensure_windows_directory_tree(directory)
+    else:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
         os.chmod(directory, 0o700)
+    with _control_directory_guard(directory):
+        _replace_bytes(path, payload)
+
+
+def _replace_bytes(path, payload):
+    directory = os.path.dirname(path)
     fd, temporary = tempfile.mkstemp(prefix=".%s." % os.path.basename(path),
                                      dir=directory)
     try:
@@ -270,9 +395,26 @@ def _atomic_bytes(path, payload):
             pass
 
 
+@contextlib.contextmanager
+def _control_directory_guard(directory):
+    if os.name == "nt":
+        from . import _windows_control
+        with contextlib.ExitStack() as stack:
+            try:
+                stack.enter_context(_windows_control.directory(directory))
+            except OSError as exc:
+                raise LocalStateError("cannot secure local control path: %s" % exc) from None
+            yield
+    else:
+        yield
+
+
 def _ensure_private_control_dir(directory):
     """Create and verify a private, non-link control directory before spawn."""
     directory = os.path.abspath(directory)
+    if os.name == "nt":
+        _ensure_windows_directory_tree(directory)
+        return directory
     os.makedirs(directory, mode=0o700, exist_ok=True)
     try:
         before = os.lstat(directory)
@@ -303,6 +445,41 @@ def _ensure_private_control_dir(directory):
         finally:
             os.close(fd)
     return directory
+
+
+def _ensure_windows_directory_tree(directory):
+    """Create each Windows control path component while its parent is pinned."""
+    absolute = os.path.abspath(directory)
+    drive, tail = os.path.splitdrive(absolute)
+    current = drive + os.sep
+    parts = [part for part in tail.split(os.sep) if part]
+    if not parts:
+        raise LocalStateError("control directory cannot be a drive root")
+    for index, part in enumerate(parts):
+        candidate = os.path.join(current, part)
+        leaf = index == len(parts) - 1
+        try:
+            os.lstat(candidate)
+        except FileNotFoundError:
+            if current != drive + os.sep:
+                from . import _windows_control
+                try:
+                    with _windows_control.directory(current, secure_leaf=False):
+                        try:
+                            os.mkdir(candidate)
+                        except FileExistsError:
+                            pass
+                except OSError as exc:
+                    raise LocalStateError("cannot secure local control path: %s" % exc) from None
+            else:
+                try:
+                    os.mkdir(candidate)
+                except FileExistsError:
+                    pass
+        if leaf:
+            with _control_directory_guard(candidate):
+                pass
+        current = candidate
 
 
 def _control_path_is_reparse(path, st):
@@ -356,20 +533,19 @@ def _read_control_bytes(control_dir, filename, missing_ok=False):
         finally:
             os.close(fd)
 
-    try:
-        file_stat = os.lstat(path)
-    except FileNotFoundError:
-        if missing_ok:
-            return None
-        raise
-    if (not stat.S_ISREG(file_stat.st_mode) or
-            _control_path_is_reparse(path, file_stat)):
-        raise LocalStateError("control file is not a regular file")
-    with open(path, "rb") as handle:
-        info = os.fstat(handle.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_size > _CONTROL_MAX_BYTES:
-            raise LocalStateError("control file is invalid or exceeds 4 KiB")
-        payload = handle.read(_CONTROL_MAX_BYTES + 1)
+    from . import _windows_control
+    with _control_directory_guard(directory):
+        try:
+            fd = _windows_control.open_file(path)
+        except FileNotFoundError:
+            if missing_ok:
+                return None
+            raise
+        with os.fdopen(fd, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > _CONTROL_MAX_BYTES:
+                raise LocalStateError("control file is invalid or exceeds 4 KiB")
+            payload = handle.read(_CONTROL_MAX_BYTES + 1)
     if len(payload) > _CONTROL_MAX_BYTES:
         raise LocalStateError("control file exceeds 4 KiB")
     return payload
@@ -471,6 +647,9 @@ class LocalNodeManager:
     def __init__(self, state_root, name="default"):
         if not isinstance(name, str) or not _NAME.fullmatch(name):
             raise LocalStateError("invalid instance name")
+        if os.name == "nt" and re.fullmatch(r"CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]",
+                                            name, re.IGNORECASE):
+            raise LocalStateError("instance name is a reserved Windows device name")
         self.state_root = os.path.abspath(os.path.expanduser(state_root))
         self.name = name
         self.instance_dir = os.path.join(self.state_root, name)
@@ -480,8 +659,15 @@ class LocalNodeManager:
 
     def read_state(self):
         try:
-            with open(self.state_path, "r", encoding="utf-8") as handle:
-                state = json.load(handle)
+            with _control_directory_guard(self.instance_dir):
+                if os.name == "nt":
+                    from . import _windows_control
+                    handle = os.fdopen(_windows_control.open_file(self.state_path),
+                                       "r", encoding="utf-8")
+                else:
+                    handle = open(self.state_path, "r", encoding="utf-8")
+                with handle:
+                    state = json.load(handle)
         except FileNotFoundError:
             raise LocalStateError("instance state does not exist") from None
         except (OSError, ValueError) as exc:
@@ -553,8 +739,23 @@ class LocalNodeManager:
 
     @contextlib.contextmanager
     def _exclusive(self):
-        os.makedirs(self.instance_dir, exist_ok=True)
-        handle = open(self.lock_path, "a+")
+        if os.name == "nt":
+            _ensure_windows_directory_tree(self.instance_dir)
+        else:
+            os.makedirs(self.instance_dir, exist_ok=True)
+        with _control_directory_guard(self.instance_dir):
+            with self._lock():
+                yield
+
+    @contextlib.contextmanager
+    def _lock(self):
+        if os.name == "nt":
+            from . import _windows_control
+            handle = os.fdopen(_windows_control.open_file(
+                self.lock_path, writable=True, create=True), "r+b")
+        else:
+            handle = open(self.lock_path, "a+")
+        acquired = False
         try:
             if os.name == "posix":
                 import fcntl
@@ -562,11 +763,24 @@ class LocalNodeManager:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except (BlockingIOError, OSError) as exc:
                     raise LocalStateError("instance is busy") from exc
+            elif os.name == "nt":
+                import msvcrt
+                handle.seek(0)
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                except OSError as exc:
+                    raise LocalStateError("instance is busy") from exc
+            acquired = True
             yield
         finally:
-            if os.name == "posix":
+            if acquired and os.name == "posix":
                 import fcntl
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            elif acquired and os.name == "nt":
+                import msvcrt
+                handle.seek(0)
+                with contextlib.suppress(OSError):
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
             handle.close()
 
     def _status_for(self, state):
@@ -600,21 +814,22 @@ class LocalNodeManager:
             self.instance_dir, "launches", launch_id))
         if os.path.normcase(os.path.abspath(control_dir)) != os.path.normcase(expected_dir):
             raise LocalStateError("control directory does not match the current launch")
-        try:
-            control_stat = os.lstat(control_dir)
-        except OSError as exc:
-            raise LocalStateError("cannot inspect terminal control directory: %s" % exc) from None
-        if (not stat.S_ISDIR(control_stat.st_mode) or
-                _control_path_is_reparse(control_dir, control_stat)):
-            raise LocalStateError("terminal control path is not a regular directory")
-        for filename in ("control.token", "stop.request"):
+        with _control_directory_guard(control_dir):
             try:
-                os.unlink(os.path.join(control_dir, filename))
-            except FileNotFoundError:
-                pass
+                control_stat = os.lstat(control_dir)
             except OSError as exc:
-                raise LocalStateError(
-                    "cannot clean terminal control file %s: %s" % (filename, exc)) from None
+                raise LocalStateError("cannot inspect terminal control directory: %s" % exc) from None
+            if (not stat.S_ISDIR(control_stat.st_mode) or
+                    _control_path_is_reparse(control_dir, control_stat)):
+                raise LocalStateError("terminal control path is not a regular directory")
+            for filename in ("control.token", "stop.request"):
+                try:
+                    os.unlink(os.path.join(control_dir, filename))
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    raise LocalStateError(
+                        "cannot clean terminal control file %s: %s" % (filename, exc)) from None
 
     def _reconcile_exited(self, state=None):
         """Conditionally merge exit evidence, never changing a live process."""
@@ -880,8 +1095,6 @@ class LocalNodeManager:
 
     def start(self, config, binary=None, workdir=None, log_file=None,
               timeout=15.0, foreground=False, on_ready=None):
-        if os.name != "posix":
-            raise LocalNodeError("Windows local start is not supported")
         config = os.path.realpath(os.path.abspath(os.path.expanduser(config)))
         if not os.path.isfile(config):
             raise LocalNodeError("config file does not exist: %s" % config)
@@ -955,6 +1168,10 @@ class LocalNodeManager:
                                      "stderr": subprocess.STDOUT}
                     if os.name == "posix":
                         popen_options["start_new_session"] = True
+                    elif os.name == "nt":
+                        popen_options["creationflags"] = (
+                            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW)
+                        popen_options["stdin"] = subprocess.DEVNULL
                     if _config_sha256(config) != config_sha256:
                         raise LocalNodeError(
                             "server config changed before the process was spawned")
@@ -1145,6 +1362,22 @@ class LocalNodeManager:
             raise
 
     def stop(self, timeout=10.0, force=False):
+        with contextlib.ExitStack() as handles:
+            return self._stop(timeout, force, handles)
+
+    def _stop(self, timeout, force, handles):
+        force_handle = None
+
+        def process_alive():
+            if force_handle is None:
+                return _pid_alive(pid)
+            kernel32, handle = force_handle
+            result = kernel32.WaitForSingleObject(handle, 0)
+            if result == 0xFFFFFFFF:
+                import ctypes
+                raise ctypes.WinError(ctypes.get_last_error())
+            return result == 258
+
         with self._exclusive():
             state = self.read_state()
         launch_id = state.get("launch_id")
@@ -1246,7 +1479,10 @@ class LocalNodeManager:
                         return self._stop_exit_result(*reconciled)
                 if stopping.get("force_delivery") != "accepted":
                     try:
-                        _send_verified_signal(stopping, signal.SIGKILL)
+                        delivered = _send_verified_signal(stopping, _FORCE_SIGNAL)
+                        if os.name == "nt" and delivered is not None:
+                            force_handle = delivered
+                            handles.callback(delivered[0].CloseHandle, delivered[1])
                     except IdentityError:
                         stopping = self._record_force_delivery(
                             launch_id, "rejected", force_rejected_at=_now())
@@ -1274,8 +1510,23 @@ class LocalNodeManager:
             else:
                 raise LocalStateError("force delivery state is invalid")
         elif stopping.get("force_delivery") != "accepted":
+            if os.name == "nt":
+                try:
+                    force_handle = _open_verified_windows_process(stopping)
+                except (IdentityError, OSError):
+                    reconciled = self._reconcile_exited(stopping)
+                    if reconciled is not None:
+                        return self._stop_exit_result(*reconciled)
+                    raise
+                handles.callback(force_handle[0].CloseHandle, force_handle[1])
             request_sent = _write_stop_request(stopping) if control_dir else False
             if not request_sent:
+                if os.name == "nt":
+                    reconciled = self._reconcile_exited(stopping)
+                    if reconciled is not None:
+                        return self._stop_exit_result(*reconciled)
+                    raise LocalStateError("cannot publish the Windows stop request",
+                                          result=self._status_for(stopping))
                 handshake, _ = _verified_handshake(stopping, require_ready=True)
                 if handshake:
                     try:
@@ -1294,7 +1545,7 @@ class LocalNodeManager:
 
         deadline = time.monotonic() + max(float(timeout), 0.01)
         while time.monotonic() < deadline:
-            if not _pid_alive(pid):
+            if not process_alive():
                 reconciled = self._reconcile_exited(stopping)
                 if reconciled is not None:
                     return self._stop_exit_result(*reconciled)
@@ -1304,7 +1555,12 @@ class LocalNodeManager:
                     require_original_launch(current)
             else:
                 current = self.read_state()
-                if current.get("launch_id") == launch_id and not _identity_matches(current):
+                # The force handle was verified before delivery and pins this
+                # process while Windows is tearing down its image.
+                force_accepted = (force_handle is not None and
+                                  current.get("launch_id") == launch_id)
+                if (current.get("launch_id") == launch_id and
+                        not force_accepted and not _identity_matches(current)):
                     reconciled = self._reconcile_exited(current)
                     if reconciled is not None:
                         return self._stop_exit_result(*reconciled)
@@ -1327,7 +1583,7 @@ class LocalNodeManager:
             if reconciled is not None:
                 return self._stop_exit_result(*reconciled)
             raise LocalStateError("cannot reconcile process exit at stop deadline")
-        if not result["identity_verified"]:
+        if not result["identity_verified"] and force_handle is None:
             reconciled = self._reconcile_exited(current)
             if reconciled is not None:
                 return self._stop_exit_result(*reconciled)

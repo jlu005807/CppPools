@@ -14,6 +14,8 @@
 
 2026-10-15 补验更新：A01 已用本机 Oracle MySQL 8.0.11 实际通过并关闭；A02 已验证 Windows 有界退出，但重置期限负对照仍通过，因此总期限门槛保持开放。Windows HTTP 测试已可原生编译，全量构建的下一个阻断为 `test_config.cpp`。命令、结果和评审边界见 [验收报告第 8 节](completed-stages-acceptance-2026-10-14.md#8-本机真实环境补验2026-10-15)。下文任务记录保留历史状态，以本更新为准。
 
+同日后续验收：Windows start/status/stop、DACL/句柄级路径防护、file-level reparse 和 Unicode 状态目录已通过；Linux/WSL 前台真实终端、Windows 双解释器六项发行矩阵已通过。Compose 真实远程部署验收见 [验收报告 §12](completed-stages-acceptance-2026-10-14.md#12-docker-compose-远程验收与回归修复2026-10-15)，它不替代 macOS 本机管理和 A02 负对照门槛。
+
 日期：2026-10-14；审查基线：`a8acc5b09c99f7ec617b0b996747efc7d46e2681`。问题事实和复现证据见 [验收报告](completed-stages-acceptance-2026-10-14.md)，阶段进度见 [统一实施路线](implementation-roadmap.md)，协议和退出码以 [CLI 方案 §3–§5](cpl-cli-design.md) 为准。
 
 本文件已进入执行记录：F1–F7 的实现、定向回归和阶段评审已完成；F8 的 Linux/WSL 组合验收已完成，完整环境验收仍部分完成。整体复审新增 F9–F11 的实现、测试和独立代码复审已完成；Windows 慢读期限及真实 MySQL SQL mode 仍缺环境证据。A01、A02 保持开放，不把 skip 记为通过。CLI 分阶段进度见 [CLI §6.1](cpl-cli-design.md#61-当前实施进度2026-10-14)。
@@ -627,7 +629,8 @@ PYTHONPATH=sdk/python CPL_RUN_E2E=1 \
 | 门槛 | 当前状态 | 后续顺序与通过要求 |
 |---|---|---|
 | macOS 本机生命周期 | Linux /proc 实现不能外推 | 修复批次验收后补平台身份查询/锁/启停，再跑 macOS 实机矩阵 |
-| Windows 本机 start | 当前显式拒绝执行 | 先完成受限 ACL、身份/终止/锁，再实现启动和真实启停；Windows HTTP 修复不能替代它 |
+| Windows 本机 start | 已完成：真实 start/status/stop、重复 start、显式 force、独立 CLI 进程、中文/emoji 状态目录通过 | 见验收报告 §11–12；Windows 前台真实终端结果不从 Linux PTY 外推 |
+| Windows 控制目录安全 | 已完成本批：protected DACL、祖先目录句柄固定、创建/清理 junction 拒绝和 file-level reparse 实测 | 见验收报告 §12；自定义日志路径不属于控制目录防护范围 |
 | 前台输出与终端验收 | Linux/WSL 已完成：running 后即时 stderr 提示，stdout 一份最终结果；真实 PTY Ctrl+C 与慢收尾通过 | 见验收报告 §10；Windows/macOS 前台验收依赖各平台本机启动，不外推为通过 |
 | 发行版本来源 | 已完成：安装版读取 metadata，缺 metadata 才回退 0+dev | 两类入口与 metadata 在六项安装矩阵中一致，见验收报告 §9 |
 | Windows console script smoke | 已完成：修正路径且源码树外实跑通过 | 六项安装矩阵实际调用 cpl.exe 与 -m |

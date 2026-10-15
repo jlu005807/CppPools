@@ -1,6 +1,6 @@
 # `cpl` 命令行设计方案
 
-**状态**：阶段 0–2 已实现；Linux/WSL 本机生命周期及 F9–F11 修复通过；发行/兼容性和 Linux 前台就绪、真实终端 Ctrl+C 已补验，Windows/macOS 平台门槛继续保留。当前进度见 [§6.1](#61-当前实施进度2026-10-14)。
+**状态**：阶段 0–2 已实现；Linux/WSL 本机生命周期、Windows SDK start/status/stop、ACL/句柄级路径安全、file-level reparse 及 F9–F11 修复通过；发行/兼容性和 Linux 前台就绪、真实终端 Ctrl+C 已补验。Compose 的远程 health、SDK/CLI CRUD、优雅停止和数据卷恢复已在 WSL Docker Engine 验收；macOS 本机生命周期仍待对应环境。当前进度见 [§6.1](#61-当前实施进度2026-10-14)。
 **目标版本**：`cpl` v1  
 **文档修订**：R5
 
@@ -145,7 +145,7 @@ start 只有在确认旧进程已经死亡或 PID 已被复用时，才能将旧
 
 ### 3.4 本地控制通道
 
-方案为后台节点定义可选的本机参数 `--control-dir`，由 CLI 在启动时生成实例目录和随机 token。F4 已让 Linux 与 Windows C++ 服务消费同一 JSON v1 控制协议，并让 POSIX SDK 写入新协议；每次 launch 使用独立子目录，避免新启动与旧退出互相覆盖。Windows SDK 本机启动和 macOS 生命周期仍未实现或验收，不能据此称三平台生命周期均已完成。
+方案为后台节点定义可选的本机参数 `--control-dir`，由 CLI 在启动时生成实例目录和随机 token。Linux 与 Windows C++ 服务消费同一 JSON v1 控制协议；Linux 与 Windows SDK start/status/stop 已有真实进程证据。每次 launch 使用独立子目录。Windows 当前用户 + SYSTEM 受保护 DACL、父目录句柄固定、文件级 reparse 检查和中文/emoji 状态目录已实测；macOS 生命周期、Windows/macOS 前台真实终端仍有门槛，不能据此称三平台生命周期均已完成。
 
 服务完成 bind/listen 后原子写入 ready，包含 launch_id、实际端口、node_id、PID、精确 process_start_time 和状态；CLI 同时核验 ready、OS 身份和 HTTP health。配置摘要仅由 CLI 用 hashlib 记录，不要求 C++ 新增 SHA-256 实现/依赖，也不是加载证明。启动期间配置应保持不变；spawn 前/ready 后复检发现变化时，按启动失败规则请求停止并给 10 秒清理期限，已退出返回 6、仍活返回 7。v1 不做配置快照/热加载。
 
@@ -157,7 +157,7 @@ start 只有在确认旧进程已经死亡或 PID 已被复用时，才能将旧
 
 控制目录的约束：
 
-- 目录位于 CLI 状态目录下。POSIX 启动时强制目录 0700、控制文件 0600；Windows 当前依赖父目录继承的 ACL，服务检查 reparse point 但没有主动读取或强制目录 DACL。不要把 control-dir 放在其他账户可写的共享目录：reparse 检查对共享可写路径不构成无竞态保证。Windows SDK 本机启动及跨账户 hostile-path 防护留待 S2 单独实现和验收。
+- 目录位于 CLI 状态目录下。POSIX 启动时强制目录 0700、控制文件 0600；Windows 设置并验证当前用户 + SYSTEM 的受保护 DACL。读取、写入、清理期间逐级打开目录且不共享删除权限，防止父目录重命名；创建缺失目录前先固定父目录，文件读取检查已打开句柄的 reparse 属性。测试覆盖真实 junction、file-level GUID reparse 和打开时替换；这不是对同一账户其他程序的隔离保证。
 - `control.token` 和 `stop.request` 只存在受限目录；stop 请求只包含协议版本、`launch_id`、请求时间和 token，不接受任意 shell 命令。token 不出现在命令行、环境变量、stdout/stderr 或普通 status 输出中。
 - `control.meta` 在 spawn 前创建且不包含 secret；缺失、协议版本不支持或 launch_id 无效时，server fail-fast 且不写 ready。
 - starting/ready/state/stopping/stopped 文件均采用临时写入加原子替换，带协议版本与 launch_id；starting 写失败则不继续耗时初始化，fail-fast。
@@ -425,8 +425,8 @@ CRUD 在成功 HTTP 响应中遇到无效 JSON/结果结构时属于 protocol_er
 | 0 / S1 | parser、别名、帮助、模块入口已实现；离线 help/version 及参数契约已测 | 无本轮新增阻断 |
 | 1 / S1 | 严格 JSON、输出及远程 health 已实现；F6 补齐超长整数、深嵌套和运行期错误 JSON | 无本轮新增阻断 |
 | 2 / S1 | 四个 CRUD 复用 SDK；真实 HTTP 往返及既有路由/重试回归通过 | 发布时继续保留 SDK 组合回归 |
-| 3 / S2 | Linux/WSL start/status/stop、身份核验、配置一致性、退出归并已实现；前台 running 登记后即时 stderr 提示、真实 PTY Ctrl+C + 慢收尾和输出失败保留进程均已验证 | macOS 身份/生命周期；Windows 前台验收依赖该平台 start |
-| 4 / S2 | Linux 与 Windows C++ 服务使用 JSON v1 控制协议；Linux CLI 生命周期、Windows 服务 idle-stop 与目录 reparse 拒绝已有证据 | Windows SDK start、当前用户 + SYSTEM DACL、句柄级路径防护及 file-level reparse 实测；macOS 控制生命周期 |
+| 3 / S2 | Linux/WSL 与 Windows start/status/stop、身份核验、配置一致性、退出归并已实现；Windows 中文/emoji 状态目录真实启停通过；Linux 前台 running 登记后即时 stderr 提示、真实 PTY Ctrl+C + 慢收尾和输出失败保留进程均已验证 | macOS 身份/生命周期；Windows/macOS 前台真实终端验收 |
+| 4 / S2 | Linux 与 Windows C++ 服务使用 JSON v1 控制协议；Windows DACL、句柄级路径固定、目录创建/清理 junction、file-level reparse 和真实停止竞态回归已通过 | macOS 控制生命周期；Windows 自定义日志路径不属于控制目录防护范围 |
 | 5 / S2 | 安装版 metadata 版本、三类静态补全和 README 加载说明已交付；Windows 3.12.3/3.8.10 六项独立构建/安装/真实 CRUD 矩阵通过；3.8 源码单测实跑通过 | 平台生命周期仍需按第 7.4 节单独验收；macOS 发行与生命周期不能从 Windows/Linux 结果外推 |
 
 F9–F11 的实现、测试和独立代码复审已完成：前台 Ctrl+C 使用普通认证停止，graceful 后返回 `interrupted`/130；同代 stopping 可补发请求；被取消的 start 返回 6，被新代替换的旧 stop 返回 10。无需新增状态机。详见 [整体评审](completed-stages-overall-review-2026-10-14.md) 和 [修复计划第 7 节](completed-stages-fix-plan-2026-10-14.md#7-整体复审补充任务与执行结果)。
@@ -434,6 +434,8 @@ F9–F11 的实现、测试和独立代码复审已完成：前台 Ctrl+C 使用
 前台命令在 running 登记后即时将状态写 stderr，在附着结束后向 stdout 输出一个最终实例结果；携带结果的失败另写单行结构化诊断。2026-10-15 在 WSL 真实 PTY 中输入 `0x03`，验证内核将 SIGINT 发给 CLI 前台进程组，server 独立 session 不重复接收；在唯一 worker 被半包请求阻塞时，CLI 等待 graceful 后返回 130。就绪输出异常不杀 running 进程的真实测试也通过，详见验收报告 §10；这些证据仅覆盖 Linux/WSL。
 
 F9–F11 的历史测试计数保留在验收报告 §7；本轮发行/兼容性测试见 §9。S2 整体与 v1 发布仍按第 7.4 节门槛验收；A01 已有真实 MySQL SQL mode/CRUD 证据，A02 Windows 总期限的负对照门槛继续保留。
+
+本表为当前状态；后文 F4–F7 按日期保留历史实现限制，已关闭项以验收报告 §11–12 为准。Compose 部署验收见 [部署说明](docker-compose-deployment.md)，不会自动补齐 macOS 本机生命周期、Windows/macOS 前台真实终端或原生完整 CTest 的未决门槛。Unicode 状态目录通过不代表配置、数据库和二进制的所有 Unicode 路径均已验证。
 
 ### 阶段 0：契约冻结与工程骨架
 

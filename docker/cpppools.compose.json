@@ -1,0 +1,20 @@
+{
+  "server": {
+    "port": 8080,
+    "worker_threads": 2
+  },
+  "cluster": {
+    "node_id": "compose-node",
+    "epoch": 1,
+    "nodes": [{"node_id": "compose-node", "host": "127.0.0.1", "port": 8080}]
+  },
+  "datasources": [
+    {
+      "name": "main",
+      "type": "sqlite",
+      "default": true,
+      "pool_size": 2,
+      "sqlite": { "path": "/var/lib/cpppools/cpppools.db" }
+    }
+  ]
+}

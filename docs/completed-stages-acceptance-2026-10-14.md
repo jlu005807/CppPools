@@ -3,7 +3,7 @@
 > 日期：2026-10-14；代码 HEAD：`a8acc5b09c99f7ec617b0b996747efc7d46e2681`。
 > 范围：S0 五项修复、S1 远程 CLI、S2 已实现的本机管理与基础打包。S3 仅保留进度记录，S4–S7 未进入本次验收。
 > 方法：源码与方案逐项比对、独立代码审查、构建与回归、隔离真实服务及边界复现。第 1–3 节保留修复前发现；第 6 节记录 F1–F8 复验；最新整体复审结论见第 7 节。
-> 当前进度：A03–A08 与 R01–R03 在已测 Linux/WSL 范围修复复验通过；A01/A02 缺少真实环境证据，S2 平台/前台输出/发行门槛仍开放。完整阶段状态见 [CLI §6.1](cpl-cli-design.md#61-当前实施进度2026-10-14)。
+> 当前进度（2026-10-15 更新）：A01、A03–A08 与 R01–R03 已在相应实测范围修复验收；Windows 生命周期、DACL/句柄路径、文件级 reparse 和 Unicode 状态目录、本轮 Compose 真实验收见 §11–12。A02 总期限负对照、macOS 本机生命周期继续开放；S2 未整体关闭。完整阶段状态见 [CLI §6.1](cpl-cli-design.md#61-当前实施进度2026-10-14)。
 
 ## 1. 修复前验收基线
 
@@ -156,10 +156,12 @@ CLI 因此返回成功，而服务没有正常收尾。显式 force 确认退出
 
 修复门槛：仅 running 且启动身份及配置摘要匹配时幂等成功；starting/stopping 或配置变化返回既定错误码，不能重复 spawn。
 
-## 4. 已知的平台与发布范围
+## 4. 修复前的平台与发布范围
 
-- 本机管理当前仅核验 Linux `/proc` 身份；macOS 无此接口，不能把 Linux 测试写成所有 POSIX 平台通过。Windows start 仍显式拒绝执行。
-- F4 已将 Linux/WSL 生命周期的 ready/stopped marker 改为带 launch、PID 和进程启动身份的结构化证据，并覆盖原子发布、写失败和重复信号收尾；Windows 服务/control 的已测路径也已通过。macOS 生命周期、Windows SDK 本机 start 及 Windows ACL/句柄级 TOCTOU 仍未验收。
+本节保留初次评审时的缺口；2026-10-15 的关闭项以 §8–12 为准。
+
+- 本机管理已核验 Linux `/proc` 与 Windows 进程句柄身份；macOS 无此接口，不能把 Linux/Windows 测试写成所有 POSIX 平台通过。Windows SDK start/status/stop 已有真实进程证据。
+- F4 已将 Linux/WSL 生命周期的 ready/stopped marker 改为带 launch、PID 和进程启动身份的结构化证据，并覆盖原子发布、写失败和重复信号收尾；Windows 服务/control 与 SDK start/status/stop 的已测路径也已通过。macOS 生命周期、Windows ACL/句柄级 TOCTOU 仍未验收。
 - 基础 `pyproject` 和 `cpl` 入口安装通过；CLI 固定显示 `0+dev`，发行元数据为 `0.1.0`，完整发行版版本来源仍需对齐。静态补全资源未交付，独立 wheel/sdist 重建和 Python 3.8 smoke 未验收。
 - 前台当前在附着结束后输出实例结果；原规划的就绪即时输出未实现。本轮 Ctrl+C 路径有确定性模拟测试，真实终端 Ctrl+C 专项尚未执行；这些原方案门槛与 R01 修复关闭分别记录。
 - Windows 打包测试把 Scripts 目录重复拼接为 `Scripts/Scripts/cpl.exe`；属于待补的平台测试矩阵，不能由 Linux 安装 smoke 推断 Windows 发布通过。
@@ -204,7 +206,7 @@ Windows 原生复验结果：
 - 原生 `test_server_socket_live.py` 共 9 项，8 项通过、慢读 deadline 1 项因无法形成可验证远端背压而 skip。通过项覆盖延迟头、分片 header/body、空闲认证停止、control token 告警和 Windows 目录 reparse 拒绝。测试进程使用本次构建目录、MinGW 与 Python 环境的临时 PATH，未修改系统环境。
 - 全量原生 CMake build 仍在既有 `test/test_http_server.cpp:18` 因包含 POSIX `<arpa/inet.h>` 失败；所需服务、MySQL 专项和 control 专项目标已独立构建。此构建阻断不改写为通过，也不影响上述已实际运行的 Windows 专项证据。
 
-上述为 F1–F8 原范围关闭 A03–A08 的证据；F9–F11 已补齐生命周期衔接并通过本轮复验。A01、A02 保留开放，直到真实 SQL mode 服务和可验证 Windows 慢读背压环境可用。S2 整体仍未完成：macOS 生命周期、Windows 本机 start、Windows ACL/句柄边界、发行版本来源、Windows 安装 smoke、独立 wheel/sdist 与最低 Python 版本矩阵均保留在 [修复计划的平台与发行门槛](completed-stages-fix-plan-2026-10-14.md) 中。未运行 sanitizer、性能压力或长期稳定性测试，不对这些范围作通过承诺。
+上述为 F1–F8 原范围关闭 A03–A08 的证据；F9–F11 已补齐生命周期衔接并通过本轮复验。A01、A02 保留开放，直到真实 SQL mode 服务和可验证 Windows 慢读背压环境可用。S2 整体仍未完成：macOS 生命周期、Windows ACL/句柄边界与 file-level reparse 保留在 [修复计划的平台与发行门槛](completed-stages-fix-plan-2026-10-14.md) 中；Windows 本机 start、发行版本来源、Windows 安装 smoke、独立 wheel/sdist 与最低 Python 版本矩阵已在后续章节补验。未运行 sanitizer、性能压力或长期稳定性测试，不对这些范围作通过承诺。
 
 ## 7. 整体复审补充（2026-10-14）
 
@@ -264,7 +266,7 @@ ctest --test-dir build-accept-s0-s2 --output-on-failure
 | 补全资源 | wheel 和重建 wheel 均含 `cpl.bash`、`_cpl`、`cpl.ps1`；直接 sdist 安装也检查三类资源。实际 Bash 候选和 PowerShell 5.1 `CompleteInput` 通过；评审发现 PowerShell 忽略中间光标位置，新增 RED 后修正，两个中间光标回归通过。WSL 提取 Ubuntu zsh 5.9 包到忽略目录，`compinit` 注册和 `autoload +X _cpl` 加载实际成功；未把加载 smoke 表述为完整交互候选测试。README 提供三种 shell 的资源定位与加载命令。 |
 | Python 3.8 源码兼容 | 真实 Python 3.8.10，`-W error` 全量 178 项：129 通过、49 按 Windows/POSIX/live 条件跳过，退出 0；没有设置 live 环境。修正仅测试夹具的 Windows 可执行文件后缀，避免 `shutil.which` 的 PATHEXT 差异。 |
 | Windows 存活检查 | 全量 suite 两次收到非预期 KeyboardInterrupt，单独 socket suite 正常。定位 `_pid_alive` 在 Windows 使用 `os.kill(pid, 0)`，该平台的 0 是 CTRL_C_EVENT。改用 SYNCHRONIZE 进程句柄与零超时等待，不发送事件；真实当前/活子进程/退出子进程验证通过。评审补齐 DWORD PID 上界与未知 OpenProcess 错误的 RED→GREEN，未知错误不得当作进程已退出。独立评审连续 1000 次真实探测句柄数 163→163，等待各分支正确关闭句柄。 |
-| Windows 组合回归 | 最终句柄修正后，Python 3.12.3 全量 live 配置 178 项：141 通过、37 跳过，退出 0，用时 35.073 秒；句柄定向 5/5 通过。Windows start/macOS 仍不可由这些结果宣称可用。 |
+| Windows 组合回归 | Windows Python 3.12.3 `-W error` 全量 184 项：142 通过、42 跳过，退出 0，用时 28.507 秒；其中 Windows 本机 start/status/stop、重复 start、force 定向 4/4 通过。Windows ACL 仍保留 RED 证据：新控制目录继承 CODEXSANDBOXUSERS、域用户和 Administrators，尚未达到仅当前用户+SYSTEM、禁用继承的门槛。macOS 不在本机可验收范围。 |
 | Linux 组合回归 | WSL Python 3.12.3、真实 server、`CPL_RUN_E2E=1`，`-W error` 全量 178 项：172 通过、6 跳过，退出 0，用时 47.823 秒；包括既有生命周期和 Bash 实际候选项。 |
 
 构建器：Python 3.12.3，`build 1.3.0`、`setuptools 80.9.0`、`wheel 0.45.1`；安装环境冻结 `pip 24.3.1`、`setuptools 68.2.2`、`wheel 0.45.1`，通过本地 wheelhouse 离线获取，避免 Python 3.8 随附旧 pip 的 TLS/proxy 故障。Python 3.8.10 使用官方 NuGet runtime，未修改系统 Python 注册或 PATH；下载包 SHA256 为 `C63A2FC8FC62612B5ABD391FDA99AE1D90BAD42ED8A9E99B1BD81C7FFDB4FEFA`。
@@ -284,7 +286,7 @@ D:/Anaconda/python.exe -W error -m unittest sdk.python.tests.test_cli_packaging.
 
 产物本地保留在 `output/release-s2-20261015/cpppools_distribution_qm0vsl_p/`，不提交二进制构建产物。句柄错误分类修正由后续源码定向/组合回归单独覆盖，不用前面的包安装 smoke 冒充错误注入测试。
 
-独立评审已完成，所提补全光标、产物目录和句柄检查问题均修正复验。S2 的 Windows start/ACL/句柄级路径防护、file-level reparse、macOS 生命周期、前台就绪即时提示与真实终端 Ctrl+C 仍待完成；A02 总期限负对照仍开放。未接入 Redis RowCache 或动态发现。
+独立评审已完成，所提补全光标、产物目录和句柄检查问题均修正复验。S2 的 Windows ACL/句柄级路径防护、file-level reparse、macOS 生命周期仍待完成；Windows start、前台就绪即时提示、真实终端 Ctrl+C 和发行门槛已在后续章节补验。A02 总期限负对照仍开放。未接入 Redis RowCache 或动态发现。
 
 ## 10. S2 前台就绪与真实终端补验（2026-10-15）
 
@@ -311,4 +313,62 @@ PYTHONPATH=sdk/python CPL_RUN_E2E=1 \
   python3 -W error -m unittest discover -s sdk/python/tests
 ```
 
-本节的终端证据覆盖**单次** Ctrl+C。停止等待期间再次 Ctrl+C 仍可能传播 KeyboardInterrupt 并保留进程，这是既有行为，本批没有把它记为已通过的重复中断验收。Windows start/ACL/句柄级路径防护与 file-level reparse、macOS 生命周期、A02 总期限负对照继续开放；S2 整体和 v1 尚未验收，Redis RowCache/动态发现仍待后续阶段。
+本节的终端证据覆盖**单次** Ctrl+C。停止等待期间再次 Ctrl+C 仍可能传播 KeyboardInterrupt 并保留进程，这是既有行为，本批没有把它记为已通过的重复中断验收。Windows start 已通过真实生命周期补验；Windows ACL/句柄级路径防护与 file-level reparse、macOS 生命周期、A02 总期限负对照继续开放。S2 整体和 v1 尚未验收，Redis RowCache/动态发现仍待后续阶段。
+
+## 11. S2 Windows 本机生命周期补验（2026-10-15）
+
+本节基于当前工作区 Windows 原生构建 `build-redis-verify-off2/bin/cpppools_server.exe`、Anaconda Python 3.12.3 和本机 loopback/SQLite 临时库。
+
+以下表格记录本批早期结果，包含 ACL 的 RED；后续 DACL/句柄路径与文件级 reparse 的 GREEN 见 §12，不再将这些项列为当前待办。
+
+| 项目 | 实际结果 |
+|---|---|
+| Windows SDK start/status/stop | 先运行旧行为测试，`LocalNodeManager.start` 明确抛出 `Windows local start is not supported`（RED）。实现 Windows 进程句柄存活检查、映像路径和 FILETIME 创建时间核验、非阻塞实例锁、独立进程组、控制请求优雅停止和句柄强杀后，真实 `start → status → stop` 通过。 |
+| 重复启动与配置一致性 | 相同 binary/config/workdir 的第二次 start 返回 `already_running=true` 且 launch_id 不变；不同 workdir 被拒绝；真实测试通过。 |
+| 显式 force | Windows 没有 `signal.SIGKILL`，首轮真实测试暴露该平台差异；改用进程句柄 `TerminateProcess`，并允许 accepted force 后等待进程退出。真实 force 结果为 `ExitOutcome` code 9、`exit_kind=forced`、进程已退出。 |
+| Windows 组合回归 | Python 3.12.3 `-W error` 全量 184 项：142 通过、42 跳过，退出 0，用时 28.507 秒；POSIX pidfd 测试改为 POSIX 门控。Windows 原生 socket/control 12 项中 11 通过、1 项慢读背压 skip；`test_local_control` 1/1 通过，但 file-level symbolic-link 子用例因当前账户权限 skip。 |
+| ACL 门槛 | 实际运行 `icacls` 发现新 control directory 继承 `CODEXSANDBOXUSERS`、域用户和 Administrators，同时有 SYSTEM；不满足设计要求的仅当前用户+SYSTEM、禁用继承。该 RED 证据保留，ACL 未关闭。 |
+
+Windows 的 `LocalNodeManager.start/status/stop` 已关闭本机生命周期门槛，但不能把它扩展为 Windows ACL/句柄级路径防护完成。file-level reparse 尚未独立实测；directory junction reparse 已通过。macOS 当前环境无法验收，A02 总期限负对照仍开放。
+
+## 12. Docker Compose 远程验收与回归修复（2026-10-15）
+
+本批针对“Compose 管容器启停，SDK/CLI 管远程 health 和 CRUD”的交付做了真实验证，并修复了验收中发现的地址和清理边界问题。
+
+| 项目 | 实际结果 |
+|---|---|
+| Compose 运行 | WSL Ubuntu Docker Engine 29.1.3、Compose 2.40.3；唯一 project name、随机宿主机端口、真实镜像多阶段构建，服务健康检查通过。镜像内以 UID 10001 的 `cpppools` 非 root 用户运行。 |
+| SDK/CLI 远程操作 | SDK `ClusterClient` 实际完成 insert/select/update；CLI 实际完成 health、insert/select/update/delete。拓扑中的 `cluster.nodes` 发布地址与随机宿主端口一致，避免 SDK 从 seed 跳到错误的固定 8080。 |
+| 生命周期和持久化 | `docker compose stop` 后容器退出码 0 且未 OOM；`down` 后保留命名卷重新 `up`，SDK 读回停止前数据，随后完成 delete/select 空结果。测试结束仅清理本次唯一 project 的卷。 |
+| Windows 路径安全 | 控制目录设置并核验仅当前用户和 SYSTEM 的 protected DACL；逐级持有不共享删除的目录句柄。真实 ancestor junction 的创建与 secret 清理回归通过；Python 的打开后文件属性检查、C++ file-level GUID reparse 分支独立实测通过，不依赖符号链接创建权限。 |
+| 停止竞态修复 | 优雅 stop 在服务刚退出后打开等待句柄的竞态归并已写入的 `stopped` 证据，不误报身份错误。真实服务退出后再打开句柄的可控交错测试由 RED 转 GREEN。 |
+| Unicode 状态目录 | 中文及非 BMP emoji 的 `state_root` 真实启动先失败，报 `filesystem ... Illegal byte sequence`。Windows 控制参数改从 Unicode 命令行读取，内部用 UTF-8 保存、`fs::u8path` 还原；真实 start/status/graceful stop 通过。只覆盖控制路径，未据此承诺配置文件、数据库或二进制所有 Unicode 路径都已验收。 |
+| 本批最终测试 | Compose 定义/隔离和真实 smoke 共 5/5；Windows Python `-W error` 全量 202 项中 159 通过、43 跳过（44.344 秒）；WSL Python live 全量 202 项中 179 通过、23 跳过（50.331 秒）；WSL C++ CTest 20/20（45.01 秒），均退出 0。Windows 全量包含控制文件 5 项和真实本机生命周期 7 项；原生 `test_local_control` 输出 `Windows file-level GUID reparse fixture exercised` 后退出 0。 |
+| 最终发行回归 | 包含本批 Windows 生产修改的干净源码独立构建 wheel、sdist、从 sdist 重建 wheel；Windows Python 3.12.3/3.8.10 × 三种产物，共六项源码树外安装、入口/metadata 版本、补全资源及真实 CRUD 全部通过。矩阵退出 0，用时 132.883 秒；产物保留于 `output/release-s2-20261015/cpppools_distribution_3bwslzq2/`，不提交构建产物。 |
+| 最低 Python 版本回归 | 同一最终源码在真实 Windows Python 3.8.10 下设置 live 环境后，`-W error` 全量 202 项中 159 通过、43 跳过（47.758 秒），退出 0；Windows 控制文件和真实生命周期均执行，未以安装版远程 CRUD 代替本机管理兼容性。 |
+
+Compose smoke 不代表 macOS 本机生命周期已验收，也不关闭 A02 Windows 慢读客户端总期限负对照。Windows 全量原生 CTest 仍受 `test_config.cpp` 的 POSIX API 编译阻断；本轮构建了所需服务和控制专项。自定义 `log_file` 的 hostile reparse 路径不属于控制目录防护范围。Redis RowCache、动态发现仍未实现。
+
+本批最终生产补丁经独立复审，无剩余 Critical/Important；Compose 地址说明和路线待办中的两处旧表述已同步修正。构建仍有既有编译告警；WSL 的 Windows 挂载目录还出现亚秒级 clock-skew 告警，不能将结果表述为零告警构建。
+
+可重复入口从仓库根执行：
+
+```powershell
+$env:PYTHONUTF8='1'
+$env:PYTHONPATH='sdk/python'
+$env:CPL_RUN_E2E='1'
+$env:CPL_TEST_SERVER=(Resolve-Path build-redis-verify-off2/bin/cpppools_server.exe).Path
+# PATH 需要包含该构建使用的 MinGW 和 SQLite 运行时 DLL 目录。
+D:/Anaconda/python.exe -W error -m unittest discover -s sdk/python/tests
+```
+
+```bash
+cmake --build build-accept-s0-s2 --parallel 2
+ctest --test-dir build-accept-s0-s2 --output-on-failure
+PYTHONPATH=sdk/python CPL_RUN_E2E=1 \
+  CPL_TEST_SERVER="$PWD/build-accept-s0-s2/bin/cpppools_server" \
+  CPL_PACKAGING_WHEELHOUSE="$PWD/output/release-wheelhouse" \
+  python3 -W error -m unittest discover -s sdk/python/tests
+PYTHONPATH=sdk/python CPL_RUN_DOCKER=1 \
+  python3 -W error -m unittest sdk.python.tests.test_docker_compose -v
+```

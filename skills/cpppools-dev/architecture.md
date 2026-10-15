@@ -14,8 +14,13 @@ SDK 由 seed URL 拉取任一可达节点的 `/api/v1/cluster` 完整视图，�
 同一组实际数据库；节点之间不传播连接配置或凭据。摘要比对只检查目标字符串，
 SDK 初始化时记录 `digest_warnings`，不阻断、不同步数据，也不验证 schema。
 
+Docker Compose 负责容器启停，SDK/CLI 通过发布的 HTTP 端口访问。
+SDK 拉到拓扑后使用 `cluster.nodes` 地址发 CRUD，所以容器内监听端口和
+宿主发布端口不同时，配置要填写 SDK 可达的宿主地址/端口。
+
 缓存是节点进程内的分片 `unordered_map` + LRU 链表；每数据源一份共享实例，
-由该数据源的全部连接装饰器使用。跨节点不共享缓存，Redis 尚未实现。
+由该数据源的全部连接装饰器使用。跨节点不共享缓存，Redis 尚未接入 RowCache；
+S3 只有配置与可选 transport 基础，不能据此声称已有 Redis 行缓存。
 路由环哈希决定 owner，本地哈希决定缓存分片，两者用途不同。
 
 集群 e2e 的独立 SQLite 库是路由测试环境。源码没有数据库复制/迁移机制，
@@ -65,7 +70,7 @@ sdk/python/cpppools/         零依赖 SDK
 ```
 accept（poll 200ms 唤醒，优雅停机检查点）
  └─ ThreadPool::submit_detached(handle_client)      队列满 → accept 层 503
-     └─ 解析请求行/头（零拷贝）+ Content-Length 读体（上限 1MB）
+     └─ 解析请求行/头（零拷贝）+ Content-Length 读体（上限 64 KiB）
          └─ route_table 匹配（constexpr 表 + switch 全覆盖）
              ├─ 集群头解析：X-CppPools-Fallback / Epoch / Rejoin
              │    └─ Rejoin → handle_rejoin（10s CAS 节流清缓存，规则 B）
@@ -113,14 +118,15 @@ accept（poll 200ms 唤醒，优雅停机检查点）
 
 | 层 | 入口 | 钉住什么 |
 |---|---|---|
-| C++ 默认 18 / MySQL 启用时注册 20 项 | `ctest --test-dir build` | SQLite 裸后端与装饰器 conformance 双跑；MySQL 为两个独立专项，缺少测试账号会返回 0 跳过，不能据此声称验证了 MySQL |
-| SDK 单测（实测 60 项） | `unittest discover -s sdk/python/tests` | 黄金向量跨语言、错误矩阵、路由/绕行/全黑/Rejoin/epoch/畸形拓扑 |
+| C++ 注册项随构建开关和平台变化 | `ctest --test-dir build --output-on-failure` | SQLite 裸后端与装饰器 conformance 双跑；MySQL 两个独立专项缺账号会内部跳过，需看输出；本机 OFF 构建最新 20 项 |
+| SDK/CLI 单测与 live 门控 | `unittest discover -s sdk/python/tests` | 黄金向量、重试/路由、CLI、生命周期与发行；设置 CPL_TEST_SERVER/CPL_RUN_E2E 后运行对应真实用例 |
+| Compose 真实验收 | `CPL_RUN_DOCKER=1` + `test_docker_compose` | 镜像构建、远程 health/CRUD、非 root、stop 与持久卷；默认静态检查不代替 live |
 | live e2e ×2 | `scripts/cluster_e2e.sh`、`scripts/sdk_e2e.sh` | 稳态 0 个 307 = 两端环一致；杀节点/归队/滚动重启全链路 |
 | 压测 | `scripts/loadtest_sdk.py` | 缓存对照、归队风暴观测（docs/benchmarks/ 归档） |
 
 ## 6. 已知边界（改动时别踩）
 
-- 服务端 HTTP：Connection: close，无 keep-alive/chunked/TLS；请求行 4095B / 体 1MB。
+- 服务端 HTTP：Connection: close，无 keep-alive/chunked/TLS；请求行 4095B / 体 64 KiB。
 - SQLite：不支持 BLOB 列 / WITHOUT ROWID；`:memory:` 字面路径强制单槽；单写者模型。
 - 集群：缓存命中仍需借连接（pool_size 即并发上限）；SDK 无连接复用。
   独立数据库的故障绕行和改环不保证数据收敛，须满足共享实际数据源前提。

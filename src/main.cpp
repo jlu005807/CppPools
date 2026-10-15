@@ -17,8 +17,15 @@
 #include <cstdlib>
 #include <iostream>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <shellapi.h>
 #include <process.h>
 #else
 #include <unistd.h>
@@ -103,15 +110,48 @@ HttpServerConfig build_server_config_from_env() {
     return cfg;
 }
 
-std::string argument_value(int argc, char** argv, const char* option) {
+std::string control_directory_argument(int argc, char** argv) {
+#ifdef _WIN32
+    // Narrow CRT argv uses the system code page and loses paths outside it.
+    (void)argc;
+    (void)argv;
+    int wide_argc = 0;
+    const std::unique_ptr<wchar_t*, decltype(&LocalFree)> wide_argv(
+        CommandLineToArgvW(GetCommandLineW(), &wide_argc), &LocalFree);
+    if (!wide_argv) {
+        throw std::runtime_error("could not read Unicode command line");
+    }
+    for (int i = 1; i < wide_argc; ++i) {
+        if (std::wstring(wide_argv.get()[i]) != L"--control-dir") {
+            continue;
+        }
+        if (i + 1 >= wide_argc || wide_argv.get()[i + 1][0] == L'\0') {
+            throw std::invalid_argument("--control-dir requires a path argument");
+        }
+        const std::wstring value(wide_argv.get()[i + 1]);
+        const int length = static_cast<int>(value.size());
+        const int size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+            value.data(), length, nullptr, 0, nullptr, nullptr);
+        if (size == 0) {
+            throw std::invalid_argument("--control-dir is not valid Unicode");
+        }
+        std::string result(static_cast<std::size_t>(size), '\0');
+        if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(), length,
+                               result.data(), size, nullptr, nullptr) != size) {
+            throw std::runtime_error("could not encode control directory as UTF-8");
+        }
+        return result;
+    }
+#else
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == option) {
+        if (std::string(argv[i]) == "--control-dir") {
             if (i + 1 >= argc || argv[i + 1][0] == '\0') {
-                throw std::invalid_argument(std::string(option) + " requires a path argument");
+                throw std::invalid_argument("--control-dir requires a path argument");
             }
             return argv[i + 1];
         }
     }
+#endif
     return {};
 }
 
@@ -296,7 +336,7 @@ int main(int argc, char** argv) {
     std::unique_ptr<LocalControl> control;
     std::unique_ptr<ManagedStopBridge> managed_bridge;
     try {
-        control_dir = argument_value(argc, argv, "--control-dir");
+        control_dir = control_directory_argument(argc, argv);
         if (!control_dir.empty()) {
             std::string error;
             control = LocalControl::open(control_dir, &error);

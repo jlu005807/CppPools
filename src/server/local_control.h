@@ -34,7 +34,7 @@ private:
     bool write_json(const char* filename, const void* document,
                     std::string* error) const;
 
-    std::string dir_;
+    std::string dir_;  // UTF-8, including on Windows.
     LocalIdentity identity_;
     std::string token_;
 };

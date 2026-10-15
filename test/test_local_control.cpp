@@ -16,6 +16,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <process.h>
+#include <aclapi.h>
+#include <winioctl.h>
 #else
 #include <unistd.h>
 #endif
@@ -134,10 +136,28 @@ void test_symlink_metadata_is_rejected() {
         const DWORD error = GetLastError();
         if (error == ERROR_PRIVILEGE_NOT_HELD || error == ERROR_ACCESS_DENIED ||
             error == ERROR_INVALID_PARAMETER) {
-            std::cerr << "SKIP: Windows symlink/reparse test needs Developer Mode or privilege\n";
-            return;
+            // An unknown GUID tag is an actual file-level reparse point and
+            // needs no symlink privilege. Both use the same rejection branch.
+            write_file(link, "");
+            HANDLE file = CreateFileW(link.c_str(), GENERIC_WRITE, 0, nullptr,
+                                      OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+            assert(file != INVALID_HANDLE_VALUE);
+            struct ReparseData {
+                DWORD tag;
+                WORD length;
+                WORD reserved;
+                GUID guid;
+            } data{0x42, 0, 0,
+                   {0xaaac7164, 0xcf2b, 0x4d13, {0xae, 0x67, 0x81, 0xbe, 0x63, 0x0a, 0xd3, 0xe0}}};
+            DWORD returned = 0;
+            assert(DeviceIoControl(file, FSCTL_SET_REPARSE_POINT, &data, sizeof(data),
+                                    nullptr, 0, &returned, nullptr));
+            CloseHandle(file);
+            assert(GetFileAttributesW(link.c_str()) & FILE_ATTRIBUTE_REPARSE_POINT);
+            std::cout << "Windows file-level GUID reparse fixture exercised\n";
+        } else {
+            assert(false && "CreateSymbolicLinkW failed unexpectedly");
         }
-        assert(false && "CreateSymbolicLinkW failed unexpectedly");
     }
     assert(!opens(temp.path));
 #else
@@ -147,6 +167,36 @@ void test_symlink_metadata_is_rejected() {
     fs::rename(temp.path / "control.meta", actual);
     fs::create_symlink(actual.filename(), temp.path / "control.meta");
     assert(!opens(temp.path));
+#endif
+}
+
+void test_windows_control_directory_is_private() {
+#ifdef _WIN32
+    TempDir temp;
+    write_meta(temp.path);
+    std::string error;
+    auto control = LocalControl::open(temp.path.string(), &error);
+    if (!control) { std::cerr << "ACL open failed: " << error << "\n"; }
+    assert(control);
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    PACL acl = nullptr;
+    assert(GetNamedSecurityInfoW(const_cast<wchar_t*>(temp.path.c_str()), SE_FILE_OBJECT,
+                                 DACL_SECURITY_INFORMATION, nullptr, nullptr, &acl,
+                                 nullptr, &descriptor) == ERROR_SUCCESS);
+    SECURITY_DESCRIPTOR_CONTROL flags = 0;
+    DWORD revision = 0;
+    assert(GetSecurityDescriptorControl(descriptor, &flags, &revision));
+    assert(flags & SE_DACL_PROTECTED);
+    assert(acl && acl->AceCount == 2);
+    for (DWORD index = 0; index < acl->AceCount; ++index) {
+        void* raw = nullptr;
+        assert(GetAce(acl, index, &raw));
+        const auto* ace = static_cast<ACCESS_ALLOWED_ACE*>(raw);
+        assert(ace->Header.AceType == ACCESS_ALLOWED_ACE_TYPE);
+        assert((ace->Header.AceFlags & INHERITED_ACE) == 0);
+        assert(ace->Mask == FILE_ALL_ACCESS);
+    }
+    LocalFree(descriptor);
 #endif
 }
 
@@ -243,6 +293,7 @@ void test_marker_schema_and_managed_stop_flag() {
 }  // namespace
 
 int main() {
+    test_windows_control_directory_is_private();
     test_meta_requires_v1_and_launch_id();
     test_corrupt_and_oversize_metadata_are_rejected();
     test_symlink_metadata_is_rejected();

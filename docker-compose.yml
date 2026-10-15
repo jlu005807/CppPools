@@ -1,0 +1,26 @@
+services:
+  cpppools:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    ports:
+      # 改宿主机端口时，须同步配置中 cluster.nodes 的发布端口。
+      - "127.0.0.1:${CPPPOOLS_PORT:-8080}:8080"
+    volumes:
+      - cpppools-data:/var/lib/cpppools
+      - type: bind
+        source: ${CPPPOOLS_CONFIG_FILE:-./docker/cpppools.compose.json}
+        target: /etc/cpppools/config.json
+        read_only: true
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/health"]
+      interval: 5s
+      timeout: 2s
+      retries: 12
+      start_period: 5s
+
+volumes:
+  cpppools-data:
