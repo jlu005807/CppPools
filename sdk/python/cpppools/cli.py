@@ -518,13 +518,15 @@ def run_crud(args):
     return 0
 
 
-def _print_local_result(result, output):
+def _print_local_result(result, output, stream=None):
     if output == "json":
-        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")),
+              file=stream, flush=True)
         return
     print("%s %s endpoint=%s pid=%s" %
           (result.get("state", "unknown"), result.get("name", ""),
-           result.get("endpoint") or "-", result.get("pid") or "-"))
+           result.get("endpoint") or "-", result.get("pid") or "-"),
+          file=stream, flush=True)
 
 
 def _run_local(args, operation):
@@ -535,7 +537,9 @@ def _run_local(args, operation):
         elif operation == "start":
             result = manager.start(config=args.config, binary=args.binary,
                                    workdir=args.workdir, log_file=args.log_file,
-                                   timeout=args.timeout, foreground=args.foreground)
+                                   timeout=args.timeout, foreground=args.foreground,
+                                   on_ready=(lambda ready: _print_local_result(
+                                       ready, args.output, stream=sys.stderr)) if args.foreground else None)
         else:
             result = manager.stop(timeout=args.timeout, force=args.force)
         _print_local_result(result, args.output)

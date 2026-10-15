@@ -285,3 +285,30 @@ D:/Anaconda/python.exe -W error -m unittest sdk.python.tests.test_cli_packaging.
 产物本地保留在 `output/release-s2-20261015/cpppools_distribution_qm0vsl_p/`，不提交二进制构建产物。句柄错误分类修正由后续源码定向/组合回归单独覆盖，不用前面的包安装 smoke 冒充错误注入测试。
 
 独立评审已完成，所提补全光标、产物目录和句柄检查问题均修正复验。S2 的 Windows start/ACL/句柄级路径防护、file-level reparse、macOS 生命周期、前台就绪即时提示与真实终端 Ctrl+C 仍待完成；A02 总期限负对照仍开放。未接入 Redis RowCache 或动态发现。
+
+## 10. S2 前台就绪与真实终端补验（2026-10-15）
+
+基于 `6c3696e` 补齐 CLI 阶段 3 的 Linux 前台交付。此前 §9 的前台残项在本节所测范围关闭，Windows/macOS 平台状态不外推。
+
+- **RED**：CLI 就绪即时诊断测试返回 6（缺少 `on_ready`）；真实进程回调测试因接口不存在失败，真实 PTY 用例等待 10 秒没有就绪输出而失败。
+- **修改**：`LocalNodeManager.start` 在 running 状态提交、进程保留标记设置后调用可选 `on_ready`，再等待前台进程；CLI 将该状态立即 flush 到 stderr。stdout 仍只输出最终结果；已登记后的提示输出异常保留进程，不走就绪前清理强杀。
+- **真实 PTY GREEN**：Linux/WSL、Python 3.12.3、`build-accept-s0-s2/bin/cpppools_server`。实际控制终端的前台进程组为 CLI，server 使用独立 session。唯一 worker 被不完整 HTTP body 阻塞且 health 探针超时时，向 PTY 写 `0x03`，由终端 ISIG 产生 SIGINT；CLI 等待真实 graceful 收尾后返回 130，server 退出码 0、launch 不变，stdout 恰好一份最终 JSON，stderr 有就绪和中断诊断，token/stop.request 清除且 token 未输出。
+- **异常边界 GREEN**：就绪通知抛 RuntimeError 的真实服务测试确认 running 登记和进程仍在、身份可核验，随后可正常 stop。新增两个 live 用例最终修正夹具后 2/2 通过，6.017 秒。
+- **组合回归**：生产代码最终版本的 `-W error` 全量 live 套件，Linux/WSL 181 项中 175 通过、6 跳过（56.007 秒）；Windows 181 项中 142 通过、39 跳过（37.945 秒），均退出 0。Python 3.8.10 的 CLI 本机分发/parser 定向 14/14 通过（0.414 秒）；其全量与发行证据另见 §9。
+- **最终发行回归**：包含本批前台生产修改的干净源码再次独立构建 wheel/sdist/重建 wheel，Windows 3.12.3/3.8.10 六项安装与真实 CRUD 全部通过，矩阵退出 0，用时 132.530 秒。产物保留于 `output/release-s2-20261015/cpppools_distribution_e2xndjyl/`。
+- **评审与回归修正**：独立评审确认生产回调/状态/信号/输出契约无新阻断，复现了夹具停止失败后遗留 server 的问题。夹具改为仅在确认退出后删除目录：本次自有 Popen 有界回收；CLI 创建的服务须核对本次配置、binary、workdir、launch/PID/创建身份，再走已验证信号路径；无法确认则保留登记目录。实际启动两个 native server 并注入 stop 超时，拥有 Popen 与分离 manager 两条清理后备均验证进程退出和目录删除。CLI 子进程自身也补齐超时 kill/reap。早期 starting/PID 未知时明确保留目录，独立隔离 probe 验证不会删除；最终复审无剩余 Critical/Important。此后备只属于测试失败清理，不改变生产自动强杀禁令。
+
+真实入口：
+
+```bash
+PYTHONPATH=sdk/python \
+  CPL_TEST_SERVER="$PWD/build-accept-s0-s2/bin/cpppools_server" \
+  python3 -W error -m unittest sdk.python.tests.test_foreground_live -v
+
+PYTHONPATH=sdk/python CPL_RUN_E2E=1 \
+  CPL_TEST_SERVER="$PWD/build-accept-s0-s2/bin/cpppools_server" \
+  CPL_PACKAGING_WHEELHOUSE="$PWD/output/release-wheelhouse" \
+  python3 -W error -m unittest discover -s sdk/python/tests
+```
+
+本节的终端证据覆盖**单次** Ctrl+C。停止等待期间再次 Ctrl+C 仍可能传播 KeyboardInterrupt 并保留进程，这是既有行为，本批没有把它记为已通过的重复中断验收。Windows start/ACL/句柄级路径防护与 file-level reparse、macOS 生命周期、A02 总期限负对照继续开放；S2 整体和 v1 尚未验收，Redis RowCache/动态发现仍待后续阶段。

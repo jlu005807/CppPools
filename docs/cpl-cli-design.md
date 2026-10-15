@@ -1,8 +1,8 @@
 # `cpl` 命令行设计方案
 
-**状态**：阶段 0–2 已实现；Linux/WSL 本机生命周期及 F9–F11 修复已通过定向与组合回归；阶段 3–5 的平台与发行门槛尚未全部关闭。当前进度见 [§6.1](#61-当前实施进度2026-10-14)。  
+**状态**：阶段 0–2 已实现；Linux/WSL 本机生命周期及 F9–F11 修复通过；发行/兼容性和 Linux 前台就绪、真实终端 Ctrl+C 已补验，Windows/macOS 平台门槛继续保留。当前进度见 [§6.1](#61-当前实施进度2026-10-14)。
 **目标版本**：`cpl` v1  
-**文档修订**：R4
+**文档修订**：R5
 
 **修订日期**：2026-10-15
 **适用范围**：CppPools Python SDK 的命令行入口，以及本机 CppPools 节点的生命周期管理。
@@ -262,7 +262,7 @@ cpl start -c CONFIG [-n NAME] [-b BINARY] [-W WORKDIR]
 3. 同时观察子进程退出、ready 文件和 `/health`。只收到旧进程或其他服务的 200 不能判定启动成功。
 4. 成功后按状态提交规则写 running，再输出 endpoint/PID/日志；endpoint 使用 ready 的实际 port 与本机 loopback。若并发 stop 已让本代进入 stopping/stopped/crashed，start 不得写回 running，返回 6、输出最新状态。启动超时先请求优雅停止，另给固定 10 秒清理期限；退出后返回 6，仍活返回 7 并保留控制信息，不自动强杀。
 5. 前后台都登记状态。后台 POSIX 用独立 session，Windows 用脱离调用终端的进程启动标志并隐藏窗口；stdin 为 DEVNULL、stdout/stderr 写日志，以参数数组启动且 shell=false。`-F` 由 CLI 保持附着，server 使用独立进程组防止 Ctrl+C 被双方重复处理；server stdout/stderr 写日志或转发到 CLI stderr，CLI stdout 只输出结果。另一 CLI 可 stop/status；CLI 被单独关闭时保留可恢复登记。
-6. 已完成就绪登记的前台附着阶段，正常 graceful 退出返回 0，异常/无法确认退出返回 10，显式 force 且确认退出返回 9；就绪前失败按前述 start 规则。Ctrl+C 使用默认 stop 的 10 秒等待：确认 graceful 退出返回 130，超时返回 7，身份/状态失败返回 8/10，不自动强杀。阶段 3 SIGTERM、阶段 4 控制文件；原规划的前台就绪即时输出及当前输出时机差异见 §6.1。
+6. 已完成就绪登记的前台附着阶段，正常 graceful 退出返回 0，异常/无法确认退出返回 10，显式 force 且确认退出返回 9；就绪前失败按前述 start 规则。Ctrl+C 使用默认 stop 的 10 秒等待：确认 graceful 退出返回 130，超时返回 7，身份/状态失败返回 8/10，不自动强杀。阶段 3 SIGTERM、阶段 4 控制文件。前台就绪登记完成后立即在 stderr 输出并 flush 一份 running 状态，再附着等待；stdout 只在结束后输出最终结果。
 
 ### 4.5 `stop`
 
@@ -366,6 +366,8 @@ cpl stop -n dev-a -t 10
 
 非 CRUD JSON 输出如下；stdout 至多一个完整 UTF-8 JSON 文档加换行，未获得的信息为 null，token 永不输出。health 的部分失败仍输出完整数组，stop 超时/强杀仍输出实例结果，诊断另写 stderr。参数解析失败沿用 argparse 用法文字；运行期 JSON 错误在 stderr 输出 error 对象，不打印 traceback。
 
+`start -F` 的就绪提示属于诊断，写 stderr；JSON 模式为单行 running 状态，table 模式为状态摘要。前台失败或中断时，stderr 后续还会出现单行错误对象，因此不能把整个前台 stderr 当作一份 JSON 解析；stdout 仍只有最终实例对象。就绪提示只在 running 状态提交后发出，提示输出失败保留已登记进程，不自动杀进程。
+
 | 命令 | JSON 字段 |
 |---|---|
 | start | name、launch_id、pid、endpoint、state、log_file、already_running |
@@ -423,13 +425,13 @@ CRUD 在成功 HTTP 响应中遇到无效 JSON/结果结构时属于 protocol_er
 | 0 / S1 | parser、别名、帮助、模块入口已实现；离线 help/version 及参数契约已测 | 无本轮新增阻断 |
 | 1 / S1 | 严格 JSON、输出及远程 health 已实现；F6 补齐超长整数、深嵌套和运行期错误 JSON | 无本轮新增阻断 |
 | 2 / S1 | 四个 CRUD 复用 SDK；真实 HTTP 往返及既有路由/重试回归通过 | 发布时继续保留 SDK 组合回归 |
-| 3 / S2 | Linux/WSL start/status/stop、身份核验、配置一致性、退出归并已实现；F9–F11 补齐前台中断、续停和旧命令结果归属 | macOS 身份/生命周期；真实终端 Ctrl+C 专项证据；原规划的就绪即时输出尚未实现 |
+| 3 / S2 | Linux/WSL start/status/stop、身份核验、配置一致性、退出归并已实现；前台 running 登记后即时 stderr 提示、真实 PTY Ctrl+C + 慢收尾和输出失败保留进程均已验证 | macOS 身份/生命周期；Windows 前台验收依赖该平台 start |
 | 4 / S2 | Linux 与 Windows C++ 服务使用 JSON v1 控制协议；Linux CLI 生命周期、Windows 服务 idle-stop 与目录 reparse 拒绝已有证据 | Windows SDK start、当前用户 + SYSTEM DACL、句柄级路径防护及 file-level reparse 实测；macOS 控制生命周期 |
 | 5 / S2 | 安装版 metadata 版本、三类静态补全和 README 加载说明已交付；Windows 3.12.3/3.8.10 六项独立构建/安装/真实 CRUD 矩阵通过；3.8 源码单测实跑通过 | 平台生命周期仍需按第 7.4 节单独验收；macOS 发行与生命周期不能从 Windows/Linux 结果外推 |
 
 F9–F11 的实现、测试和独立代码复审已完成：前台 Ctrl+C 使用普通认证停止，graceful 后返回 `interrupted`/130；同代 stopping 可补发请求；被取消的 start 返回 6，被新代替换的旧 stop 返回 10。无需新增状态机。详见 [整体评审](completed-stages-overall-review-2026-10-14.md) 和 [修复计划第 7 节](completed-stages-fix-plan-2026-10-14.md#7-整体复审补充任务与执行结果)。
 
-当前前台命令在附着结束后输出一个实例结果；携带结果的失败同时将结构化诊断写到 stderr。原方案的就绪即时输出仍属未交付项，不能据当前测试标为通过。Ctrl+C 路径由确定性模拟测试覆盖，完整 live 套件验证既有真实进程生命周期；本轮未单独执行真实终端中断测试。
+前台命令在 running 登记后即时将状态写 stderr，在附着结束后向 stdout 输出一个最终实例结果；携带结果的失败另写单行结构化诊断。2026-10-15 在 WSL 真实 PTY 中输入 `0x03`，验证内核将 SIGINT 发给 CLI 前台进程组，server 独立 session 不重复接收；在唯一 worker 被半包请求阻塞时，CLI 等待 graceful 后返回 130。就绪输出异常不杀 running 进程的真实测试也通过，详见验收报告 §10；这些证据仅覆盖 Linux/WSL。
 
 F9–F11 的历史测试计数保留在验收报告 §7；本轮发行/兼容性测试见 §9。S2 整体与 v1 发布仍按第 7.4 节门槛验收；A01 已有真实 MySQL SQL mode/CRUD 证据，A02 Windows 总期限的负对照门槛继续保留。
 
@@ -748,6 +750,7 @@ fixture 的 finally 清理只终止自己已核验的子进程，确认退出后
 | `sdk/python/tests/test_cli_commands.py` | health/CRUD 适配、真实 HTTP CRUD、输出与退出码测试 |
 | `sdk/python/tests/test_local_node.py` | 状态、身份、锁、确定性交错与真实 Linux 生命周期测试 |
 | `sdk/python/tests/test_server_socket_live.py` | 当前原生服务 socket/control live 入口 |
+| `sdk/python/tests/test_foreground_live.py` | Linux 真实 PTY Ctrl+C、慢收尾与就绪通知失败边界 |
 | `sdk/python/tests/test_cli_packaging.py` | 基础安装及可选独立 wheel/sdist 重建、双解释器六项源码树外安装/真实 CRUD 矩阵 |
 | `sdk/python/tests/test_cli_completions.py` | parser 资源完整性、实际 Bash/PowerShell 候选项与光标范围 |
 | `test/test_local_control.cpp`、`CMakeLists.txt` | 本机控制协议/边界 CTest 注册及现有 C++ 回归 |

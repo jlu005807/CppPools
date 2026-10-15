@@ -54,6 +54,10 @@ CLI 提供 `health`、行级 CRUD 和本地节点管理命令，详见
 macOS 尚未验收；Windows 的 `start` 明确不支持，可直接启动服务程序，
 再使用 CLI 的 HTTP 命令。
 
+`cpl start -F ... -o json` 就绪后立即在 stderr 提示 running 状态，停止后
+stdout 输出一份最终 JSON；Ctrl+C 确认服务优雅退出后返回 130。stderr 可含
+多行诊断，服务日志写入实例日志文件。
+
 安装包包含 Bash、zsh、PowerShell 静态补全。使用安装该包的 Python 获取资源目录：
 
 ```sh

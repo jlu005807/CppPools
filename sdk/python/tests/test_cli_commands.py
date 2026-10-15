@@ -616,6 +616,26 @@ class TestLocalCommands(unittest.TestCase):
         self.assertEqual(out.getvalue(), "")
         self.assertEqual(json.loads(err.getvalue())["kind"], "local_state_error")
 
+    def test_foreground_readiness_is_immediate_diagnostic_and_stdout_is_final_json(self):
+        out, err = io.StringIO(), io.StringIO()
+        ready = {"name": "dev", "state": "running", "pid": 123}
+        finished = dict(ready, state="stopped", exit_kind="graceful")
+
+        class NotifyingManager(self.StubManager):
+            def start(manager, **kwargs):
+                self.assertTrue(kwargs["foreground"])
+                self.assertEqual(out.getvalue(), "")
+                kwargs["on_ready"](ready)
+                self.assertEqual(out.getvalue(), "")
+                self.assertEqual(json.loads(err.getvalue())["state"], "running")
+                return finished
+
+        with mock.patch.object(cli, "LocalNodeManager", NotifyingManager, create=True), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli.main(["start", "-n", "dev", "-c", "/tmp/server.json", "-F", "-o", "json"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue()), finished)
+
     def test_start_cancellation_and_foreground_interrupt_keep_exit_results(self):
         outcomes = [
             (local_node.LocalNodeError(

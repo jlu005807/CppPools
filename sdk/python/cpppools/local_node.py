@@ -879,7 +879,7 @@ class LocalNodeManager:
             pass
 
     def start(self, config, binary=None, workdir=None, log_file=None,
-              timeout=15.0, foreground=False):
+              timeout=15.0, foreground=False, on_ready=None):
         if os.name != "posix":
             raise LocalNodeError("Windows local start is not supported")
         config = os.path.realpath(os.path.abspath(os.path.expanduser(config)))
@@ -1115,6 +1115,8 @@ class LocalNodeManager:
             result["already_running"] = False
             if foreground:
                 try:
+                    if on_ready is not None:
+                        on_ready(result)
                     process.wait()
                 except KeyboardInterrupt:
                     stopped = self.stop(timeout=10.0)
