@@ -9,6 +9,7 @@
 #include "cpppools/pool/thread_pool.h"
 #include "cpppools/server/http_server.h"
 #include "sqlite_pool_fixture.h"
+#include "test_temp_file.h"
 
 #include <sqlite3.h>
 
@@ -16,8 +17,6 @@
 #include <cstdio>
 #include <memory>
 #include <string>
-#include <unistd.h>
-#include <vector>
 
 using namespace cpppools;
 
@@ -28,15 +27,8 @@ bool contains(const std::string& haystack, const std::string& needle) {
 }
 
 std::string make_temp_db(const char* tag) {
-    std::string path = std::string("/tmp/cpppools_clusterapi_") + tag + "_XXXXXX";
-    std::vector<char> buf(path.begin(), path.end());
-    buf.push_back('\0');
-    const int fd = mkstemp(buf.data());
-    assert(fd >= 0);
-    close(fd);
-    // 注意：mkstemp 原地改写 buf，必须用 buf.data()（改写后的真实文件名），
-    // 不能用 path（模板串未变）—— 否则所有测试会打开同一个字面名文件。
-    const std::string real_path(buf.data());
+    const std::string real_path = cpppools::testing::make_test_temp_file(
+        std::string("cpppools_clusterapi_") + tag);
     sqlite3* raw = nullptr;
     assert(sqlite3_open(real_path.c_str(), &raw) == SQLITE_OK);
     assert(sqlite3_exec(raw, "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT)",

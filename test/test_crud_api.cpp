@@ -12,6 +12,7 @@
 #include "server/crud_api.h"
 #include "server/hash_ring.h"
 #include "server/ownership_router.h"
+#include "test_temp_file.h"
 
 #include <sqlite3.h>
 
@@ -20,8 +21,6 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include <unistd.h>
-#include <vector>
 
 using namespace cpppools;
 
@@ -93,13 +92,8 @@ bool contains(const std::string& haystack, const std::string& needle) {
 }
 
 std::string make_temp_path(const char* tag) {
-    std::string path = "/tmp/cpppools_crudapi_" + std::string(tag) + "_XXXXXX";
-    std::vector<char> buf(path.begin(), path.end());
-    buf.push_back('\0');
-    const int fd = mkstemp(buf.data());
-    assert(fd >= 0);
-    close(fd);
-    return std::string(buf.data());
+    return cpppools::testing::make_test_temp_file("cpppools_crudapi_" +
+                                                  std::string(tag));
 }
 
 void seed(const std::string& path, const std::vector<std::string>& ddls) {

@@ -12,6 +12,7 @@
 #include "cpppools/db/row_request.h"
 #include "cpppools/db/value.h"
 #include "db/sqlite_database.h"
+#include "test_temp_file.h"
 
 #include <sqlite3.h>
 
@@ -19,8 +20,6 @@
 #include <cassert>
 #include <cstdio>
 #include <string>
-#include <unistd.h>
-#include <vector>
 
 using namespace cpppools::db;
 namespace config = cpppools::config;
@@ -28,13 +27,8 @@ namespace config = cpppools::config;
 namespace {
 
 std::string make_temp_path(const char* tag) {
-    std::string path = "/tmp/cpppools_routing_" + std::string(tag) + "_XXXXXX";
-    std::vector<char> buf(path.begin(), path.end());
-    buf.push_back('\0');
-    const int fd = mkstemp(buf.data());
-    assert(fd >= 0);
-    close(fd);
-    return std::string(buf.data());
+    return cpppools::testing::make_test_temp_file("cpppools_routing_" +
+                                                  std::string(tag));
 }
 
 void seed(const std::string& path, const std::vector<std::string>& ddls) {

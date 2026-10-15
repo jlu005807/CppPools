@@ -9,6 +9,7 @@
 
 #include "server/hash_ring.h"
 #include "server/ownership_router.h"
+#include "test_temp_file.h"
 
 #include "db/sqlite_database.h"
 
@@ -25,8 +26,6 @@
 #include <cstdlib>
 #include <memory>
 #include <string>
-#include <unistd.h>
-#include <vector>
 
 using cpppools::db::Value;
 using cpppools::server::ClusterView;
@@ -255,13 +254,8 @@ struct HttpFixture {
     HttpFixture() {
         cpppools::db::register_sqlite_backend();
         db_path = [] {
-            std::string path = "/tmp/cpppools_ownership_XXXXXX";
-            std::vector<char> buf(path.begin(), path.end());
-            buf.push_back('\0');
-            const int fd = mkstemp(buf.data());
-            assert(fd >= 0);
-            close(fd);
-            const std::string real_path(buf.data());
+            const std::string real_path = cpppools::testing::make_test_temp_file(
+                "cpppools_ownership");
             sqlite3* raw = nullptr;
             assert(sqlite3_open(real_path.c_str(), &raw) == SQLITE_OK);
             assert(sqlite3_exec(raw,

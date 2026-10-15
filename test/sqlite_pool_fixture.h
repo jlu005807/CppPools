@@ -8,6 +8,7 @@
 #include "cpppools/config/config.h"
 #include "cpppools/db/db_connection_pool.h"
 #include "db/sqlite_database.h"
+#include "test_temp_file.h"
 
 #include <sqlite3.h>
 
@@ -18,19 +19,11 @@
 #include <memory>
 #include <string>
 #include <unistd.h>
-#include <vector>
 
 namespace cpppools::testing {
 
 inline std::string make_temp_db_path(const std::string& tag) {
-    const std::string path = (std::filesystem::temp_directory_path() /
-        ("cpppools_scoretest_" + tag + "_XXXXXX")).string();
-    std::vector<char> buf(path.begin(), path.end());
-    buf.push_back('\0');
-    const int fd = mkstemp(buf.data());
-    assert(fd >= 0);
-    close(fd);
-    return std::string(buf.data());
+    return make_test_temp_file("cpppools_scoretest_" + tag);
 }
 
 // 建 user_scores 表（score 四端点的过渡期数据模型，期 5 删除）。

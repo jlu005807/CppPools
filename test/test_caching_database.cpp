@@ -10,6 +10,7 @@
 
 #include "cpppools/db/datasource_registry.h"
 #include "cpppools/db/db_connection_pool.h"
+#include "test_temp_file.h"
 
 #include <sqlite3.h>
 
@@ -18,8 +19,6 @@
 #include <cstdio>
 #include <memory>
 #include <string>
-#include <unistd.h>
-#include <vector>
 
 using namespace cpppools;
 using namespace cpppools::db;
@@ -27,13 +26,8 @@ using namespace cpppools::db;
 namespace {
 
 std::string make_seeded_db(const char* tag) {
-    std::string path = std::string("/tmp/cpppools_caching_") + tag + "_XXXXXX";
-    std::vector<char> buf(path.begin(), path.end());
-    buf.push_back('\0');
-    const int fd = mkstemp(buf.data());
-    assert(fd >= 0);
-    close(fd);
-    const std::string real_path(buf.data());
+    const std::string real_path = cpppools::testing::make_test_temp_file(
+        std::string("cpppools_caching_") + tag);
     sqlite3* raw = nullptr;
     assert(sqlite3_open(real_path.c_str(), &raw) == SQLITE_OK);
     assert(sqlite3_exec(raw,
@@ -294,13 +288,8 @@ static void test_request_bypass_disables_reads_but_not_invalidation() {
 // cache.tables whitelist: only listed tables get cache wrappers.
 static void test_table_allowlist_skips_non_listed_tables() {
     register_sqlite_backend();
-    std::string path = std::string("/tmp/cpppools_allowlist_XXXXXX");
-    std::vector<char> buf(path.begin(), path.end());
-    buf.push_back(' ');
-    const int fd = mkstemp(buf.data());
-    assert(fd >= 0);
-    close(fd);
-    const std::string real_path(buf.data());
+    const std::string real_path = cpppools::testing::make_test_temp_file(
+        "cpppools_allowlist");
 
     sqlite3* raw = nullptr;
     assert(sqlite3_open(real_path.c_str(), &raw) == SQLITE_OK);

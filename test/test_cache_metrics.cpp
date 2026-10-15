@@ -11,6 +11,7 @@
 #include "cpppools/pool/thread_pool.h"
 #include "cpppools/server/http_server.h"
 #include "db/sqlite_database.h"
+#include "test_temp_file.h"
 
 #include <sqlite3.h>
 
@@ -18,8 +19,6 @@
 #include <cstdio>
 #include <memory>
 #include <string>
-#include <unistd.h>
-#include <vector>
 
 using namespace cpppools;
 
@@ -44,13 +43,8 @@ struct Fixture {
     Fixture() {
         db::register_sqlite_backend();
         db_path = [] {
-            std::string path = "/tmp/cpppools_cachemetrics_XXXXXX";
-            std::vector<char> buf(path.begin(), path.end());
-            buf.push_back('\0');
-            const int fd = mkstemp(buf.data());
-            assert(fd >= 0);
-            close(fd);
-            const std::string real_path(buf.data());
+            const std::string real_path = cpppools::testing::make_test_temp_file(
+                "cpppools_cachemetrics");
             sqlite3* raw = nullptr;
             assert(sqlite3_open(real_path.c_str(), &raw) == SQLITE_OK);
             assert(sqlite3_exec(raw,

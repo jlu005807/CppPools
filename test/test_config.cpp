@@ -5,16 +5,44 @@
 #include <cstdlib>
 #include <fstream>
 #include <string>
+#ifdef _WIN32
+#include <direct.h>
+#else
 #include <sys/stat.h>
+#endif
 
 using namespace cpppools::config;
 
 namespace {
 
+int test_mkdir(const char* path) {
+#ifdef _WIN32
+    return _mkdir(path);
+#else
+    return ::mkdir(path, 0755);
+#endif
+}
+
+void set_test_environment(const char* key, const char* value) {
+#ifdef _WIN32
+    (void)_putenv_s(key, value);
+#else
+    (void)::setenv(key, value, 1);
+#endif
+}
+
+void unset_test_environment(const char* key) {
+#ifdef _WIN32
+    (void)_putenv_s(key, "");
+#else
+    (void)::unsetenv(key);
+#endif
+}
+
 // CTest 从 build/ 目录运行时 output/b/ 不存在，自建之（幂等）。
 void ensure_tmp_dir() {
-    ::mkdir("output", 0755);
-    ::mkdir("output/b", 0755);
+    (void)test_mkdir("output");
+    (void)test_mkdir("output/b");
 }
 
 // 写临时配置文件，返回路径。测试结束自行删除。
@@ -153,17 +181,17 @@ static void test_mysql_missing_required_fields_fails() {
 }
 
 static void test_mysql_password_env_resolved() {
-    ::setenv("CPPPOOLS_TEST_PASSWORD", "secret123", 1);
+    set_test_environment("CPPPOOLS_TEST_PASSWORD", "secret123");
     const std::string path = write_tmp_config(kPasswordEnvConfig, "cfg_pwdenv.json");
     const auto result = load_config(path);
     assert(result.ok);
     assert(result.config.datasources[0].mysql_password == "secret123");
-    ::unsetenv("CPPPOOLS_TEST_PASSWORD");
+    unset_test_environment("CPPPOOLS_TEST_PASSWORD");
     std::remove(path.c_str());
 }
 
 static void test_mysql_password_env_unset_fails() {
-    ::unsetenv("CPPPOOLS_TEST_PASSWORD");
+    unset_test_environment("CPPPOOLS_TEST_PASSWORD");
     const std::string path = write_tmp_config(kPasswordEnvConfig, "cfg_pwdenv_missing.json");
     const auto result = load_config(path);
     assert(!result.ok);  // 环境变量未设置 = 配置不完整
@@ -226,10 +254,10 @@ static void test_resolve_config_path_precedence() {
     const char* argv_with_flag[] = {"cpppools_server", "--config", "custom.json"};
     assert(resolve_config_path(3, argv_with_flag) == "custom.json");
 
-    ::setenv("CPPPOOLS_CONFIG", "env.json", 1);
+    set_test_environment("CPPPOOLS_CONFIG", "env.json");
     assert(resolve_config_path(1, argv_with_flag) == "env.json");  // 无 --config 时看环境变量
     assert(resolve_config_path(3, argv_with_flag) == "custom.json");  // 显式参数仍优先
-    ::unsetenv("CPPPOOLS_CONFIG");
+    unset_test_environment("CPPPOOLS_CONFIG");
 
     assert(resolve_config_path(1, argv_with_flag) == "config/cpppools.json");
 }

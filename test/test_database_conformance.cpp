@@ -11,6 +11,7 @@
 #include "db/caching_database.h"
 #include "db/sqlite_database.h"
 #include "cpppools/db/value.h"
+#include "test_temp_file.h"
 
 #include <sqlite3.h>
 
@@ -20,8 +21,6 @@
 #include <cstdlib>
 #include <memory>
 #include <string>
-#include <unistd.h>
-#include <vector>
 #include <atomic>
 #include <thread>
 
@@ -35,15 +34,8 @@ namespace {
 // ---------------------------------------------------------------------------
 
 std::string make_temp_path(const char* tag) {
-    std::string path = "/tmp/cpppools_conformance_" + std::string(tag) + "_XXXXXX";
-    std::vector<char> buf(path.begin(), path.end());
-    buf.push_back('\0');
-    const int fd = mkstemp(buf.data());
-    assert(fd >= 0);
-    close(fd);
-    // mkstemp 建了空文件；SQLite 以 READWRITE 打开空文件没问题
-    // （空文件被视为空库，首次写入时才建页）。
-    return std::string(buf.data());
+    return cpppools::testing::make_test_temp_file("cpppools_conformance_" +
+                                                  std::string(tag));
 }
 
 // 用裸连接建被测 schema。返回 0 表示成功。
