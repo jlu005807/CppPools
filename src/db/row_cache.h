@@ -16,6 +16,10 @@
 #include <utility>
 #include <vector>
 
+#ifdef CPPPOOLS_USE_REDIS
+#include "cache/redis_row_store.h"
+#endif
+
 namespace cpppools::db {
 
 // 缓存的一行：列名 → 值（整行，投影由消费方现算，与后端口径同构）。
@@ -61,6 +65,9 @@ struct RowCacheConfig {
     std::size_t max_entry_bytes{65536};
     std::chrono::milliseconds ttl{60000};
     std::size_t shard_count{16};
+#ifdef CPPPOOLS_USE_REDIS
+    std::shared_ptr<cache::RedisRowStore> redis_store;
+#endif
 };
 
 struct RowCacheStats {
@@ -111,6 +118,23 @@ public:
     // 读命中（TTL 检查；过期惰性删除）。
     std::optional<RowData> get(const RowCacheKey& key) {
         const std::string k = key.encode();
+#ifdef CPPPOOLS_USE_REDIS
+        if (cfg_.redis_store && cfg_.redis_store->available()) {
+            const auto remote = cfg_.redis_store->get(redis_key(k));
+            if (remote.code == cache::RedisStoreCode::hit) {
+                RowData row;
+                if (decode_row(remote.value, &row)) {
+                    Shard& shard = shard_of(k);
+                    std::lock_guard<std::mutex> lock(shard.mu);
+                    ++shard.stats.hits;
+                    return row;
+                }
+                cfg_.redis_store->disable();
+            } else if (remote.code == cache::RedisStoreCode::unavailable) {
+                // The store is retired by RedisRowStore; use cold memory below.
+            }
+        }
+#endif
         Shard& shard = shard_of(k);
         std::lock_guard<std::mutex> lock(shard.mu);
         const auto it = shard.entries.find(k);
@@ -129,6 +153,12 @@ public:
     // 回填。超单条上限 → 丢弃并计 bypass；否则入缓存并按双阈值 LRU 淘汰。
     void put(const RowCacheKey& key, RowData row) {
         const std::string k = key.encode();
+#ifdef CPPPOOLS_USE_REDIS
+        if (cfg_.redis_store && cfg_.redis_store->available()) {
+            if (row_bytes(row) <= cfg_.max_entry_bytes &&
+                cfg_.redis_store->put(redis_key(k), encode_row(row), cfg_.ttl)) return;
+        }
+#endif
         Shard& shard = shard_of(k);
         std::lock_guard<std::mutex> lock(shard.mu);
         put_locked(shard, k, std::move(row), std::chrono::steady_clock::now());
@@ -156,6 +186,12 @@ public:
         if (retired) {
             retired->set_value(std::nullopt);
         }
+#ifdef CPPPOOLS_USE_REDIS
+        if (cfg_.redis_store && cfg_.redis_store->available() &&
+            !cfg_.redis_store->erase(redis_key(k))) {
+            // RedisRowStore retires itself; the next read uses cold memory.
+        }
+#endif
     }
 
     // 全量清空（归队 Rejoin，spec §5.2 规则 B：best-effort 优化）。
@@ -180,6 +216,12 @@ public:
         for (auto& p : retired) {
             p->set_value(std::nullopt);
         }
+#ifdef CPPPOOLS_USE_REDIS
+        // A clear must not expose pre-clear Redis entries.  The minimal S3
+        // backend has no namespace rotation yet, so retire it and continue
+        // with an empty cold-memory cache instead of scanning Redis.
+        if (cfg_.redis_store) cfg_.redis_store->disable();
+#endif
     }
 
     // 当前分片世代号（回填 CAS 用：回源前记录，回填时比对）。
@@ -256,6 +298,9 @@ public:
         std::shared_ptr<std::promise<std::optional<RowData>>> promise;
         bool stored = false;
         bool stale = false;
+#ifdef CPPPOOLS_USE_REDIS
+        bool remote_store = false;
+#endif
         {
             std::lock_guard<std::mutex> lock(shard.mu);
             const auto fit = shard.flights.find(k);
@@ -274,13 +319,30 @@ public:
             }
             if (result.has_value()) {
                 if (!stale && shard.generation == expected_generation) {
+#ifdef CPPPOOLS_USE_REDIS
+                    remote_store = cfg_.redis_store && cfg_.redis_store->available() &&
+                                   row_bytes(*result) <= cfg_.max_entry_bytes;
+                    stored = remote_store || put_locked(shard, k, *result, cached_at);
+#else
                     stored = put_locked(shard, k, *result, cached_at);
+#endif
                 } else {
                     stale = true;
                     ++shard.stats.backfill_dropped;
                 }
             }
         }
+#ifdef CPPPOOLS_USE_REDIS
+        if (remote_store && result.has_value()) {
+            if (!cfg_.redis_store->put(redis_key(k), encode_row(*result), cfg_.ttl)) {
+                Shard& fallback = shard_of(k);
+                std::lock_guard<std::mutex> lock(fallback.mu);
+                if (fallback.generation == expected_generation) {
+                    put_locked(fallback, k, *result, cached_at);
+                }
+            }
+        }
+#endif
         if (promise) {
             promise->set_value(stale ? std::nullopt : std::move(result));
         }
@@ -311,6 +373,96 @@ public:
     bool enabled() const { return enabled_.load(std::memory_order_relaxed); }
 
 private:
+    static void append_u32(std::string& out, std::uint32_t value) {
+        for (int shift = 0; shift < 32; shift += 8) {
+            out.push_back(static_cast<char>((value >> shift) & 0xffu));
+        }
+    }
+
+    static bool read_u32(const std::string& in, std::size_t* offset, std::uint32_t* value) {
+        if (*offset > in.size() || in.size() - *offset < 4) return false;
+        *value = static_cast<std::uint32_t>(static_cast<unsigned char>(in[*offset])) |
+                 (static_cast<std::uint32_t>(static_cast<unsigned char>(in[*offset + 1])) << 8) |
+                 (static_cast<std::uint32_t>(static_cast<unsigned char>(in[*offset + 2])) << 16) |
+                 (static_cast<std::uint32_t>(static_cast<unsigned char>(in[*offset + 3])) << 24);
+        *offset += 4;
+        return true;
+    }
+
+    static void append_string(std::string& out, const std::string& value) {
+        append_u32(out, static_cast<std::uint32_t>(value.size()));
+        out.append(value);
+    }
+
+    static bool read_string(const std::string& in, std::size_t* offset, std::string* value) {
+        std::uint32_t length = 0;
+        if (!read_u32(in, offset, &length) || length > in.size() - *offset) return false;
+        value->assign(in.data() + *offset, length);
+        *offset += length;
+        return true;
+    }
+
+    static std::string encode_row(const RowData& row) {
+        std::string out = "CPR1";
+        append_u32(out, static_cast<std::uint32_t>(row.size()));
+        for (const auto& [column, value] : row) {
+            append_string(out, column);
+            if (is_null(value)) {
+                out.push_back('N');
+            } else if (const auto* integer = std::get_if<std::int64_t>(&value)) {
+                out.push_back('I');
+                out.append(reinterpret_cast<const char*>(integer), sizeof(*integer));
+            } else if (const auto* real = std::get_if<double>(&value)) {
+                out.push_back('D');
+                out.append(reinterpret_cast<const char*>(real), sizeof(*real));
+            } else if (const auto* text = std::get_if<std::string>(&value)) {
+                out.push_back('S');
+                append_string(out, *text);
+            }
+        }
+        return out;
+    }
+
+    static bool decode_row(const std::string& in, RowData* row) {
+        if (in.size() < 8 || in.compare(0, 4, "CPR1") != 0) return false;
+        std::size_t offset = 4;
+        std::uint32_t count = 0;
+        if (!read_u32(in, &offset, &count) || count > 100000) return false;
+        row->clear();
+        row->reserve(count);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            std::string column;
+            if (!read_string(in, &offset, &column) || offset >= in.size()) return false;
+            const char type = in[offset++];
+            if (type == 'N') {
+                row->emplace_back(std::move(column), Value{});
+            } else if (type == 'I' || type == 'D') {
+                if (in.size() - offset < sizeof(std::int64_t)) return false;
+                if (type == 'I') {
+                    std::int64_t value = 0;
+                    std::memcpy(&value, in.data() + offset, sizeof(value));
+                    row->emplace_back(std::move(column), value);
+                } else {
+                    double value = 0;
+                    std::memcpy(&value, in.data() + offset, sizeof(value));
+                    row->emplace_back(std::move(column), value);
+                }
+                offset += sizeof(std::int64_t);
+            } else if (type == 'S') {
+                std::string value;
+                if (!read_string(in, &offset, &value)) return false;
+                row->emplace_back(std::move(column), std::move(value));
+            } else {
+                return false;
+            }
+        }
+        return offset == in.size();
+    }
+
+    static std::string redis_key(const std::string& encoded) {
+        return "cpppools:row:v1:" + encoded;
+    }
+
     struct Entry {
         RowData row;
         std::chrono::steady_clock::time_point cached_at;

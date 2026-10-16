@@ -6,6 +6,8 @@
 
 2026-10-15 最终补验：Windows 原生完整 CTest 19/19 通过；WSL C++ `build-accept-s0-s2` CTest 20/20；Windows Python 3.12 全量 203 项（跳过 43）和 Python 3.8 全量 203 项（跳过 44）通过；WSL Python live 全量 203 项（通过 179、跳过 24）通过。Windows 前台真实终端 `cpl start -F` + Ctrl+C 通过，A02 Windows 慢读总期限及确定性负对照通过。Compose 定义/隔离静态检查通过，但真实 build 因 Docker Hub 网络超时阻断，不能记为 live smoke 通过。macOS 本机生命周期仍未验收；详细证据与范围见 [验收报告 §12](../../docs/completed-stages-acceptance-2026-10-14.md#12-docker-compose-远程验收与回归修复2026-10-15)。
 
+S3 最小 Redis RowCache 补验：Redis ON 的 Windows CTest `build-s3-red2` 为 21/21，通过 loopback RESP 的 `GET/SET PX/DEL`、Redis 命中、写后失效和 transport 失败后冷内存回退；Redis OFF 的 `build-redis-verify-off2` 为 19/19，通过，确认默认构建不链接 Redis 客户端且内存 RowCache 回归不变。当前实现不包含 `redis-server` 自启动、AOF/RDB 暖恢复、真实 Redis 服务端 TTL 验收或动态发现。
+
 所有命令从仓库根运行；Bash 命令用于 Linux/WSL。需要 C++17 编译器、CMake
 3.16+、SQLite 开发库和 Python 3.8+。不要混用 Windows 与 WSL 的 CMake 构建目录。
 

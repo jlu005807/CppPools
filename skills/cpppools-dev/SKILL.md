@@ -11,7 +11,7 @@ CppPools 是数据库前面的 HTTP 中间件：JSON 行级 CRUD → 表路由 �
 
 - SQLite 已实现且默认可用；MySQL 已实现，但必须用 CPPPOOLS_USE_MYSQL=ON 编译并提供客户端开发库。CMake 中 OFF 模式的 mock 摘要是遗留描述，不表示服务使用模拟数据库。
 - **拓扑来自静态配置**：每节点启动时读本地 JSON 的 cluster.nodes，通过 GET /api/v1/cluster 发布完整视图。SDK 给一个或多个 seed URL，初始化时逐个尝试获取视图并建环，再从 /api/v1/schema 获取唯一列信息。节点没有心跳、自动注册或配置传播。
-- **缓存在服务进程内存**：每个节点、每个数据源一份 RowCache，该源所有池连接共享；不是每连接一份，也不是 SDK 缓存或 Redis。分片哈希表存整行，LRU/TTL 管淘汰，Singleflight 合并回源，世代 CAS 阻止旧回填。
+- **缓存默认在服务进程内存**：每个节点、每个数据源一份 RowCache，该源所有池连接共享；不是每连接一份，也不是 SDK 缓存。默认 `memory` 使用分片哈希表、LRU/TTL、Singleflight 和世代 CAS；编译 `CPPPOOLS_USE_REDIS=ON` 且配置 `cache.backend=redis|auto` 时，可选 Redis 行后端接管条目存取，故障后一次性回退冷内存。
 - **数据库目标由部署配置保证**：集群设计要求所有节点连同一组实际数据源。节点各读各的 datasources 并建立连接池，不从 SDK 或邻居取得账号密码。datasource_digest 仅核对目标标识，SDK 初始化时比对并记录 digest_warnings，不能分发配置或证明数据一致。
 - 多进程 e2e 使用独立 SQLite 库验证路由与故障流程；实现没有复制、迁移或补写机制。不要由这些测试推断独立库故障后数据会收敛。相同路径在不同主机上也不代表同一 SQLite 数据库；TTL 只让缓存过期，不同步数据库。
 - **容器部署边界**：`docker-compose.yml`、根目录 `.dockerignore`、`docker/Dockerfile` 和 `docs/docker-compose-deployment.md` 是当前可审查的 Compose 入口。容器内服务按 Linux 运行；Compose 负责容器生命周期和数据卷，`cpl start/stop/status` 不管理容器。更改发布端口时必须同步 `cluster.nodes` 的可达端口；测试用唯一 project、随机端口和临时配置。Docker Compose 真实 smoke 只有在 `CPL_RUN_DOCKER=1` 且本机 Docker 引擎可用时才运行；静态文件检查不能替代真实容器证据。本轮 Compose 定义/隔离检查通过，真实 build 因 Docker Hub 网络超时阻断，不能记为 live 通过。
@@ -36,9 +36,9 @@ CppPools 是数据库前面的 HTTP 中间件：JSON 行级 CRUD → 表路由 �
 | Redis 动态拓扑发现的独立设计 | [redis-discovery-design.md](../../docs/redis-discovery-design.md) |
 | Docker Compose 部署、持久化和远程验收 | [docker-compose-deployment.md](../../docs/docker-compose-deployment.md) |
 
-**实现状态边界**：当前行缓存仍是每个服务进程、每个数据源一份的内存 `RowCache`；Redis 缓存和 Redis 拓扑发现均尚未实现。上述 Redis 文档是设计/实施计划，不是当前配置能力、运行保证或已通过测试的证明。回答“现在怎么运行”时以源码、当前配置示例和实际测试为准；回答“将来如何实现”时才引用这些方案，并标明尚未落地。
+**实现状态边界**：当前 `memory` 仍是默认行缓存；S3 已提供可选 Redis 行后端（有界 RESP `GET/SET PX/DEL`、命中/失效、一次性冷内存回退），但 Redis 自启动、持久化暖恢复、真实 Redis 服务端 TTL 验收和动态拓扑发现均尚未实现。Redis 文档中超出 S3 的内容仍是设计/实施计划，不是当前运行保证。回答“现在怎么运行”时以源码、当前配置示例和实际测试为准；回答“将来如何实现”时才引用这些方案，并标明尚未落地。
 
-**实施顺序入口**：按 [统一实施路线](../../docs/implementation-roadmap.md) 区分 S0 修复、S1 远程 CLI、S2 本机 CLI/打包、S3–S4 本地 Redis 缓存和 S5–S7 动态发现。S0 五项修复已有实现和证据，A01/A02 均已关闭；macOS 本机生命周期仍是 S2 未关闭门槛。继续任务前先查最新状态及证据，不重做已关闭修复，也不把 S3 的配置/transport 基础计为 RowCache 后端完成。
+**实施顺序入口**：按 [统一实施路线](../../docs/implementation-roadmap.md) 区分 S0 修复、S1 远程 CLI、S2 本机 CLI/打包、S3–S4 本地 Redis 缓存和 S5–S7 动态发现。S0 五项修复和 A01/A02 均已有证据；S3 最小 Redis RowCache 接入已完成，S4 仍负责真实 Redis 服务端 TTL、生命周期、持久化和暖恢复；macOS 本机生命周期仍是 S2 未关闭门槛。继续任务前先查最新状态及证据，不重做已关闭修复，也不把 S3 基础误计为 S4 完成。
 
 ## 改动时守住的契约
 

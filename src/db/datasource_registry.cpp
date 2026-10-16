@@ -4,6 +4,9 @@
 #include "cpppools/db/db_connection_pool.h"
 #include "db/caching_database.h"
 #include "db/row_cache.h"
+#ifdef CPPPOOLS_USE_REDIS
+#include "cache/redis_row_store.h"
+#endif
 #include "server/hash_ring.h"
 
 #include <algorithm>
@@ -98,6 +101,16 @@ RegistryBuildResult DataSourceRegistry::build(
             rc.max_bytes = cache_cfg.max_bytes;
             rc.max_entry_bytes = cache_cfg.max_entry_bytes;
             rc.ttl = std::chrono::milliseconds(cache_cfg.ttl_ms);
+#ifdef CPPPOOLS_USE_REDIS
+            if (cache_cfg.backend == "redis" || cache_cfg.backend == "auto") {
+                cache::RedisLimits limits;
+                limits.operation_timeout = std::chrono::milliseconds(cache_cfg.redis_timeout_ms);
+                limits.max_reply_bytes = cache_cfg.redis_max_reply_bytes;
+                auto redis = std::make_shared<cache::RedisRowStore>(
+                    cache_cfg.redis_host, cache_cfg.redis_port, limits);
+                if (redis->available()) rc.redis_store = std::move(redis);
+            }
+#endif
             cache = std::make_shared<RowCache>(rc);
         }
         const config::DataSourceConfig pool_cfg = cfg;  // 值拷贝：factory 捕获

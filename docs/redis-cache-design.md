@@ -1,9 +1,9 @@
 # CppPools 节点本地 Redis 行缓存设计与实施方案
 
-**状态**：设计方案，功能尚未实现。  
+**状态**：设计方案；S3 最小 Redis 行后端已实现并通过 OFF/ON 回归，S4 的真实服务端 TTL、生命周期、持久化和暖恢复尚未实现。
 **修订**：R3，2026-10-07。  
 **依据**：当前仓库源码、集群缓存规范及节点本地 Redis 行缓存需求。  
-**范围**：架构、配置、生命周期、故障边界、分阶段 TDD、测试与验收。本文中的新增配置、组件和测试均是实施要求，不代表当前程序已经支持。
+**范围**：架构、配置、生命周期、故障边界、分阶段 TDD、测试与验收。文中已明确标注的 S3 `GET/SET PX/DEL`、RowCache 接入和冷内存回退已经落地；自启动、持久化暖恢复、真实服务端验收及动态发现仍是后续实施要求。
 
 **实现顺序**：见 [统一实施路线](implementation-roadmap.md)。必须先完成 S0 的五项高优修复；之后 P0 只负责基线/接口冻结，P1–P2及P3的共享transport归入S3，其余P3–P7归入S4；动态拓扑集成在S6复用本方案的协调器和后端token。
 
@@ -46,7 +46,7 @@
 | R08 | Redis 故障后进入空内存缓存，本进程不再切回 Redis；旧请求不得污染新缓存 |
 | R09 | 恢复是否可信有明确判断；异常退出、Redis 重启和配置漂移不得复用旧命名空间 |
 | R10 | 自动启动只操作本节点登记的专用实例，不接管任意占用端口的 Redis |
-| R11 | hiredis 可选构建；第三方类型留在私有实现，默认构建不下载依赖 |
+| R11 | Redis 客户端 transport 可选构建；当前 S3 使用私有非阻塞 RESP 实现，默认构建不下载依赖 |
 | R12 | 保留现有 HTTP/SDK 契约，补充可观察的后端状态；阶段验收有可重复证据 |
 
 ### 1.2 一致性承诺与适用前提
@@ -61,13 +61,13 @@ Redis 使用墙上时钟处理过期，内存缓存使用单调时钟。Redis �
 
 ### 1.3 首版范围
 
-首版支持 `memory` 和 `auto` 两个 backend。`auto` 是显式选择的尽力使用策略；Redis 缓存故障不会使健康数据库无法提供 CRUD。首版不增加要求 Redis 必须成功的 `redis` 严格模式，以免把可丢弃缓存变成启动依赖。
+S3 当前支持 `memory`、`auto` 和 `redis` 配置值，但 `redis` 与 `auto` 都是尽力使用模式：Redis 缓存故障不会使健康数据库无法提供 CRUD，且本进程一次性退回冷内存。当前尚未提供要求 Redis 必须成功的严格启动模式，也未实现自动启动或暖恢复。
 
 不引入 Redis Cluster/Sentinel、跨节点共享缓存、Redis 分布式锁、负缓存、后台热切回、DDL、任意 SQL、新 CRUD 端点或第二套 SDK 路由。自动启动不安装 Redis、不下载服务端，也不要求管理员权限。
 
 ## 2. 当前代码基线与设计落点
 
-与动态发现组合时，遵守[跨方案对齐契约](implementation-roadmap.md#4-三份方案必须共同遵守的对齐契约)：首版discovery.enabled=true必须warm_reuse=false；节点专用缓存Redis与共享中心独立。私有有界transport首次实现即放在src/redis，由两者复用，缓存连接池及RowStore仍属于db。
+与动态发现组合时，遵守[跨方案对齐契约](implementation-roadmap.md#4-三份方案必须共同遵守的对齐契约)：首版discovery.enabled=true必须warm_reuse=false；节点专用缓存Redis与共享中心独立。私有有界 transport 放在 `src/cache`，由两者复用，缓存连接池及 RowStore 仍属于 db。当前 S3 未实现发现中心。
 
 RowCache后端token增加独立topology_revision时不替换backend_epoch/namespace/flight_id。发现准入gate不能覆盖Redis网络等待；后端lane中读取后复核token再返回，拓扑clear对于Redis旋转namespace，对于memory清条目。enable/disable/Rejoin使用同一退休入口，人工enable不能越过发现blocked/hold-down。缓存正常收尾先完成恢复清单，再由main在所有资源关闭后发布CLI终态。
 

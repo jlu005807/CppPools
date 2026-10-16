@@ -47,7 +47,7 @@ Compose 的 `healthcheck` 只表示容器内 HTTP 服务已经响应；SDK 的 h
 
 ## 边界和安全
 
-容器隔离不会自动解决数据库一致性、集群拓扑或 Redis 共享问题。每个节点仍读取自己的配置和数据库目标；容器重建不会复制 SQLite 数据。Redis RowCache 和动态发现尚未接入，Compose 示例也不会启动 Redis。
+容器隔离不会自动解决数据库一致性、集群拓扑或 Redis 共享问题。每个节点仍读取自己的配置和数据库目标；容器重建不会复制 SQLite 数据。S3 已有可选 Redis RowCache 后端，但本 Compose 镜像关闭 Redis 选项且示例不启动 Redis；Redis 自启动/暖恢复和动态发现仍未接入。
 
 本示例验收的是单节点 SQLite。多个独立 SQLite 卷不能充当同一实际数据库；生产集群仍需统一实际数据源，使用 MySQL 时还须另行启用 MySQL 后端构建并提供配置。本批没有将多节点数据一致性计为通过。
 
@@ -57,4 +57,4 @@ Compose 的 `healthcheck` 只表示容器内 HTTP 服务已经响应；SDK 的 h
 
 静态契约测试位于 `sdk/python/tests/test_docker_compose.py`。设置 `CPL_RUN_DOCKER=1` 会执行真实镜像构建、随机宿主端口 `/health`、容器内非 root 检查、SDK/CLI health 与完整 CRUD、`stop` 退出码检查，以及保留命名卷后的重建恢复；测试使用唯一 project name，结束时执行 `down -v`。未设置时只运行不依赖 Docker 的定义测试。没有 Docker 引擎时必须报告为环境未验证，不能把静态 YAML 检查写成容器验收通过。
 
-2026-10-15 已在 WSL Ubuntu 的 Docker Engine 29.1.3 / Compose 2.40.3 上实际运行该 smoke，1/1 通过；Windows 主机本身没有 Docker Desktop，但容器内服务仍统一按 Linux 运行。Redis RowCache 和动态发现仍未接入 Compose 示例。
+本轮 WSL Docker Engine 的 Compose 定义/隔离检查通过，但真实镜像 build 因 Docker Hub `ubuntu:24.04` 元数据请求超时阻断，未记为 live smoke 通过；Windows 主机本身没有 Docker Desktop。容器内服务仍统一按 Linux 运行。Redis RowCache 的 S3 实现通过独立 Windows ON/ OFF CTest，Compose 示例本身仍关闭 Redis。

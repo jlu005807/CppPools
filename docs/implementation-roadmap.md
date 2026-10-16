@@ -1,7 +1,7 @@
 # 未完成方案实现顺序与对齐清单
 
 > 日期：2026-10-15；修订：R13；初始排期基线：`6c554dd`；本轮最终补验基线：`98dd98e` 加工作区修改。
-> 状态：S0/S1 已实现，S2/S3 部分实现，S4–S7 待执行。A01、A02 已关闭；A02 的 Windows 总期限负对照已证明“每次成功发送重置期限”的错误实现会失败。S2 版本、补全、Windows 双解释器六项发行矩阵、Linux 前台就绪/真实 PTY Ctrl+C、Windows SDK start/status/stop、Windows ACL/句柄路径和 file-level reparse 已在本机通过；macOS 生命周期仍未验收。Windows 原生完整 CTest 已通过 19/19；WSL C++ CTest 20/20，WSL Python 全量 203 项（179 通过、24 跳过）通过。Compose 定义/静态隔离检查通过，但本轮真实 smoke 受 Docker Hub 网络超时阻断，不能记为 live 通过。最新证据见 [Docker Compose 部署说明](docker-compose-deployment.md) 与 [验收报告第 12 节](completed-stages-acceptance-2026-10-14.md#12-docker-compose-远程验收与回归修复2026-10-15)；下文历史记录保留当时结论。
+> 状态：S0/S1 已实现，S2 已完成除 macOS 本机生命周期外的门槛，S3 最小 Redis RowCache 接入已完成，S4–S7 待执行。A01、A02 已关闭；A02 的 Windows 总期限负对照已证明“每次成功发送重置期限”的错误实现会失败。S2 版本、补全、Windows 双解释器六项发行矩阵、Linux 前台就绪/真实 PTY Ctrl+C、Windows SDK start/status/stop、Windows ACL/句柄路径和 file-level reparse 已在本机通过；macOS 生命周期仍未验收。Windows 原生 OFF CTest 已通过 19/19，Redis ON CTest 已通过 21/21；WSL C++ CTest 20/20，WSL Python 全量 203 项（179 通过、24 跳过）通过。Compose 定义/静态隔离检查通过，但本轮真实 smoke 受 Docker Hub 网络超时阻断，不能记为 live 通过。最新证据见 [Docker Compose 部署说明](docker-compose-deployment.md) 与 [验收报告第 12 节](completed-stages-acceptance-2026-10-14.md#12-docker-compose-远程验收与回归修复2026-10-15)；下文历史记录保留当时结论。
 > 用途：统一现有方案的先后、依赖和交叉契约；具体配置、命令、测试仍以对应专题文档为准。
 
 ## 1. 当前有哪些真正未完成的方案
@@ -11,7 +11,7 @@
 | 方案 | 当前状态与源码依据 | 本轮安排 |
 |---|---|---|
 | [cpl CLI](cpl-cli-design.md) | 远程命令、Linux 本机管理、控制文件及基础打包已实现；输入错误、并发/停机与 F9–F11 在 Linux/WSL 已修复并复验；平台与发布门槛仍开放 | 补真实环境证据及平台/发行交付，详细阶段进度见 CLI §6.1 |
-| [节点本地 Redis 行缓存](redis-cache-design.md) | S3 配置与有界 transport 基础已提交；RowCache/CachingDatabase仍为内存实现，Redis 后端/恢复/自启未实现 | 在静态集群上完成后端和故障行为，再接动态拓扑 |
+| [节点本地 Redis 行缓存](redis-cache-design.md) | S3 最小 Redis 行后端已接入：RowCache 支持有界 `GET/SET PX/DEL`、命中/失效及一次性冷内存回退；恢复、自启和暖复用仍未实现 | 在静态集群上完成真实 Redis TTL、生命周期和恢复资格，再接动态拓扑 |
 | [Redis 动态服务发现](redis-discovery-design.md) | 设计完成并补充本轮对齐；现有配置、OwnershipRouter和SDK仍使用静态节点/HTTP seed | 最后增加注册租约、运行时视图、SDK provider和discovery命令 |
 
 `docs/superpowers/` 中有部分旧文档仍标“待评审”“待实施”，或者任务未勾选，不能据此把所有内容重新列为未开发。
@@ -34,7 +34,7 @@
 | S0 基线与五项高优修复 | 历史加固残余项、缓存P0、HTTP生命周期Task 4 | 先完成基线证据和五个只读评审问题：MySQL ON 编译阻断、Singleflight 竞态、bypass 异常复位、Prometheus 重复声明、HTTP 慢速发送总期限 | 目标平台上的基线/定向测试真实运行；五项均有 RED→GREEN 证据；默认内存/静态集群契约不变 | 五项修复及 Linux 回归通过；A01 本机真实自省/CRUD、A02 Windows 总期限及确定性负对照均已通过 |
 | S1 远程CLI | CLI阶段0–2 | parser、严格JSON/输出/错误映射、health、四个CRUD，源码`python -m cpppools`入口 | 无网络help/version；远程命令复用SDK；成功写不因CLI重新执行；真实HTTP CRUD | A06/A07 已修复并通过 WSL 全量回归；真实 HTTP CRUD 通过 |
 | S2 本机CLI与基础打包 | CLI阶段3–5 | POSIX/Windows控制、ready/stopped、start/stop/status、pyproject、cpl入口与包安装 | 目标平台真实进程控制；停止超时不假报成功；源码树外wheel/sdist可安装 | Linux/WSL 生命周期、Windows SDK start/status/stop、ACL/句柄路径、file-level reparse、真实 PTY 前台验收、版本/补全/Windows 3.12+3.8 发行矩阵通过；macOS 本机管理仍开放；Compose 静态定义/隔离检查通过，live smoke 受 Docker Hub 网络阻断 |
-| S3 共享缓存与Redis基础 | 缓存P1–P2、P3的transport子任务 | 稳定RowCache协调入口、flight_id/token/异常复位；配置/codec；唯一可选hiredis构建和私有有界transport | 原内存语义不变；flight身份竞态关闭；OFF无依赖、ON能链接；transport确实受总期限/响应大小限制 | 配置校验、OFF构建开关和有界PING transport已完成；hiredis/真实Redis及RowCache接入待执行 |
+| S3 共享缓存与Redis基础 | 缓存P1–P2、P3的transport子任务 | 稳定RowCache协调入口、flight_id/token/异常复位；配置/codec；可选 Redis transport 与 RowCache 最小接入 | 原内存语义不变；flight身份竞态关闭；OFF无依赖、ON能链接；transport确实受总期限/响应大小限制 | 已完成：配置校验、OFF 构建、非阻塞有界 RESP transport、RowCache `GET/SET PX/DEL`、命中/失效和一次性冷内存回退；Windows ON 21/21、OFF 19/19 CTest 通过。真实 Redis 持久化/自启/暖恢复仍属于 S4 |
 | S4 本地Redis缓存交付 | 缓存P3剩余部分、P4–P7 | 显式实例→故障冷内存→恢复资格/自启→静态集群验证；运维和性能证据 | SQL成功不因缓存故障变成重试；旧namespace不复活；专用实例归属、停止和支持平台明确 | 待执行 |
 | S5 发现控制面与服务端 | 发现P0–P2 | discovery配置、共享状态/脚本、注册租约、runtime snapshot、HTTP诊断；先cache-off | 新ID可在固定fallback列表外加入；expired lease可重新登记；empty/outage/blocked区别正确；请求线程不访问发现Redis | 待执行 |
 | S6 动态路由与SDK | 发现P3–P4 | topology gate与两种缓存后端集成、请求版本、hold-down、from_redis、schema快照、close | 旧请求不能回填；Fallback始终旁路；一次操作不混身份；blocked/close后不发新尝试；动态cold restart不暖复用 | 待执行 |
@@ -103,7 +103,7 @@ S1.2 的 CLI 只负责参数解析、完整 payload 64 KiB 预检、输出和错
 
 完整证据、代码位置、复现及关闭条件见 [S0–S2 审查与验收报告](completed-stages-acceptance-2026-10-14.md)。原 F8 复验：Linux OFF/OFF CTest 20/20；MariaDB ON 基础 CTest 20/20；Python 全量 167 项中 165 通过、2 项 Windows 专属用例按平台跳过。后续 F9–F11 定向测试 92 项中 79 通过、13 项按平台/live 条件跳过；Python 全量 live 最新为 171 项中 169 通过、2 项 Windows 专属用例跳过。Windows 原生服务和控制专项构建通过，`test_local_control` 1/1、socket live 8 项通过；慢读期限因无法证明远端背压而跳过。MySQL 自省/CRUD 因未设置测试账号跳过。历史 RED 与原正常功能证据保留。
 
-A03–A08 原范围已有针对性 GREEN 与组合回归证据。整体复审新增的 R01 前台异常清理、R02 普通续停补发、R03 并发命令结果归属已由 F9–F11 修复并通过 Linux/WSL 定向与组合回归；A06/A07/A08 原结论保留。A01 仍缺默认/NBE SESSION 下的真实 MySQL 自省和 CRUD，A02 仍缺 Windows 慢读总期限的可验证背压证据。Windows 全量原生 CMake 构建仍被既有 `test_http_server.cpp` 的 POSIX `<arpa/inet.h>` 阻断；所需服务/控制目标独立构建通过。S3 仅保留部分实现进度，本轮未进行完整 Redis 验收。
+A03–A08 原范围已有针对性 GREEN 与组合回归证据。整体复审新增的 R01 前台异常清理、R02 普通续停补发、R03 并发命令结果归属已由 F9–F11 修复并通过 Linux/WSL 定向与组合回归；A06/A07/A08 原结论保留。A01/A02 已按最新 Windows/MySQL 证据关闭；Windows 原生完整 CTest 和 Redis OFF/ON 回归均已通过。S3 最小 Redis RowCache 接入已验收，S4 的真实 Redis 服务端 TTL、生命周期、持久化和暖恢复仍未完成。
 
 修复执行入口为 [S0–S2 验收问题修复计划](completed-stages-fix-plan-2026-10-14.md)：F1–F8 阶段实现与评审记录保留；F9 清理边界、F10 停止投递恢复、F11 命令结果归属均已实现并复验。问题与策略见 [整体评审](completed-stages-overall-review-2026-10-14.md)。F 编号是修复任务，不替代 S 阶段或原专题编号。A01/A02 的实测缺口以及 macOS/Windows 本机管理、发行版本/包矩阵继续按 S2 门槛单独验收。
 
@@ -142,7 +142,7 @@ A03–A08 原范围已有针对性 GREEN 与组合回归证据。整体复审新
 - **本地缓存Redis**：节点专用，保存可丢弃行缓存，可在已支持平台自启；故障一次性转冷内存，本进程不自动切回。
 - **发现中心Redis**：共享、由部署方提供，只保存发现状态；短故障last_good，超过grace静态回退；同一权威恢复后可自动回动态。
 - endpoint、凭据、连接/队列、目录、run_id和状态机各自独立。禁止共享缓存namespace与发现state，禁止把缓存launcher用于启动/关闭发现中心。
-- 共用一个 `CPPPOOLS_USE_REDIS` 可选构建开关和一个私有 `src/redis/` transport。缓存P3首次需要网络时提取实际用到的deadline/RESP预算/TLS/RAII能力；db和server分别依赖该下层组件，db不依赖server。不提前创建无调用方的通用框架。
+- 共用一个 `CPPPOOLS_USE_REDIS` 可选构建开关和一个私有 `src/cache/` transport。当前 S3 使用自有非阻塞 RESP transport，不引入 hiredis；后续若替换客户端仍须保持同一总 deadline、回复大小预算和 RAII 边界。db 和 server 分别依赖该下层组件，db 不依赖 server。不提前创建无调用方的通用框架。
 - OFF仍无Redis客户端依赖；cache.auto在OFF可以冷内存回退，discovery.enabled=true在OFF属于配置错误。两者不同的失败策略应同时覆盖。
 
 ### 4.2 RowCache、token和锁只维护一套
@@ -214,6 +214,6 @@ RowCache仍是每数据源共享协调器。缓存方案先落地 `(backend_epoc
 
 已将三份新方案作为实际待实现主线，历史已落地方案归入基线核验；统一了阶段编号引用、共享模块归属、两个Redis故障策略、token与namespace、schema、动态扩容、SDK发送门控、打包及停机。专题文档的方案入口均链接回本路线，历史加固索引注明当前执行入口。
 
-S0/S1 已有实现和回归证据，S2 Linux 本机管理修复与基础安装、S3 Redis 基础已部分落地，S4–S7 待执行。2026-10-14 修复复验关闭已测 Linux/WSL 范围的 A03–A08 与 R01–R03；A01/A02 保留真实环境门槛，S2 平台、前台输出与发行门槛也未关闭。当前 CLI 阶段状态见 [CLI §6.1](cpl-cli-design.md#61-当前实施进度2026-10-14)。
+S0/S1 已有实现和回归证据，S2 Linux/Windows 本机管理与基础安装已验收（macOS 仍开放），S3 最小 Redis RowCache 后端已落地，S4–S7 待执行。A01/A02 已关闭；当前 CLI 阶段状态见 [CLI §6.1](cpl-cli-design.md#61-当前实施进度2026-10-14)。
 
 两位独立读者已复核实施顺序、控制面关键修订和跨方案契约，未发现影响实施的剩余依赖循环或路线冲突。文档核验覆盖本路线、三个专题和历史加固索引：相对文件链接可解析，Markdown围栏成对，现有JSON示例可解析；这不是产品测试或阶段完成证据。

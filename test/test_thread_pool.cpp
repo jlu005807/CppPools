@@ -638,19 +638,21 @@ static void test_peak_execution_time_is_monotonic_under_workers() {
     cfg.worker_count = 4;
     ThreadPool pool(cfg);
 
-    // Phase 1: sequential baseline - longer task must raise the peak.
+    // Phase 1: sequential baseline - longer task must raise the peak.  Use
+    // comfortably sized sleeps so coarse Windows clocks do not turn a real
+    // 15 ms task into an occasionally observed 11 ms sample.
     must_submit(pool.submit([] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
     })).get();
     const std::uint64_t peak1 = pool.stats().peak_task_exec_us;
-    assert(peak1 >= 12000);
+    assert(peak1 >= 30000);
 
     must_submit(pool.submit([] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
     })).get();
     const std::uint64_t peak2 = pool.stats().peak_task_exec_us;
     assert(peak2 >= peak1 && "peak must not decrease");
-    assert(peak2 >= 25000);
+    assert(peak2 >= 70000);
 
     // Phase 2: concurrent tasks - reader checks monotonicity throughout.
     std::atomic<bool> stop{false};

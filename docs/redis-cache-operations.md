@@ -1,6 +1,6 @@
 # 节点本地 Redis 缓存运维说明
 
-本文是[节点本地 Redis 行缓存设计](redis-cache-design.md)的操作摘要。Redis 缓存功能尚未实现；本文中的配置和行为是后续实现目标，不代表当前程序已经支持。
+本文是[节点本地 Redis 行缓存设计](redis-cache-design.md)的操作摘要。S3 已实现可选 Redis 行后端的最小 `GET/SET PX/DEL` 与一次性冷内存回退；本文中关于自启动、持久化恢复、暖复用和真实服务端运维的内容仍是 S4 后续目标，不代表当前程序已经支持。
 
 ## 最小配置
 
@@ -43,7 +43,7 @@ CppPools 正常停止后，本节点专用 Redis 默认继续运行，以便后�
 
 | 场景 | 行为 |
 |---|---|
-| hiredis 未编译 | `auto` 记录 `client_not_built`，使用内存 |
+| Redis transport 未编译（`CPPPOOLS_USE_REDIS=OFF`） | 使用现有内存缓存；OFF 构建不包含 Redis 依赖 |
 | `redis-server` 未安装 | 记录 `not_installed`，使用内存 |
 | 端口被未知进程占用 | 记录 `foreign_instance`，不修改外部进程，使用内存 |
 | Redis 启动超时 | 记录 `startup_timeout`，只清理能证明由本次启动的失败进程 |

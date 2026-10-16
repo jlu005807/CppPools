@@ -364,7 +364,19 @@ Windows 的 `LocalNodeManager.start/status/stop`、ACL/句柄级路径防护和 
 
 因此 A02 的关闭条件已满足：成功发送不会延长生产实现的总 deadline，错误的逐次重置实现会在测试预算内失败。测试专用 POSIX `MSG_NOSIGNAL` 仅用于避免负对照清理阶段的 SIGPIPE，不改变生产发送路径。
 
-Compose smoke 不代表 macOS 本机生命周期已验收。本轮 Compose 定义/隔离检查通过，但真实 build 因 Docker Hub `docker.io/library/ubuntu:24.04` 元数据请求超时而阻断，不能记为 live smoke 通过。Windows 原生完整 CTest 已通过；自定义 `log_file` 的 hostile reparse 路径不属于控制目录防护范围。Redis RowCache、动态发现仍未实现。
+Compose smoke 不代表 macOS 本机生命周期已验收。本轮 Compose 定义/隔离检查通过，但真实 build 因 Docker Hub `docker.io/library/ubuntu:24.04` 元数据请求超时而阻断，不能记为 live smoke 通过。Windows 原生完整 CTest 已通过；自定义 `log_file` 的 hostile reparse 路径不属于控制目录防护范围。Redis 的自启动/持久化暖恢复和动态发现仍未实现；S3 最小 RowCache 后端接入见下节。
+
+### S3 Redis RowCache 最小接入补验（2026-10-16）
+
+本阶段只实现现有 `RedisTransport` 到 `RowCache` 的最小静态后端接入，不包含 `redis-server` 自启动、AOF/RDB 恢复、密码配置或动态发现。
+
+| 项目 | 实际结果 |
+|---|---|
+| Redis transport | `CPPPOOLS_USE_REDIS=ON` 下使用私有非阻塞 RESP transport；`GET/SET PX/DEL` 共用连接级绝对 operation deadline，nil-bulk miss 不关闭连接，回复大小受 `max_reply_bytes` 限制。 |
+| RowCache 命中/失效 | 每数据源的 `RowCache` 可选注入 `RedisRowStore`；Redis 命中直接解码完整行，miss 继续现有 singleflight 回源，写前/写后失效执行 Redis `DEL`。 |
+| 故障回退 | transport 连接/协议/超时或写入失败后，`RedisRowStore` 一次性退休；后续请求转为空的内存 RowCache，不重复重连，不重试已成功 SQL。定向夹具覆盖服务在 PING 后断开这一运行时故障。 |
+| Redis ON 回归 | Windows `build-s3-red2` CTest 21/21 通过，包含 transport、命中、失效和故障回退。 |
+| Redis OFF 回归 | Windows `build-redis-verify-off2` CTest 19/19 通过，确认默认构建无 Redis 源/依赖且原内存缓存回归不变。首次运行 `test_thread_pool` 出现既有时序抖动，单独复跑和完整重跑均通过。 |
 
 本批最终生产补丁经独立复审，无剩余 Critical/Important；Compose 地址说明和路线待办中的两处旧表述已同步修正。构建仍有既有编译告警；WSL 的 Windows 挂载目录还出现亚秒级 clock-skew 告警，不能将结果表述为零告警构建。
 

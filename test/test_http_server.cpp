@@ -803,7 +803,7 @@ static void test_send_deadline_negative_control_resets() {
         sender_done.store(true, std::memory_order_release);
     });
     std::this_thread::sleep_for(std::chrono::seconds(12));
-    const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - started).count();
     test_shutdown_socket(fds[0]);
     test_shutdown_socket(fds[1]);
@@ -815,11 +815,13 @@ static void test_send_deadline_negative_control_resets() {
               << " sender_done=" << sender_done.load()
               << " successful_sends=" << successful_sends.load()
               << " bytes_read=" << bytes_read.load()
-              << " elapsed_s=" << elapsed << std::endl;
+              << " elapsed_ms=" << elapsed << std::endl;
     assert(successful_sends.load() >= 2 && "negative control must observe multiple partial sends");
     assert(bytes_read.load() > 65536 && "negative control must reopen the receive window");
     assert(!completed.load() && "resetting the deadline must not complete within one total budget");
-    assert(elapsed >= 12 && "negative control must consume the total budget");
+    // Keep enough margin above the mutant's 10 s budget while avoiding a
+    // false failure when a coarse Windows clock truncates 11.99 s to 11 s.
+    assert(elapsed >= 11500 && "negative control must consume the total budget");
 }
 
 static void test_graceful_stop_drains_inflight_request() {

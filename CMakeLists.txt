@@ -87,12 +87,8 @@ add_library(cpppools STATIC
     src/server/ownership_router.cpp
 )
 if (CPPPOOLS_USE_REDIS)
-    find_path(HIREDIS_INCLUDE_DIR NAMES hiredis/hiredis.h REQUIRED)
-    find_library(HIREDIS_LIBRARY NAMES hiredis REQUIRED)
-    target_sources(cpppools PRIVATE src/cache/redis_transport.cpp)
+    target_sources(cpppools PRIVATE src/cache/redis_transport.cpp src/cache/redis_row_store.cpp)
     target_compile_definitions(cpppools PUBLIC CPPPOOLS_USE_REDIS=1)
-    target_include_directories(cpppools SYSTEM PRIVATE ${HIREDIS_INCLUDE_DIR})
-    target_link_libraries(cpppools PUBLIC ${HIREDIS_LIBRARY})
 endif()
 target_include_directories(cpppools
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -250,6 +246,7 @@ cpppools_add_test(test_cache_metrics)
 cpppools_add_test(test_ownership)
 if (CPPPOOLS_USE_REDIS)
     cpppools_add_test(test_redis_transport)
+    cpppools_add_test(test_redis_row_cache)
 endif()
 
 # MySQL 自省专项测试：仅在启用 MySQL 后端时编译运行。
